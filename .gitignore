@@ -1,0 +1,26 @@
+# Build artifacts
+*.o
+*.a
+*.out
+/build/
+/lexis
+
+# Generated index (rebuilt from data/corpus via ingest)
+/data/index/*
+!/data/index/.gitkeep
+
+# Python sidecar
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets
+.env
+
+# Claude Code project-local commands/settings
+.claude/
+.claude-mode
+
+# OS/editor cruft
+.DS_Store

@@ -1,0 +1,14 @@
+# Pipeline configuration template (spec sections 5.2.1, 6).
+# Copy to lexis.conf and fill in: chunk size/overlap for ingestion,
+# small/large model names for OpenRouter calls, and the Unix socket path
+# shared between the C core and the Python sidecar.
+
+# mode = testing | production
+#   testing (default if unset): full pipeline observability logging
+#     (queries/query_formulation_runs/search_runs/search_results/
+#     generation_runs -- see query_log.c) is active on every query.
+#   production: that logging is skipped entirely. Measured overhead is
+#     small (~2.5ms p50 on top of a ~5ms bare BM25 search, see
+#     LIMITATIONS.md) but non-zero, so production traffic can opt out
+#     rather than pay it.
+mode=testing

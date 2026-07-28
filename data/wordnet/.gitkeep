@@ -1,0 +1,1 @@
+Place the WordNet flat-file database here, loaded by src/core/wordnet.c at startup (spec 5.2.3, 6).
