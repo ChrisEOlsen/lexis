@@ -12,6 +12,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "bm25.h"
+#include "concurrent_ingest.h"
 #include "config.h"
 #include "generation.h"
 #include "ingest.h"
@@ -42,6 +43,12 @@
 #define LEXIS_MODEL "openai/gpt-4o-mini"
 #define LEXIS_CHUNK_SIZE 200
 #define LEXIS_CHUNK_OVERLAP 40
+/* Measured sweet spot on this machine's 8 logical cores (see SPEED.md's
+ * thread-count sweep) -- throughput peaked at 4 threads and *dropped
+ * below the single-threaded number* past ~16, driven by contention on
+ * the terms unique index, not just diminishing returns. Not
+ * auto-detected from core count yet; see LIMITATIONS.md. */
+#define LEXIS_INGEST_THREADS 4
 #define LEXIS_TOP_K 5
 
 static long elapsed_ms(struct timespec start, struct timespec end) {
@@ -74,26 +81,39 @@ static int run_ingest(const char *corpus_dir) {
         return 1;
     }
 
-    PgStore *store = pg_store_open(LEXIS_DB_CONNINFO);
-    if (store == NULL) {
+    /* A quick connect-and-close up front: fails fast with one clear error
+     * message (and creates the schema as a side effect of pg_store_open)
+     * before spawning concurrent_ingest_corpus()'s worker threads, rather
+     * than having every worker independently discover the database is
+     * unreachable. */
+    PgStore *probe_store = pg_store_open(LEXIS_DB_CONNINFO);
+    if (probe_store == NULL) {
         fprintf(stderr, "lexis: failed to open index at %s\n", LEXIS_DB_LABEL);
         stopword_set_free(stopwords);
         wordnet_table_free(wordnet);
         lemmatizer_free(lemmatizer);
         return 1;
     }
+    pg_store_close(probe_store);
 
-    long passages = ingest_corpus(store, stopwords, wordnet, lemmatizer, corpus_dir,
-                                   LEXIS_CHUNK_SIZE, LEXIS_CHUNK_OVERLAP);
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    long passages =
+        concurrent_ingest_corpus(LEXIS_DB_CONNINFO, stopwords, wordnet, lemmatizer, corpus_dir,
+                                  LEXIS_CHUNK_SIZE, LEXIS_CHUNK_OVERLAP, LEXIS_INGEST_THREADS);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
     int exit_code = 0;
     if (passages < 0) {
         fprintf(stderr, "lexis: failed to ingest %s\n", corpus_dir);
         exit_code = 1;
     } else {
-        printf("Ingested %ld passages from %s into %s\n", passages, corpus_dir, LEXIS_DB_LABEL);
+        long ms = elapsed_ms(start, end);
+        printf("Ingested %ld passages from %s into %s in %ldms (%d threads, %.1f passages/sec)\n",
+               passages, corpus_dir, LEXIS_DB_LABEL, ms, LEXIS_INGEST_THREADS,
+               ms > 0 ? (double)passages / ((double)ms / 1000.0) : 0.0);
     }
 
-    pg_store_close(store);
     stopword_set_free(stopwords);
     wordnet_table_free(wordnet);
     lemmatizer_free(lemmatizer);
