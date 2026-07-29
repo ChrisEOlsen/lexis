@@ -10,8 +10,9 @@
 #define LEXIS_BM25_H
 
 #include <stddef.h>
+#include <stdint.h>
 
-#include "sqlite_store.h"
+#include "pg_store.h"
 
 /* Standard BM25 free parameters. k1 controls term-frequency saturation —
  * how quickly repeated occurrences of a term stop adding to the score.
@@ -36,11 +37,11 @@ typedef struct {
     double avg_passage_length;
 } BM25CorpusStats;
 
-BM25CorpusStats bm25_corpus_stats(SqliteStore *store);
+BM25CorpusStats bm25_corpus_stats(PgStore *store);
 
 /* Returns n(t): the number of passages containing `term_id` at least once.
  * Returns -1 on failure. */
-long bm25_document_frequency(SqliteStore *store, sqlite3_int64 term_id);
+long bm25_document_frequency(PgStore *store, int64_t term_id);
 
 /* IDF(t) = ln((N - n(t) + 0.5) / (n(t) + 0.5) + 1). Pure math, no database
  * access — callers supply N (bm25_corpus_stats) and n(t)
@@ -63,7 +64,7 @@ double bm25_term_score(double idf, long term_frequency, long passage_length,
 /* One passage's accumulated BM25 score -- one entry per distinct passage
  * that matched at least one query term so far. */
 typedef struct {
-    sqlite3_int64 passage_id;
+    int64_t passage_id;
     double score;
 } BM25ScoredPassage;
 
@@ -84,7 +85,7 @@ BM25ResultSet *bm25_result_set_create(void);
  * this is the first time passage_id has been seen in this set. Grows the
  * backing array (doubling) if needed. Returns 0 on success, -1 on
  * allocation failure. */
-int bm25_result_set_add(BM25ResultSet *set, sqlite3_int64 passage_id, double score);
+int bm25_result_set_add(BM25ResultSet *set, int64_t passage_id, double score);
 
 /* Frees the result set's backing array and the struct itself. Safe to
  * call with set == NULL. */
@@ -96,9 +97,8 @@ void bm25_result_set_free(BM25ResultSet *set);
  * Computes n(t) and IDF(t) internally via bm25_document_frequency() and
  * bm25_idf(), using `stats` for N and avgdl. Returns 0 on success, -1 on
  * a database error. */
-int bm25_accumulate_term_scores(SqliteStore *store, sqlite3_int64 term_id,
-                                 BM25CorpusStats stats, BM25Params params,
-                                 BM25ResultSet *results);
+int bm25_accumulate_term_scores(PgStore *store, int64_t term_id, BM25CorpusStats stats,
+                                 BM25Params params, BM25ResultSet *results);
 
 /* Runs a full BM25 search: looks up each of `num_terms` query terms
  * (unrecognized terms are silently skipped -- they simply contribute no
@@ -106,7 +106,7 @@ int bm25_accumulate_term_scores(SqliteStore *store, sqlite3_int64 term_id,
  * scores across every matching passage, sorts descending by score, and
  * truncates to the top `top_k`. Returns a result set the caller must free
  * with bm25_result_set_free(), or NULL on a database/allocation failure. */
-BM25ResultSet *bm25_search(SqliteStore *store, const char **query_terms,
-                            size_t num_terms, size_t top_k, BM25Params params);
+BM25ResultSet *bm25_search(PgStore *store, const char **query_terms, size_t num_terms, size_t top_k,
+                            BM25Params params);
 
 #endif /* LEXIS_BM25_H */

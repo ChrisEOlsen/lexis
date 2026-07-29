@@ -14,20 +14,25 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define TEST_DB_PATH "build/test_generation.db"
+#define TEST_CONNINFO "host=127.0.0.1 port=5433 dbname=lexis_test user=lexis password=lexis_dev_only"
 
-static SqliteStore *open_fresh_store(void) {
-    remove(TEST_DB_PATH);
-    return sqlite_store_open(TEST_DB_PATH);
+static PgStore *open_fresh_store(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    if (store == NULL) {
+        return NULL;
+    }
+    PGresult *res = PQexec(store->conn, "TRUNCATE postings, terms, passages RESTART IDENTITY CASCADE;");
+    PQclear(res);
+    return store;
 }
 
 static void test_build_prompt_includes_passages_and_question(void) {
-    SqliteStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
-    sqlite3_int64 p1 = sqlite_store_insert_passage(store, "doc1.txt", 2,
+    int64_t p1 = pg_store_insert_passage(store, "doc1.txt", 2,
                                                     "Hypertension is treated with medication.", 5);
-    sqlite3_int64 p2 = sqlite_store_insert_passage(store, "doc2.txt", 0,
+    int64_t p2 = pg_store_insert_passage(store, "doc2.txt", 0,
                                                     "Lifestyle changes also help.", 4);
 
     BM25ResultSet *results = bm25_result_set_create();
@@ -50,12 +55,12 @@ static void test_build_prompt_includes_passages_and_question(void) {
 
     free(prompt);
     bm25_result_set_free(results);
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 static void test_build_prompt_empty_results_returns_null(void) {
-    SqliteStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
     BM25ResultSet *results = bm25_result_set_create();
     TEST_ASSERT(results != NULL, "expected bm25_result_set_create to succeed");
@@ -64,14 +69,14 @@ static void test_build_prompt_empty_results_returns_null(void) {
     TEST_ASSERT(prompt == NULL, "expected NULL when there are no results to build a prompt from");
 
     bm25_result_set_free(results);
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 static void test_build_prompt_skips_unloadable_passages(void) {
-    SqliteStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
-    sqlite3_int64 real_passage = sqlite_store_insert_passage(store, "doc1.txt", 0, "real content here", 3);
+    int64_t real_passage = pg_store_insert_passage(store, "doc1.txt", 0, "real content here", 3);
 
     BM25ResultSet *results = bm25_result_set_create();
     TEST_ASSERT(results != NULL, "expected bm25_result_set_create to succeed");
@@ -87,12 +92,12 @@ static void test_build_prompt_skips_unloadable_passages(void) {
 
     free(prompt);
     bm25_result_set_free(results);
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 static void test_build_prompt_all_passages_unloadable_returns_null(void) {
-    SqliteStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
     BM25ResultSet *results = bm25_result_set_create();
     TEST_ASSERT(results != NULL, "expected bm25_result_set_create to succeed");
@@ -103,15 +108,15 @@ static void test_build_prompt_all_passages_unloadable_returns_null(void) {
                 "expected NULL when every referenced passage fails to load -- nothing to ground an answer in");
 
     bm25_result_set_free(results);
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 static void test_generate_answer_returns_null_without_api_key(void) {
     unsetenv("OPENROUTER_API_KEY");
 
-    SqliteStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
-    sqlite3_int64 p1 = sqlite_store_insert_passage(store, "doc1.txt", 0, "some real content", 3);
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+    int64_t p1 = pg_store_insert_passage(store, "doc1.txt", 0, "some real content", 3);
 
     BM25ResultSet *results = bm25_result_set_create();
     bm25_result_set_add(results, p1, 5.0);
@@ -123,12 +128,12 @@ static void test_generate_answer_returns_null_without_api_key(void) {
     TEST_ASSERT(answer == NULL, "expected NULL when the API call fails, no fallback answer");
 
     bm25_result_set_free(results);
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 static void test_generate_answer_empty_results_returns_null(void) {
-    SqliteStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
     BM25ResultSet *results = bm25_result_set_create();
 
@@ -136,7 +141,7 @@ static void test_generate_answer_empty_results_returns_null(void) {
     TEST_ASSERT(answer == NULL, "expected NULL for empty results, without needing an API key at all");
 
     bm25_result_set_free(results);
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 int main(void) {
@@ -146,6 +151,5 @@ int main(void) {
     test_build_prompt_all_passages_unloadable_returns_null();
     test_generate_answer_returns_null_without_api_key();
     test_generate_answer_empty_results_returns_null();
-    remove(TEST_DB_PATH);
     return test_summary();
 }

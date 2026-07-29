@@ -9,7 +9,7 @@
 #define LEXIS_GENERATION_H
 
 #include "bm25.h"
-#include "sqlite_store.h"
+#include "pg_store.h"
 
 /* Builds the generation prompt: every passage in `results` is fetched
  * from `store` by passage_id and assembled into a context block with
@@ -21,7 +21,7 @@
  * NULL on allocation failure, or if `results` is empty, or if NO
  * passage could be loaded at all -- there's nothing to ground an answer
  * in either way. */
-char *generation_build_prompt(const char *query_text, SqliteStore *store,
+char *generation_build_prompt(const char *query_text, PgStore *store,
                                const BM25ResultSet *results);
 
 /* Runs the full generation step: builds the prompt and calls `model` via
@@ -31,6 +31,6 @@ char *generation_build_prompt(const char *query_text, SqliteStore *store,
  * generation itself fails, there's no lesser answer to fall back to;
  * the caller has to decide how to handle "no answer available". */
 char *generation_generate_answer(const char *query_text, const char *model,
-                                  SqliteStore *store, const BM25ResultSet *results);
+                                  PgStore *store, const BM25ResultSet *results);
 
 #endif /* LEXIS_GENERATION_H */

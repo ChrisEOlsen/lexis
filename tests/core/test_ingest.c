@@ -13,10 +13,20 @@
 #include <unistd.h>
 
 #define TEST_FILE_PATH "build/test_ingest_file.txt"
-#define TEST_DB_PATH "build/test_ingest_document.db"
+#define TEST_CONNINFO "host=127.0.0.1 port=5433 dbname=lexis_test user=lexis password=lexis_dev_only"
 #define STOPWORD_FILE "data/stopwords/english.txt"
 #define WORDNET_DIR "data/wordnet"
 #define TEST_CORPUS_DIR "build/test_corpus"
+
+static PgStore *open_fresh_store(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    if (store == NULL) {
+        return NULL;
+    }
+    PGresult *res = PQexec(store->conn, "TRUNCATE postings, terms, passages RESTART IDENTITY CASCADE;");
+    PQclear(res);
+    return store;
+}
 
 static void write_file_at(const char *path, const char *contents) {
     FILE *fp = fopen(path, "wb");
@@ -217,9 +227,8 @@ static void test_chunk_words_rejects_invalid_params(void) {
 static void test_ingest_document_end_to_end(void) {
     write_test_file("The hypertension treatment options are effective.");
 
-    remove(TEST_DB_PATH);
-    SqliteStore *store = sqlite_store_open(TEST_DB_PATH);
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
     StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
     TEST_ASSERT(stopwords != NULL, "expected stopword_set_load to succeed");
@@ -235,52 +244,49 @@ static void test_ingest_document_end_to_end(void) {
                                      TEST_FILE_PATH, "doc1.txt", 100, 0);
     TEST_ASSERT(passages == 1, "expected exactly 1 passage ingested, got %ld", passages);
 
-    sqlite3_stmt *stmt = NULL;
-    const char *sql = "SELECT document_name, text, token_count FROM passages;";
-    TEST_ASSERT(sqlite3_prepare_v2(store->db, sql, -1, &stmt, NULL) == SQLITE_OK,
-                "expected verification query to prepare");
-    TEST_ASSERT(sqlite3_step(stmt) == SQLITE_ROW, "expected a passage row to exist");
-    TEST_ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "doc1.txt");
+    PGresult *res = PQexec(store->conn, "SELECT document_name, text, token_count FROM passages;");
+    TEST_ASSERT(PQresultStatus(res) == PGRES_TUPLES_OK, "expected verification query to succeed");
+    TEST_ASSERT(PQntuples(res) == 1, "expected a passage row to exist");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 0), "doc1.txt");
     /* Passage text is the raw chunk -- original casing/punctuation intact,
      * NOT the lowercased/stripped tokenizer output. */
-    TEST_ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1),
-                        "The hypertension treatment options are effective.");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 1), "The hypertension treatment options are effective.");
     /* "The" and "are" are stopwords -- token_count reflects the 4 terms
      * that survive tokenize() + stopwords_filter(), not the 6 raw words. */
-    TEST_ASSERT(sqlite3_column_int(stmt, 2) == 4,
-                "expected token_count 4 after stopword filtering, got %d",
-                sqlite3_column_int(stmt, 2));
-    sqlite3_finalize(stmt);
+    TEST_ASSERT(atoi(PQgetvalue(res, 0, 2)) == 4,
+                "expected token_count 4 after stopword filtering, got %s", PQgetvalue(res, 0, 2));
+    PQclear(res);
 
-    sqlite3_int64 the_id = sqlite_store_lookup_term(store, "the");
-    sqlite3_int64 are_id = sqlite_store_lookup_term(store, "are");
+    int64_t the_id = pg_store_lookup_term(store, "the");
+    int64_t are_id = pg_store_lookup_term(store, "are");
     TEST_ASSERT(the_id == -1, "expected \"the\" to be filtered out as a stopword");
     TEST_ASSERT(are_id == -1, "expected \"are\" to be filtered out as a stopword");
 
-    sqlite3_int64 hypertension_id = sqlite_store_lookup_term(store, "hypertension");
+    int64_t hypertension_id = pg_store_lookup_term(store, "hypertension");
     TEST_ASSERT(hypertension_id != -1, "expected \"hypertension\" to have been indexed");
 
-    const char *freq_sql = "SELECT term_frequency FROM postings WHERE term_id = ?;";
-    TEST_ASSERT(sqlite3_prepare_v2(store->db, freq_sql, -1, &stmt, NULL) == SQLITE_OK,
-                "expected frequency query to prepare");
-    sqlite3_bind_int64(stmt, 1, hypertension_id);
-    TEST_ASSERT(sqlite3_step(stmt) == SQLITE_ROW, "expected a posting row for \"hypertension\"");
-    TEST_ASSERT(sqlite3_column_int(stmt, 0) == 1, "expected term_frequency 1, got %d",
-                sqlite3_column_int(stmt, 0));
-    sqlite3_finalize(stmt);
+    char hypertension_id_str[32];
+    snprintf(hypertension_id_str, sizeof(hypertension_id_str), "%lld", (long long)hypertension_id);
+    const char *freq_params[1] = {hypertension_id_str};
+    res = PQexecParams(store->conn, "SELECT term_frequency FROM postings WHERE term_id = $1;", 1, NULL,
+                        freq_params, NULL, NULL, 0);
+    TEST_ASSERT(PQresultStatus(res) == PGRES_TUPLES_OK, "expected frequency query to succeed");
+    TEST_ASSERT(PQntuples(res) == 1, "expected a posting row for \"hypertension\"");
+    TEST_ASSERT(atoi(PQgetvalue(res, 0, 0)) == 1, "expected term_frequency 1, got %s",
+                PQgetvalue(res, 0, 0));
+    PQclear(res);
 
     stopword_set_free(stopwords);
     wordnet_table_free(wordnet);
     lemmatizer_free(lemmatizer);
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 static void test_ingest_document_counts_repeated_terms(void) {
     write_test_file("treatment treatment treatment");
 
-    remove(TEST_DB_PATH);
-    SqliteStore *store = sqlite_store_open(TEST_DB_PATH);
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
     StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
     TEST_ASSERT(stopwords != NULL, "expected stopword_set_load to succeed");
@@ -293,7 +299,7 @@ static void test_ingest_document_counts_repeated_terms(void) {
                                      TEST_FILE_PATH, "doc1.txt", 100, 0);
     TEST_ASSERT(passages == 1, "expected exactly 1 passage ingested, got %ld", passages);
 
-    sqlite3_int64 term_id = sqlite_store_lookup_term(store, "treatment");
+    int64_t term_id = pg_store_lookup_term(store, "treatment");
     TEST_ASSERT(term_id != -1, "expected \"treatment\" to have been indexed");
 
     /* A repeated term within one chunk must collapse into exactly ONE
@@ -301,23 +307,27 @@ static void test_ingest_document_counts_repeated_terms(void) {
      * rows (which the postings table's composite primary key would
      * reject as a duplicate insert anyway, but the count should never
      * have been attempted 3 times to begin with). */
-    sqlite3_stmt *stmt = NULL;
-    const char *sql = "SELECT COUNT(*), term_frequency FROM postings WHERE term_id = ?;";
-    TEST_ASSERT(sqlite3_prepare_v2(store->db, sql, -1, &stmt, NULL) == SQLITE_OK,
-                "expected verification query to prepare");
-    sqlite3_bind_int64(stmt, 1, term_id);
-    TEST_ASSERT(sqlite3_step(stmt) == SQLITE_ROW, "expected a result row");
-    TEST_ASSERT(sqlite3_column_int(stmt, 0) == 1,
-                "expected exactly 1 posting row for a repeated term, got %d",
-                sqlite3_column_int(stmt, 0));
-    TEST_ASSERT(sqlite3_column_int(stmt, 1) == 3,
-                "expected term_frequency 3, got %d", sqlite3_column_int(stmt, 1));
-    sqlite3_finalize(stmt);
+    /* Just SELECT the rows themselves and check the count via PQntuples()
+     * -- SELECT COUNT(*), term_frequency in one query (no GROUP BY) is
+     * SQLite-only leniency (it returns an arbitrary row's value for the
+     * non-aggregated column); Postgres correctly rejects it as invalid
+     * standard SQL. */
+    char term_id_str[32];
+    snprintf(term_id_str, sizeof(term_id_str), "%lld", (long long)term_id);
+    const char *params[1] = {term_id_str};
+    PGresult *res = PQexecParams(store->conn, "SELECT term_frequency FROM postings WHERE term_id = $1;",
+                                  1, NULL, params, NULL, NULL, 0);
+    TEST_ASSERT(PQresultStatus(res) == PGRES_TUPLES_OK, "expected verification query to succeed");
+    TEST_ASSERT(PQntuples(res) == 1,
+                "expected exactly 1 posting row for a repeated term, got %d", PQntuples(res));
+    TEST_ASSERT(atoi(PQgetvalue(res, 0, 0)) == 3, "expected term_frequency 3, got %s",
+                PQgetvalue(res, 0, 0));
+    PQclear(res);
 
     stopword_set_free(stopwords);
     wordnet_table_free(wordnet);
     lemmatizer_free(lemmatizer);
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 static void reset_test_corpus_dir(void) {
@@ -337,9 +347,8 @@ static void test_ingest_corpus_ingests_every_top_level_file(void) {
     write_file_at(TEST_CORPUS_DIR "/doc1.txt", "hypertension treatment options");
     write_file_at(TEST_CORPUS_DIR "/doc2.txt", "cardiac arrest response plan");
 
-    remove(TEST_DB_PATH);
-    SqliteStore *store = sqlite_store_open(TEST_DB_PATH);
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
     StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
     TEST_ASSERT(stopwords != NULL, "expected stopword_set_load to succeed");
@@ -353,20 +362,17 @@ static void test_ingest_corpus_ingests_every_top_level_file(void) {
 
     /* Each passage's document_name should be the bare filename, not the
      * full directory-joined path. */
-    sqlite3_stmt *stmt = NULL;
-    const char *sql = "SELECT COUNT(*) FROM passages WHERE document_name = 'doc1.txt';";
-    TEST_ASSERT(sqlite3_prepare_v2(store->db, sql, -1, &stmt, NULL) == SQLITE_OK,
-                "expected verification query to prepare");
-    TEST_ASSERT(sqlite3_step(stmt) == SQLITE_ROW, "expected a result row");
-    TEST_ASSERT(sqlite3_column_int(stmt, 0) == 1,
-                "expected exactly 1 passage tagged \"doc1.txt\", got %d",
-                sqlite3_column_int(stmt, 0));
-    sqlite3_finalize(stmt);
+    PGresult *res =
+        PQexec(store->conn, "SELECT COUNT(*) FROM passages WHERE document_name = 'doc1.txt';");
+    TEST_ASSERT(PQresultStatus(res) == PGRES_TUPLES_OK, "expected verification query to succeed");
+    TEST_ASSERT(atoi(PQgetvalue(res, 0, 0)) == 1,
+                "expected exactly 1 passage tagged \"doc1.txt\", got %s", PQgetvalue(res, 0, 0));
+    PQclear(res);
 
     stopword_set_free(stopwords);
     wordnet_table_free(wordnet);
     lemmatizer_free(lemmatizer);
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 static void test_ingest_corpus_skips_subdirectories(void) {
@@ -375,9 +381,8 @@ static void test_ingest_corpus_skips_subdirectories(void) {
     mkdir(TEST_CORPUS_DIR "/subdir", 0755);
     write_file_at(TEST_CORPUS_DIR "/subdir/nested.txt", "should not be ingested");
 
-    remove(TEST_DB_PATH);
-    SqliteStore *store = sqlite_store_open(TEST_DB_PATH);
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
     StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
     TEST_ASSERT(stopwords != NULL, "expected stopword_set_load to succeed");
@@ -394,13 +399,12 @@ static void test_ingest_corpus_skips_subdirectories(void) {
     stopword_set_free(stopwords);
     wordnet_table_free(wordnet);
     lemmatizer_free(lemmatizer);
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 static void test_ingest_corpus_missing_directory_returns_negative_one(void) {
-    remove(TEST_DB_PATH);
-    SqliteStore *store = sqlite_store_open(TEST_DB_PATH);
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
     StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
     TEST_ASSERT(stopwords != NULL, "expected stopword_set_load to succeed");
@@ -415,7 +419,7 @@ static void test_ingest_corpus_missing_directory_returns_negative_one(void) {
     stopword_set_free(stopwords);
     wordnet_table_free(wordnet);
     lemmatizer_free(lemmatizer);
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 int main(void) {
@@ -441,7 +445,6 @@ int main(void) {
     test_ingest_corpus_skips_subdirectories();
     test_ingest_corpus_missing_directory_returns_negative_one();
     remove(TEST_FILE_PATH);
-    remove(TEST_DB_PATH);
     remove(TEST_CORPUS_DIR "/doc1.txt");
     remove(TEST_CORPUS_DIR "/doc2.txt");
     remove(TEST_CORPUS_DIR "/subdir/nested.txt");

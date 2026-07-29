@@ -1,0 +1,27 @@
+# Local Postgres dev environment for the experiment/postgres-migration
+# branch ONLY -- not part of the main pipeline's architecture (which is
+# explicitly zero-external-services, see spec 3.2 and README). Disposable:
+# `docker compose down -v` wipes it clean. Not a statement about how the
+# shipped app will eventually run Postgres, if it does at all -- that's a
+# separate, later decision (see LIMITATIONS.md).
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: lexis
+      POSTGRES_PASSWORD: lexis_dev_only
+      POSTGRES_DB: lexis
+    ports:
+      - "5433:5432"
+    volumes:
+      - lexis_postgres_data:/var/lib/postgresql
+      - ./docker/init-scripts:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lexis -d lexis"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  lexis_postgres_data:

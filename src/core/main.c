@@ -17,9 +17,9 @@
 #include "ingest.h"
 #include "lemmatizer.h"
 #include "openrouter_client.h"
+#include "pg_store.h"
 #include "query_formulation.h"
 #include "query_log.h"
-#include "sqlite_store.h"
 #include "stopwords.h"
 #include "wordnet.h"
 
@@ -28,7 +28,14 @@
 #include <string.h>
 #include <time.h>
 
-#define LEXIS_DB_PATH "data/index/lexis.db"
+/* Postgres connection string -- matches docker-compose.yml's dev instance
+ * (experiment/postgres-migration branch only; see LIMITATIONS.md for the
+ * still-open question of how/whether the shipped app would ever need this
+ * to be user-configurable). */
+#define LEXIS_DB_CONNINFO "host=127.0.0.1 port=5433 dbname=lexis user=lexis password=lexis_dev_only"
+/* Display-only label -- never print LEXIS_DB_CONNINFO itself, it embeds
+ * the dev password. */
+#define LEXIS_DB_LABEL "127.0.0.1:5433/lexis"
 #define LEXIS_STOPWORDS_PATH "data/stopwords/english.txt"
 #define LEXIS_WORDNET_DIR "data/wordnet"
 #define LEXIS_CONFIG_PATH "config/lexis.conf"
@@ -67,9 +74,9 @@ static int run_ingest(const char *corpus_dir) {
         return 1;
     }
 
-    SqliteStore *store = sqlite_store_open(LEXIS_DB_PATH);
+    PgStore *store = pg_store_open(LEXIS_DB_CONNINFO);
     if (store == NULL) {
-        fprintf(stderr, "lexis: failed to open index at %s\n", LEXIS_DB_PATH);
+        fprintf(stderr, "lexis: failed to open index at %s\n", LEXIS_DB_LABEL);
         stopword_set_free(stopwords);
         wordnet_table_free(wordnet);
         lemmatizer_free(lemmatizer);
@@ -83,10 +90,10 @@ static int run_ingest(const char *corpus_dir) {
         fprintf(stderr, "lexis: failed to ingest %s\n", corpus_dir);
         exit_code = 1;
     } else {
-        printf("Ingested %ld passages from %s into %s\n", passages, corpus_dir, LEXIS_DB_PATH);
+        printf("Ingested %ld passages from %s into %s\n", passages, corpus_dir, LEXIS_DB_LABEL);
     }
 
-    sqlite_store_close(store);
+    pg_store_close(store);
     stopword_set_free(stopwords);
     wordnet_table_free(wordnet);
     lemmatizer_free(lemmatizer);
@@ -107,9 +114,9 @@ static int run_query(const char *question) {
         return 1;
     }
 
-    SqliteStore *store = sqlite_store_open(LEXIS_DB_PATH);
+    PgStore *store = pg_store_open(LEXIS_DB_CONNINFO);
     if (store == NULL) {
-        fprintf(stderr, "lexis: failed to open index at %s\n", LEXIS_DB_PATH);
+        fprintf(stderr, "lexis: failed to open index at %s\n", LEXIS_DB_LABEL);
         stopword_set_free(stopwords);
         wordnet_table_free(wordnet);
         lemmatizer_free(lemmatizer);
@@ -129,7 +136,7 @@ static int run_query(const char *question) {
 
     if (openrouter_client_init() != 0) {
         fprintf(stderr, "lexis: failed to initialize the OpenRouter HTTP client\n");
-        sqlite_store_close(store);
+        pg_store_close(store);
         stopword_set_free(stopwords);
         wordnet_table_free(wordnet);
         lemmatizer_free(lemmatizer);
@@ -138,7 +145,7 @@ static int run_query(const char *question) {
 
     int exit_code = 0;
     int pipeline_succeeded = 0;
-    sqlite3_int64 query_id =
+    int64_t query_id =
         (mode == LEXIS_MODE_TESTING) ? query_log_insert_query(store, question) : -1;
 
     struct timespec pipeline_start, pipeline_end;
@@ -242,7 +249,7 @@ static int run_query(const char *question) {
         }
 
         if (query_id != -1) {
-            sqlite3_int64 search_run_id = query_log_insert_search_run(
+            int64_t search_run_id = query_log_insert_search_run(
                 store, query_id, LEXIS_TOP_K, (int)results->count,
                 elapsed_ms(search_start, search_end));
             if (search_run_id != -1) {
@@ -265,11 +272,11 @@ static int run_query(const char *question) {
         int passages_included = 0;
         int passages_skipped = 0;
         for (size_t i = 0; i < results->count; i++) {
-            SqliteStorePassage *passage = sqlite_store_get_passage(store, results->items[i].passage_id);
+            PgStorePassage *passage = pg_store_get_passage(store, results->items[i].passage_id);
             if (passage != NULL) {
                 printf("  [%.3f] %s (chunk %d)\n", results->items[i].score, passage->document_name,
                        passage->chunk_id);
-                sqlite_store_passage_free(passage);
+                pg_store_passage_free(passage);
                 passages_included++;
             } else {
                 passages_skipped++;
@@ -309,7 +316,7 @@ cleanup:
                                 pipeline_succeeded);
     }
     openrouter_client_cleanup();
-    sqlite_store_close(store);
+    pg_store_close(store);
     stopword_set_free(stopwords);
     wordnet_table_free(wordnet);
     lemmatizer_free(lemmatizer);

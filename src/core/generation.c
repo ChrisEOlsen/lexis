@@ -11,7 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-char *generation_build_prompt(const char *query_text, SqliteStore *store,
+char *generation_build_prompt(const char *query_text, PgStore *store,
                                const BM25ResultSet *results) {
     if (results->count == 0) {
         return NULL;
@@ -31,7 +31,7 @@ char *generation_build_prompt(const char *query_text, SqliteStore *store,
      * (every passage failed to load) isn't a grounded answer at all. */
     size_t passages_included = 0;
     for (size_t i = 0; i < results->count; i++) {
-        SqliteStorePassage *passage = sqlite_store_get_passage(store, results->items[i].passage_id);
+        PgStorePassage *passage = pg_store_get_passage(store, results->items[i].passage_id);
         if (passage == NULL) {
             continue;
         }
@@ -46,11 +46,11 @@ char *generation_build_prompt(const char *query_text, SqliteStore *store,
             string_builder_append(&builder, "]\n") != 0 ||
             string_builder_append(&builder, passage->text) != 0 ||
             string_builder_append(&builder, "\n\n") != 0) {
-            sqlite_store_passage_free(passage);
+            pg_store_passage_free(passage);
             goto fail;
         }
 
-        sqlite_store_passage_free(passage);
+        pg_store_passage_free(passage);
         passages_included++;
     }
 
@@ -73,7 +73,7 @@ fail:
 }
 
 char *generation_generate_answer(const char *query_text, const char *model,
-                                  SqliteStore *store, const BM25ResultSet *results) {
+                                  PgStore *store, const BM25ResultSet *results) {
     char *prompt = generation_build_prompt(query_text, store, results);
     if (prompt == NULL) {
         return NULL;

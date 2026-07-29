@@ -3,3 +3,4 @@
 -Wextra
 -Iinclude
 -Iinclude/vendor
+-I/opt/homebrew/opt/postgresql@18/include/postgresql

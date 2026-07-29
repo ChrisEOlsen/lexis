@@ -2,7 +2,7 @@
  * Pipeline observability -- records what each stage of a single query's
  * run actually did (inputs, outputs, timing, success/failure), so behavior
  * and performance can be inspected and compared across runs after the
- * fact. A distinct concern from sqlite_store.c's index/passage schema --
+ * fact. A distinct concern from pg_store.c's index/passage schema --
  * this module owns its own tables on the same connection, tied together
  * by query_id.
  *
@@ -16,26 +16,25 @@
 #ifndef LEXIS_QUERY_LOG_H
 #define LEXIS_QUERY_LOG_H
 
-#include <sqlite3.h>
+#include <stdint.h>
 
-#include "sqlite_store.h"
+#include "pg_store.h"
 
 /* Ensures the queries/query_formulation_runs/search_runs/search_results/
  * generation_runs tables exist on `store`'s connection. Returns 0 on
  * success, -1 on failure. */
-int query_log_init_schema(SqliteStore *store);
+int query_log_init_schema(PgStore *store);
 
 /* Records the anchor row for one query. Returns its new row id, or -1 on
  * failure -- callers should treat -1 as "logging unavailable" and skip
  * every other query_log_* call for this query, rather than letting a
  * logging failure disrupt the real pipeline. */
-sqlite3_int64 query_log_insert_query(SqliteStore *store, const char *question_text);
+int64_t query_log_insert_query(PgStore *store, const char *question_text);
 
 /* Closes out the anchor row once the whole pipeline finishes, recording
  * total wall-clock latency and whether a final answer was produced.
  * Returns 0 on success, -1 on failure. */
-int query_log_finish_query(SqliteStore *store, sqlite3_int64 query_id,
-                            long total_latency_ms, int succeeded);
+int query_log_finish_query(PgStore *store, int64_t query_id, long total_latency_ms, int succeeded);
 
 /* Records one query formulation stage run. `prompt_text`/`llm_response_text`
  * may be NULL (nothing to expand -- an all-stopwords query never builds a
@@ -44,25 +43,25 @@ int query_log_finish_query(SqliteStore *store, sqlite3_int64 query_id,
  * comment's note on what this can't detect. `selected_terms` is the final
  * space-joined term list actually handed to bm25_search(). Returns 0 on
  * success, -1 on failure. */
-int query_log_insert_query_formulation_run(SqliteStore *store, sqlite3_int64 query_id,
+int query_log_insert_query_formulation_run(PgStore *store, int64_t query_id,
                                             int surviving_term_count, const char *prompt_text,
                                             const char *llm_response_text, int used_fallback,
                                             const char *selected_terms, long latency_ms);
 
 /* Records one BM25 search stage run. Returns its new row id (needed to
  * attach search_results rows), or -1 on failure. */
-sqlite3_int64 query_log_insert_search_run(SqliteStore *store, sqlite3_int64 query_id, int top_k,
-                                           int result_count, long latency_ms);
+int64_t query_log_insert_search_run(PgStore *store, int64_t query_id, int top_k, int result_count,
+                                     long latency_ms);
 
 /* Records one ranked result from a search run (rank is 1-based). Returns 0
  * on success, -1 on failure. */
-int query_log_insert_search_result(SqliteStore *store, sqlite3_int64 search_run_id, int rank,
-                                    sqlite3_int64 passage_id, double score);
+int query_log_insert_search_result(PgStore *store, int64_t search_run_id, int rank,
+                                    int64_t passage_id, double score);
 
 /* Records one answer generation stage run. `prompt_text`/`answer_text` may
  * be NULL (prompt failed to build, or the API call failed with no
  * fallback -- see generation.c). Returns 0 on success, -1 on failure. */
-int query_log_insert_generation_run(SqliteStore *store, sqlite3_int64 query_id, const char *model,
+int query_log_insert_generation_run(PgStore *store, int64_t query_id, const char *model,
                                      int passages_included, int passages_skipped,
                                      const char *prompt_text, const char *answer_text,
                                      int succeeded, long latency_ms);

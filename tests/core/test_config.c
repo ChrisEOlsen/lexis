@@ -1,7 +1,7 @@
 /*
  * Tests for src/core/config.c — the testing/production mode reader.
  * Uses throwaway config files under build/, same pattern as
- * test_sqlite_store.c's throwaway DB file.
+ * test_pg_store.c's throwaway-data setup.
  */
 
 #include "config.h"

@@ -13,7 +13,7 @@
 #include <stddef.h>
 
 #include "lemmatizer.h"
-#include "sqlite_store.h"
+#include "pg_store.h"
 #include "stopwords.h"
 #include "tokenizer.h"
 #include "wordnet.h"
@@ -57,12 +57,12 @@ TokenList *ingest_chunk_words(const TokenList *words, size_t chunk_size, size_t 
  * here, not just at query time, is what lets a query for "call" actually
  * match a passage that only ever said "called" or "calling" -- see
  * lemmatizer.c. `document_name` is stored alongside each passage for
- * source attribution. Returns the number of passages ingested (>= 0) on
- * success, or -1 on failure -- in which case nothing from this call is
- * left partially committed beyond whatever SQLite writes already landed
- * before the failing step (no transaction wrapping yet, see
- * LIMITATIONS.md). */
-long ingest_document(SqliteStore *store, const StopwordSet *stopwords,
+ * source attribution. The whole document's writes are wrapped in one
+ * transaction (see pg_store_begin_transaction()) -- a failure partway
+ * through rolls back cleanly rather than leaving the document
+ * half-indexed. Returns the number of passages ingested (>= 0) on
+ * success, or -1 on failure. */
+long ingest_document(PgStore *store, const StopwordSet *stopwords,
                       const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
                       const char *path, const char *document_name,
                       size_t chunk_size, size_t overlap);
@@ -74,7 +74,7 @@ long ingest_document(SqliteStore *store, const StopwordSet *stopwords,
  * skipped rather than aborting the whole corpus. Returns the total
  * number of passages ingested across the directory (>= 0), or -1 if the
  * directory itself can't be opened. */
-long ingest_corpus(SqliteStore *store, const StopwordSet *stopwords,
+long ingest_corpus(PgStore *store, const StopwordSet *stopwords,
                     const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
                     const char *dir_path, size_t chunk_size, size_t overlap);
 

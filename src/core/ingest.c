@@ -200,8 +200,8 @@ static TokenList *ingest_lemmatize_terms(const WordNetTable *wordnet,
  * at chunk scale (a few hundred terms at most), same tradeoff already made
  * for bm25_result_set_add's linear scan. Returns 0 on success, -1 on a
  * database error. */
-static int ingest_index_chunk_terms(SqliteStore *store, const TokenList *terms,
-                                    sqlite3_int64 passage_id) {
+static int ingest_index_chunk_terms(PgStore *store, const TokenList *terms,
+                                    int64_t passage_id) {
   for (size_t i = 0; i < terms->count; i++) {
     int already_indexed = 0;
     for (size_t j = 0; j < i; j++) {
@@ -221,13 +221,13 @@ static int ingest_index_chunk_terms(SqliteStore *store, const TokenList *terms,
       }
     }
 
-    sqlite3_int64 term_id =
-        sqlite_store_get_or_create_term(store, terms->terms[i]);
+    int64_t term_id =
+        pg_store_get_or_create_term(store, terms->terms[i]);
     if (term_id == -1) {
       return -1;
     }
 
-    if (sqlite_store_insert_posting(store, term_id, passage_id, frequency) !=
+    if (pg_store_insert_posting(store, term_id, passage_id, frequency) !=
         0) {
       return -1;
     }
@@ -236,7 +236,7 @@ static int ingest_index_chunk_terms(SqliteStore *store, const TokenList *terms,
   return 0;
 }
 
-long ingest_document(SqliteStore *store, const StopwordSet *stopwords,
+long ingest_document(PgStore *store, const StopwordSet *stopwords,
                      const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
                      const char *path, const char *document_name,
                      size_t chunk_size, size_t overlap) {
@@ -263,7 +263,7 @@ long ingest_document(SqliteStore *store, const StopwordSet *stopwords,
    * LIMITATIONS.md for measured numbers) and real atomicity: a failure
    * partway through rolls back this document's writes entirely, rather
    * than leaving it half-indexed. */
-  if (sqlite_store_begin_transaction(store) != 0) {
+  if (pg_store_begin_transaction(store) != 0) {
     token_list_free(chunks);
     return -1;
   }
@@ -274,7 +274,7 @@ long ingest_document(SqliteStore *store, const StopwordSet *stopwords,
 
     TokenList *terms = tokenize(chunk_text);
     if (terms == NULL) {
-      sqlite_store_rollback_transaction(store);
+      pg_store_rollback_transaction(store);
       token_list_free(chunks);
       return -1;
     }
@@ -283,23 +283,23 @@ long ingest_document(SqliteStore *store, const StopwordSet *stopwords,
     TokenList *lemmas = ingest_lemmatize_terms(wordnet, lemmatizer, terms);
     token_list_free(terms);
     if (lemmas == NULL) {
-      sqlite_store_rollback_transaction(store);
+      pg_store_rollback_transaction(store);
       token_list_free(chunks);
       return -1;
     }
 
-    sqlite3_int64 passage_id = sqlite_store_insert_passage(
+    int64_t passage_id = pg_store_insert_passage(
         store, document_name, (int)i, chunk_text, (int)lemmas->count);
     if (passage_id == -1) {
       token_list_free(lemmas);
-      sqlite_store_rollback_transaction(store);
+      pg_store_rollback_transaction(store);
       token_list_free(chunks);
       return -1;
     }
 
     if (ingest_index_chunk_terms(store, lemmas, passage_id) != 0) {
       token_list_free(lemmas);
-      sqlite_store_rollback_transaction(store);
+      pg_store_rollback_transaction(store);
       token_list_free(chunks);
       return -1;
     }
@@ -309,13 +309,13 @@ long ingest_document(SqliteStore *store, const StopwordSet *stopwords,
   }
   token_list_free(chunks);
 
-  if (sqlite_store_commit_transaction(store) != 0) {
+  if (pg_store_commit_transaction(store) != 0) {
     return -1;
   }
   return passages_ingested;
 }
 
-long ingest_corpus(SqliteStore *store, const StopwordSet *stopwords,
+long ingest_corpus(PgStore *store, const StopwordSet *stopwords,
                    const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
                    const char *dir_path, size_t chunk_size, size_t overlap) {
   DIR *dir = opendir(dir_path);

@@ -4,7 +4,7 @@
  */
 
 #include "bm25.h"
-#include "sqlite_store.h"
+#include "pg_store.h"
 #include "test_utils.h"
 
 #include <math.h>
@@ -15,16 +15,21 @@
  * equality. Expected values computed independently via Python's math.log. */
 #define IDF_EPSILON 1e-9
 
-#define TEST_DB_PATH "build/test_bm25.db"
+#define TEST_CONNINFO "host=127.0.0.1 port=5433 dbname=lexis_test user=lexis password=lexis_dev_only"
 
-static SqliteStore *open_fresh_store(void) {
-    remove(TEST_DB_PATH);
-    return sqlite_store_open(TEST_DB_PATH);
+static PgStore *open_fresh_store(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    if (store == NULL) {
+        return NULL;
+    }
+    PGresult *res = PQexec(store->conn, "TRUNCATE postings, terms, passages RESTART IDENTITY CASCADE;");
+    PQclear(res);
+    return store;
 }
 
 static void test_corpus_stats_empty_store(void) {
-    SqliteStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
     BM25CorpusStats stats = bm25_corpus_stats(store);
     TEST_ASSERT(stats.total_passages == 0, "expected 0 passages, got %ld",
@@ -33,16 +38,16 @@ static void test_corpus_stats_empty_store(void) {
                 "expected avg length 0.0 on empty store, got %f",
                 stats.avg_passage_length);
 
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 static void test_corpus_stats_computes_n_and_avgdl(void) {
-    SqliteStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
-    sqlite_store_insert_passage(store, "doc1.txt", 0, "hello world", 2);
-    sqlite_store_insert_passage(store, "doc1.txt", 1, "second chunk here", 3);
-    sqlite_store_insert_passage(store, "doc2.txt", 0, "one", 1);
+    pg_store_insert_passage(store, "doc1.txt", 0, "hello world", 2);
+    pg_store_insert_passage(store, "doc1.txt", 1, "second chunk here", 3);
+    pg_store_insert_passage(store, "doc2.txt", 0, "one", 1);
 
     BM25CorpusStats stats = bm25_corpus_stats(store);
     TEST_ASSERT(stats.total_passages == 3, "expected 3 passages, got %ld",
@@ -51,20 +56,20 @@ static void test_corpus_stats_computes_n_and_avgdl(void) {
     TEST_ASSERT(stats.avg_passage_length == 2.0,
                 "expected avg length 2.0, got %f", stats.avg_passage_length);
 
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 static void test_document_frequency_counts_matching_passages(void) {
-    SqliteStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
-    sqlite3_int64 p1 = sqlite_store_insert_passage(store, "doc1.txt", 0, "hypertension risk", 2);
-    sqlite3_int64 p2 = sqlite_store_insert_passage(store, "doc1.txt", 1, "treatment plan", 2);
-    sqlite3_int64 p3 = sqlite_store_insert_passage(store, "doc2.txt", 0, "hypertension causes", 2);
+    int64_t p1 = pg_store_insert_passage(store, "doc1.txt", 0, "hypertension risk", 2);
+    int64_t p2 = pg_store_insert_passage(store, "doc1.txt", 1, "treatment plan", 2);
+    int64_t p3 = pg_store_insert_passage(store, "doc2.txt", 0, "hypertension causes", 2);
 
-    sqlite3_int64 term_id = sqlite_store_get_or_create_term(store, "hypertension");
-    sqlite_store_insert_posting(store, term_id, p1, 1);
-    sqlite_store_insert_posting(store, term_id, p3, 1);
+    int64_t term_id = pg_store_get_or_create_term(store, "hypertension");
+    pg_store_insert_posting(store, term_id, p1, 1);
+    pg_store_insert_posting(store, term_id, p3, 1);
 
     /* p2 never gets a posting for this term — df should count only p1/p3. */
     (void)p2;
@@ -72,19 +77,19 @@ static void test_document_frequency_counts_matching_passages(void) {
     long df = bm25_document_frequency(store, term_id);
     TEST_ASSERT(df == 2, "expected document frequency 2, got %ld", df);
 
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 static void test_document_frequency_zero_for_unseen_term(void) {
-    SqliteStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
-    sqlite3_int64 term_id = sqlite_store_get_or_create_term(store, "orphan");
+    int64_t term_id = pg_store_get_or_create_term(store, "orphan");
 
     long df = bm25_document_frequency(store, term_id);
     TEST_ASSERT(df == 0, "expected document frequency 0 for a term with no postings, got %ld", df);
 
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 static void test_idf_rare_term_scores_high(void) {
@@ -229,13 +234,13 @@ static void test_result_set_add_grows_past_initial_capacity(void) {
      * two reallocations, and verify every entry survives the growth
      * intact (an old bug class: realloc into the wrong pointer would
      * silently lose everything already stored). */
-    for (sqlite3_int64 i = 0; i < 20; i++) {
+    for (int64_t i = 0; i < 20; i++) {
         int result = bm25_result_set_add(set, i, (double)i);
         TEST_ASSERT(result == 0, "expected add %lld to succeed", (long long)i);
     }
 
     TEST_ASSERT(set->count == 20, "expected 20 entries after growth, got %zu", set->count);
-    for (sqlite3_int64 i = 0; i < 20; i++) {
+    for (int64_t i = 0; i < 20; i++) {
         TEST_ASSERT(set->items[i].passage_id == i,
                     "expected entry %lld to have passage_id %lld, got %lld",
                     (long long)i, (long long)i, (long long)set->items[i].passage_id);
@@ -254,28 +259,28 @@ static void test_result_set_free_null_is_safe(void) {
 /* Seeds a small realistic corpus: P1 matches both query terms, P2 and P4
  * match only "hypertension", P3 matches neither -- for search-level tests
  * further down (bm25_accumulate_term_scores, bm25_search). */
-static void seed_search_corpus(SqliteStore *store, sqlite3_int64 *hypertension_id,
-                                sqlite3_int64 *treatment_id, sqlite3_int64 *p1,
-                                sqlite3_int64 *p2, sqlite3_int64 *p3, sqlite3_int64 *p4) {
-    *p1 = sqlite_store_insert_passage(store, "doc1.txt", 0, "hypertension treatment options", 3);
-    *p2 = sqlite_store_insert_passage(store, "doc1.txt", 1, "hypertension causes and risk factors", 6);
-    *p3 = sqlite_store_insert_passage(store, "doc2.txt", 0, "cardiac arrest emergency response", 4);
-    *p4 = sqlite_store_insert_passage(store, "doc2.txt", 1, "hypertension is a common condition", 6);
+static void seed_search_corpus(PgStore *store, int64_t *hypertension_id,
+                                int64_t *treatment_id, int64_t *p1,
+                                int64_t *p2, int64_t *p3, int64_t *p4) {
+    *p1 = pg_store_insert_passage(store, "doc1.txt", 0, "hypertension treatment options", 3);
+    *p2 = pg_store_insert_passage(store, "doc1.txt", 1, "hypertension causes and risk factors", 6);
+    *p3 = pg_store_insert_passage(store, "doc2.txt", 0, "cardiac arrest emergency response", 4);
+    *p4 = pg_store_insert_passage(store, "doc2.txt", 1, "hypertension is a common condition", 6);
 
-    *hypertension_id = sqlite_store_get_or_create_term(store, "hypertension");
-    *treatment_id = sqlite_store_get_or_create_term(store, "treatment");
+    *hypertension_id = pg_store_get_or_create_term(store, "hypertension");
+    *treatment_id = pg_store_get_or_create_term(store, "treatment");
 
-    sqlite_store_insert_posting(store, *hypertension_id, *p1, 1);
-    sqlite_store_insert_posting(store, *hypertension_id, *p2, 1);
-    sqlite_store_insert_posting(store, *hypertension_id, *p4, 1);
-    sqlite_store_insert_posting(store, *treatment_id, *p1, 1);
+    pg_store_insert_posting(store, *hypertension_id, *p1, 1);
+    pg_store_insert_posting(store, *hypertension_id, *p2, 1);
+    pg_store_insert_posting(store, *hypertension_id, *p4, 1);
+    pg_store_insert_posting(store, *treatment_id, *p1, 1);
 }
 
 static void test_accumulate_term_scores_matches_only_relevant_passages(void) {
-    SqliteStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
-    sqlite3_int64 hypertension_id, treatment_id, p1, p2, p3, p4;
+    int64_t hypertension_id, treatment_id, p1, p2, p3, p4;
     seed_search_corpus(store, &hypertension_id, &treatment_id, &p1, &p2, &p3, &p4);
 
     BM25CorpusStats stats = bm25_corpus_stats(store);
@@ -296,14 +301,14 @@ static void test_accumulate_term_scores_matches_only_relevant_passages(void) {
     }
 
     bm25_result_set_free(results);
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 static void test_search_ranks_multi_term_match_highest(void) {
-    SqliteStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
-    sqlite3_int64 hypertension_id, treatment_id, p1, p2, p3, p4;
+    int64_t hypertension_id, treatment_id, p1, p2, p3, p4;
     seed_search_corpus(store, &hypertension_id, &treatment_id, &p1, &p2, &p3, &p4);
 
     const char *query_terms[] = {"hypertension", "treatment"};
@@ -331,14 +336,14 @@ static void test_search_ranks_multi_term_match_highest(void) {
     }
 
     bm25_result_set_free(results);
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 static void test_search_respects_top_k(void) {
-    SqliteStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
-    sqlite3_int64 hypertension_id, treatment_id, p1, p2, p3, p4;
+    int64_t hypertension_id, treatment_id, p1, p2, p3, p4;
     seed_search_corpus(store, &hypertension_id, &treatment_id, &p1, &p2, &p3, &p4);
 
     const char *query_terms[] = {"hypertension", "treatment"};
@@ -352,14 +357,14 @@ static void test_search_respects_top_k(void) {
                 (long long)results->items[0].passage_id);
 
     bm25_result_set_free(results);
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 static void test_search_skips_unindexed_query_terms(void) {
-    SqliteStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
-    sqlite3_int64 hypertension_id, treatment_id, p1, p2, p3, p4;
+    int64_t hypertension_id, treatment_id, p1, p2, p3, p4;
     seed_search_corpus(store, &hypertension_id, &treatment_id, &p1, &p2, &p3, &p4);
 
     const char *query_terms[] = {"nonexistentword"};
@@ -371,12 +376,12 @@ static void test_search_skips_unindexed_query_terms(void) {
                 results->count);
 
     bm25_result_set_free(results);
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 static void test_search_empty_corpus_returns_empty_results(void) {
-    SqliteStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected sqlite_store_open to succeed");
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
     const char *query_terms[] = {"anything"};
     BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B};
@@ -385,7 +390,7 @@ static void test_search_empty_corpus_returns_empty_results(void) {
     TEST_ASSERT(results->count == 0, "expected 0 results from an empty corpus, got %zu", results->count);
 
     bm25_result_set_free(results);
-    sqlite_store_close(store);
+    pg_store_close(store);
 }
 
 int main(void) {
@@ -411,6 +416,5 @@ int main(void) {
     test_search_respects_top_k();
     test_search_skips_unindexed_query_terms();
     test_search_empty_corpus_returns_empty_results();
-    remove(TEST_DB_PATH);
     return test_summary();
 }
