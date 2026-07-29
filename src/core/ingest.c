@@ -198,10 +198,32 @@ static TokenList *ingest_lemmatize_terms(const WordNetTable *wordnet,
  * term, counts how many times it occurs in this chunk and writes exactly
  * one posting row for it. O(n^2) over the chunk's term count -- acceptable
  * at chunk scale (a few hundred terms at most), same tradeoff already made
- * for bm25_result_set_add's linear scan. Returns 0 on success, -1 on a
+ * for bm25_result_set_add's linear scan.
+ *
+ * Batches the whole chunk into pg_store_get_or_create_terms() +
+ * pg_store_insert_postings() -- a fixed handful of round trips regardless
+ * of how many distinct terms the chunk has, instead of two round trips
+ * *per term*. That per-term round-trip cost, at ~0.13ms each measured
+ * against this project's Docker Postgres, dominated single-threaded
+ * ingestion latency badly enough to make it slower than the SQLite
+ * version it replaced (see LIMITATIONS.md) -- SQLite's in-process calls
+ * never paid a network round trip at all. Returns 0 on success, -1 on a
  * database error. */
 static int ingest_index_chunk_terms(PgStore *store, const TokenList *terms,
                                     int64_t passage_id) {
+  if (terms->count == 0) {
+    return 0;
+  }
+
+  const char **distinct_terms = malloc(sizeof(char *) * terms->count);
+  int *frequencies = malloc(sizeof(int) * terms->count);
+  if (distinct_terms == NULL || frequencies == NULL) {
+    free(distinct_terms);
+    free(frequencies);
+    return -1;
+  }
+
+  size_t distinct_count = 0;
   for (size_t i = 0; i < terms->count; i++) {
     int already_indexed = 0;
     for (size_t j = 0; j < i; j++) {
@@ -221,19 +243,22 @@ static int ingest_index_chunk_terms(PgStore *store, const TokenList *terms,
       }
     }
 
-    int64_t term_id =
-        pg_store_get_or_create_term(store, terms->terms[i]);
-    if (term_id == -1) {
-      return -1;
-    }
-
-    if (pg_store_insert_posting(store, term_id, passage_id, frequency) !=
-        0) {
-      return -1;
-    }
+    distinct_terms[distinct_count] = terms->terms[i];
+    frequencies[distinct_count] = frequency;
+    distinct_count++;
   }
 
-  return 0;
+  int64_t *term_ids = pg_store_get_or_create_terms(store, distinct_terms, distinct_count);
+  free(distinct_terms);
+  if (term_ids == NULL) {
+    free(frequencies);
+    return -1;
+  }
+
+  int result = pg_store_insert_postings(store, term_ids, passage_id, frequencies, distinct_count);
+  free(term_ids);
+  free(frequencies);
+  return result;
 }
 
 long ingest_document(PgStore *store, const StopwordSet *stopwords,

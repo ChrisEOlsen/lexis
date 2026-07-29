@@ -225,6 +225,110 @@ static void test_get_or_create_term_survives_concurrent_style_conflict(void) {
     pg_store_close(store);
 }
 
+static void test_get_or_create_terms_batch_mixes_new_and_existing(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+    int64_t pre_existing = pg_store_get_or_create_term(store, "hypertension");
+    TEST_ASSERT(pre_existing != -1, "expected setup term to insert");
+
+    const char *terms[3] = {"hypertension", "treatment", "diagnosis"};
+    int64_t *ids = pg_store_get_or_create_terms(store, terms, 3);
+    TEST_ASSERT(ids != NULL, "expected batch resolve to succeed");
+    TEST_ASSERT(ids[0] == pre_existing, "expected the already-existing term to resolve to its real id");
+    TEST_ASSERT(ids[1] != -1 && ids[2] != -1, "expected the two new terms to get real ids");
+    TEST_ASSERT(ids[1] != ids[2], "expected the two distinct new terms to get distinct ids");
+    free(ids);
+
+    PGresult *res = PQexec(store->conn, "SELECT COUNT(*) FROM terms;");
+    TEST_ASSERT(atoi(PQgetvalue(res, 0, 0)) == 3, "expected exactly 3 term rows total, got %s",
+                PQgetvalue(res, 0, 0));
+    PQclear(res);
+
+    pg_store_close(store);
+}
+
+static void test_get_or_create_terms_batch_handles_duplicates_in_input(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+    /* "treatment" appears twice in the same batch -- must resolve to the
+     * same id both times, and must not create two rows. */
+    const char *terms[3] = {"treatment", "hypertension", "treatment"};
+    int64_t *ids = pg_store_get_or_create_terms(store, terms, 3);
+    TEST_ASSERT(ids != NULL, "expected batch resolve to succeed");
+    TEST_ASSERT(ids[0] == ids[2], "expected both occurrences of \"treatment\" to resolve to the same id");
+    free(ids);
+
+    PGresult *res = PQexec(store->conn, "SELECT COUNT(*) FROM terms WHERE term = 'treatment';");
+    TEST_ASSERT(atoi(PQgetvalue(res, 0, 0)) == 1, "expected exactly 1 row for \"treatment\", got %s",
+                PQgetvalue(res, 0, 0));
+    PQclear(res);
+
+    pg_store_close(store);
+}
+
+static void test_get_or_create_terms_batch_handles_special_characters(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+    /* Exercises the array-literal escaping path directly -- a comma is
+     * the array-element separator, so this term ("1,000", which the
+     * tokenizer's internal-connector-punctuation rule can legitimately
+     * produce) must round-trip intact, not get split into two elements. */
+    const char *terms[2] = {"1,000", "normal"};
+    int64_t *ids = pg_store_get_or_create_terms(store, terms, 2);
+    TEST_ASSERT(ids != NULL, "expected batch resolve to succeed");
+    TEST_ASSERT(ids[0] != -1 && ids[1] != -1, "expected both terms to resolve");
+    free(ids);
+
+    PGresult *res = PQexec(store->conn, "SELECT term FROM terms ORDER BY id;");
+    TEST_ASSERT(PQntuples(res) == 2, "expected exactly 2 term rows, got %d", PQntuples(res));
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 0), "1,000");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 1, 0), "normal");
+    PQclear(res);
+
+    pg_store_close(store);
+}
+
+static void test_insert_postings_batch_zips_not_cross_products(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+    int64_t passage_id = pg_store_insert_passage(store, "doc1.txt", 0, "some text", 3);
+    const char *terms[3] = {"alpha", "beta", "gamma"};
+    int64_t *term_ids = pg_store_get_or_create_terms(store, terms, 3);
+    TEST_ASSERT(term_ids != NULL, "expected batch resolve to succeed");
+
+    int frequencies[3] = {5, 7, 9};
+    int result = pg_store_insert_postings(store, term_ids, passage_id, frequencies, 3);
+    TEST_ASSERT(result == 0, "expected batch posting insert to succeed");
+
+    /* If unnest() were a cross product instead of zipping element-wise,
+     * this would be 9 rows (3x3), not 3. */
+    PGresult *res = PQexec(store->conn, "SELECT COUNT(*) FROM postings;");
+    TEST_ASSERT(atoi(PQgetvalue(res, 0, 0)) == 3, "expected exactly 3 posting rows, got %s",
+                PQgetvalue(res, 0, 0));
+    PQclear(res);
+
+    /* And each term_id must be paired with its OWN frequency, not a
+     * mismatched one. */
+    for (int i = 0; i < 3; i++) {
+        char term_id_str[32];
+        snprintf(term_id_str, sizeof(term_id_str), "%lld", (long long)term_ids[i]);
+        const char *params[1] = {term_id_str};
+        res = PQexecParams(store->conn, "SELECT term_frequency FROM postings WHERE term_id = $1;", 1, NULL,
+                            params, NULL, NULL, 0);
+        TEST_ASSERT(atoi(PQgetvalue(res, 0, 0)) == frequencies[i],
+                    "expected term_ids[%d] paired with frequency %d, got %s", i, frequencies[i],
+                    PQgetvalue(res, 0, 0));
+        PQclear(res);
+    }
+
+    free(term_ids);
+    pg_store_close(store);
+}
+
 int main(void) {
     test_open_creates_store();
     test_insert_passage_returns_ids();
@@ -239,5 +343,9 @@ int main(void) {
     test_commit_transaction_persists_writes();
     test_rollback_transaction_discards_writes();
     test_get_or_create_term_survives_concurrent_style_conflict();
+    test_get_or_create_terms_batch_mixes_new_and_existing();
+    test_get_or_create_terms_batch_handles_duplicates_in_input();
+    test_get_or_create_terms_batch_handles_special_characters();
+    test_insert_postings_batch_zips_not_cross_products();
     return test_summary();
 }
