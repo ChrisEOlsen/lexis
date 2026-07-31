@@ -5,7 +5,7 @@
 
 #include "generation.h"
 
-#include "openrouter_client.h"
+#include "local_llm_client.h"
 #include "string_builder.h"
 
 #include <stdio.h>
@@ -72,14 +72,14 @@ fail:
     return NULL;
 }
 
-char *generation_generate_answer(const char *query_text, const char *model,
-                                  PgStore *store, const BM25ResultSet *results) {
+char *generation_generate_answer(const char *query_text, PgStore *store,
+                                  const BM25ResultSet *results) {
     char *prompt = generation_build_prompt(query_text, store, results);
     if (prompt == NULL) {
         return NULL;
     }
 
-    char *answer = openrouter_chat_completion(model, prompt);
+    char *answer = local_llm_chat_completion(prompt);
     free(prompt);
     return answer;
 }

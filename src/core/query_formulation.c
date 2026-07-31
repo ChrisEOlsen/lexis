@@ -9,7 +9,7 @@
 
 #include "query_formulation.h"
 
-#include "openrouter_client.h"
+#include "local_llm_client.h"
 #include "string_builder.h"
 #include "tokenizer.h"
 
@@ -237,7 +237,7 @@ TokenList *query_formulation_parse_selected_terms(
     return result;
 }
 
-TokenList *query_formulation_formulate_query(const char *query_text, const char *model,
+TokenList *query_formulation_formulate_query(const char *query_text,
                                               const StopwordSet *stopwords,
                                               const WordNetTable *wordnet,
                                               const Lemmatizer *lemmatizer) {
@@ -260,7 +260,7 @@ TokenList *query_formulation_formulate_query(const char *query_text, const char 
         return NULL;
     }
 
-    char *response = openrouter_chat_completion(model, prompt);
+    char *response = local_llm_chat_completion(prompt);
     free(prompt);
 
     TokenList *selected_terms;

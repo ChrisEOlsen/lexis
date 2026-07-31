@@ -17,7 +17,7 @@
 #include "generation.h"
 #include "ingest.h"
 #include "lemmatizer.h"
-#include "openrouter_client.h"
+#include "local_llm_client.h"
 #include "pg_store.h"
 #include "query_formulation.h"
 #include "query_log.h"
@@ -40,7 +40,13 @@
 #define LEXIS_STOPWORDS_PATH "data/stopwords/english.txt"
 #define LEXIS_WORDNET_DIR "data/wordnet"
 #define LEXIS_CONFIG_PATH "config/lexis.conf"
-#define LEXIS_MODEL "openai/gpt-4o-mini"
+/* Local GGUF model, loaded once at startup (see local_llm_client.c) and
+ * reused for both query formulation and generation -- replaces the
+ * OpenRouter API per the project's move to a locally hosted model. See
+ * SPEED.md/LIMITATIONS.md for why this specific model/quantization was
+ * chosen (8GB RAM budget, shared with Docker Postgres). */
+#define LEXIS_MODEL_PATH "data/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
+#define LEXIS_MODEL_LABEL "Llama-3.2-3B-Instruct-Q4_K_M (local)"
 #define LEXIS_CHUNK_SIZE 200
 #define LEXIS_CHUNK_OVERLAP 40
 /* Measured sweet spot on this machine's 8 logical cores (see SPEED.md's
@@ -154,8 +160,8 @@ static int run_query(const char *question) {
         fprintf(stderr, "lexis: warning: pipeline logging unavailable, continuing without it\n");
     }
 
-    if (openrouter_client_init() != 0) {
-        fprintf(stderr, "lexis: failed to initialize the OpenRouter HTTP client\n");
+    if (local_llm_client_init(LEXIS_MODEL_PATH) != 0) {
+        fprintf(stderr, "lexis: failed to load local model from %s\n", LEXIS_MODEL_PATH);
         pg_store_close(store);
         stopword_set_free(stopwords);
         wordnet_table_free(wordnet);
@@ -197,7 +203,7 @@ static int run_query(const char *question) {
     } else {
         qf_prompt = query_formulation_build_prompt(question, candidates);
         if (qf_prompt != NULL) {
-            qf_response = openrouter_chat_completion(LEXIS_MODEL, qf_prompt);
+            qf_response = local_llm_chat_completion(qf_prompt);
             used_fallback = (qf_response == NULL);
         }
         /* query_formulation_parse_selected_terms() falls back to
@@ -307,19 +313,22 @@ static int run_query(const char *question) {
         struct timespec gen_start, gen_end;
         clock_gettime(CLOCK_MONOTONIC, &gen_start);
         char *gen_prompt = generation_build_prompt(question, store, results);
-        char *answer = generation_generate_answer(question, LEXIS_MODEL, store, results);
+        if (mode == LEXIS_MODE_TESTING && gen_prompt != NULL) {
+            printf("--- Generation prompt ---\n%s\n--- End generation prompt ---\n\n", gen_prompt);
+        }
+        char *answer = generation_generate_answer(question, store, results);
         clock_gettime(CLOCK_MONOTONIC, &gen_end);
         bm25_result_set_free(results);
 
         if (query_id != -1) {
-            query_log_insert_generation_run(store, query_id, LEXIS_MODEL, passages_included,
+            query_log_insert_generation_run(store, query_id, LEXIS_MODEL_LABEL, passages_included,
                                              passages_skipped, gen_prompt, answer, answer != NULL,
                                              elapsed_ms(gen_start, gen_end));
         }
         free(gen_prompt);
 
         if (answer == NULL) {
-            fprintf(stderr, "lexis: could not generate an answer -- is OPENROUTER_API_KEY set?\n");
+            fprintf(stderr, "lexis: could not generate an answer -- local model generation failed\n");
             exit_code = 1;
             goto cleanup;
         }
@@ -335,7 +344,7 @@ cleanup:
         query_log_finish_query(store, query_id, elapsed_ms(pipeline_start, pipeline_end),
                                 pipeline_succeeded);
     }
-    openrouter_client_cleanup();
+    local_llm_client_cleanup();
     pg_store_close(store);
     stopword_set_free(stopwords);
     wordnet_table_free(wordnet);

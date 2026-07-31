@@ -6,10 +6,6 @@
  * pieces together.
  */
 
-/* See tokenizer.c for why this must come before any #include (unsetenv is
- * a POSIX extension hidden by glibc under strict -std=c11 otherwise). */
-#define _POSIX_C_SOURCE 200809L
-
 #include "query_formulation.h"
 #include "lemmatizer.h"
 #include "wordnet.h"
@@ -295,19 +291,18 @@ static void test_parse_selected_terms_ignores_non_string_items(void) {
     stopword_set_free(stopwords);
 }
 
-static void test_formulate_query_falls_back_without_api_key(void) {
-    unsetenv("OPENROUTER_API_KEY");
-
+static void test_formulate_query_falls_back_without_local_model(void) {
     StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
     WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    /* openrouter_chat_completion() returns NULL immediately with no API
-     * key set -- no network call happens. This exercises the real
-     * API-failure fallback path without needing network access. */
+    /* local_llm_chat_completion() returns NULL immediately when
+     * local_llm_client_init() hasn't been called -- no model load
+     * happens. This exercises the real generation-failure fallback path
+     * without needing a loaded model in this test binary. */
     TokenList *result = query_formulation_formulate_query(
-        "What is the treatment for hypertension?", "openai/gpt-4", stopwords, wordnet, lemmatizer);
+        "What is the treatment for hypertension?", stopwords, wordnet, lemmatizer);
     TEST_ASSERT(result != NULL, "expected a fallback result, not NULL, when the API call fails");
     TEST_ASSERT(result->count == 2, "expected fallback to the 2 original terms, got %zu", result->count);
     TEST_ASSERT_STR_EQ(result->terms[0], "treatment");
@@ -325,8 +320,8 @@ static void test_formulate_query_all_stopwords_returns_empty_not_null(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    TokenList *result = query_formulation_formulate_query("what is the for", "openai/gpt-4", stopwords,
-                                                            wordnet, lemmatizer);
+    TokenList *result =
+        query_formulation_formulate_query("what is the for", stopwords, wordnet, lemmatizer);
     TEST_ASSERT(result != NULL, "expected an empty result, not NULL, for an all-stopwords query");
     TEST_ASSERT(result->count == 0, "expected 0 terms, got %zu", result->count);
 
@@ -348,7 +343,7 @@ int main(void) {
     test_parse_selected_terms_non_array_falls_back();
     test_parse_selected_terms_empty_array_falls_back();
     test_parse_selected_terms_ignores_non_string_items();
-    test_formulate_query_falls_back_without_api_key();
+    test_formulate_query_falls_back_without_local_model();
     test_formulate_query_all_stopwords_returns_empty_not_null();
     return test_summary();
 }

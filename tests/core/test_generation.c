@@ -3,10 +3,6 @@
  * grounded generation prompt (spec 5.2.7).
  */
 
-/* See tokenizer.c for why this must come before any #include (unsetenv is
- * a POSIX extension hidden by glibc under strict -std=c11 otherwise). */
-#define _POSIX_C_SOURCE 200809L
-
 #include "generation.h"
 #include "test_utils.h"
 
@@ -111,9 +107,7 @@ static void test_build_prompt_all_passages_unloadable_returns_null(void) {
     pg_store_close(store);
 }
 
-static void test_generate_answer_returns_null_without_api_key(void) {
-    unsetenv("OPENROUTER_API_KEY");
-
+static void test_generate_answer_returns_null_without_loaded_model(void) {
     PgStore *store = open_fresh_store();
     TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
     int64_t p1 = pg_store_insert_passage(store, "doc1.txt", 0, "some real content", 3);
@@ -121,11 +115,13 @@ static void test_generate_answer_returns_null_without_api_key(void) {
     BM25ResultSet *results = bm25_result_set_create();
     bm25_result_set_add(results, p1, 5.0);
 
-    /* Unlike query formulation, generation has no fallback -- an API
-     * failure just propagates as NULL, since there's no "lesser" answer
-     * to fall back to. */
-    char *answer = generation_generate_answer("a question", "openai/gpt-4", store, results);
-    TEST_ASSERT(answer == NULL, "expected NULL when the API call fails, no fallback answer");
+    /* Unlike query formulation, generation has no fallback -- a
+     * generation failure just propagates as NULL, since there's no
+     * "lesser" answer to fall back to. local_llm_chat_completion()
+     * returns NULL here since local_llm_client_init() is never called in
+     * this test binary. */
+    char *answer = generation_generate_answer("a question", store, results);
+    TEST_ASSERT(answer == NULL, "expected NULL when generation fails, no fallback answer");
 
     bm25_result_set_free(results);
     pg_store_close(store);
@@ -137,8 +133,8 @@ static void test_generate_answer_empty_results_returns_null(void) {
 
     BM25ResultSet *results = bm25_result_set_create();
 
-    char *answer = generation_generate_answer("a question", "openai/gpt-4", store, results);
-    TEST_ASSERT(answer == NULL, "expected NULL for empty results, without needing an API key at all");
+    char *answer = generation_generate_answer("a question", store, results);
+    TEST_ASSERT(answer == NULL, "expected NULL for empty results, without needing a loaded model at all");
 
     bm25_result_set_free(results);
     pg_store_close(store);
@@ -149,7 +145,7 @@ int main(void) {
     test_build_prompt_empty_results_returns_null();
     test_build_prompt_skips_unloadable_passages();
     test_build_prompt_all_passages_unloadable_returns_null();
-    test_generate_answer_returns_null_without_api_key();
+    test_generate_answer_returns_null_without_loaded_model();
     test_generate_answer_empty_results_returns_null();
     return test_summary();
 }

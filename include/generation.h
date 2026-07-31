@@ -24,13 +24,13 @@
 char *generation_build_prompt(const char *query_text, PgStore *store,
                                const BM25ResultSet *results);
 
-/* Runs the full generation step: builds the prompt and calls `model` via
- * OpenRouter to produce the final answer. Returns the answer text
- * (caller must free()), or NULL if prompt-building or the API call
- * fails. Unlike query formulation, there's no fallback here -- if
- * generation itself fails, there's no lesser answer to fall back to;
- * the caller has to decide how to handle "no answer available". */
-char *generation_generate_answer(const char *query_text, const char *model,
-                                  PgStore *store, const BM25ResultSet *results);
+/* Runs the full generation step: builds the prompt and calls the local
+ * model to produce the final answer. Returns the answer text (caller
+ * must free()), or NULL if prompt-building or generation itself fails.
+ * Unlike query formulation, there's no fallback here -- if generation
+ * itself fails, there's no lesser answer to fall back to; the caller has
+ * to decide how to handle "no answer available". */
+char *generation_generate_answer(const char *query_text, PgStore *store,
+                                  const BM25ResultSet *results);
 
 #endif /* LEXIS_GENERATION_H */

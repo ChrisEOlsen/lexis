@@ -77,14 +77,13 @@ TokenList *query_formulation_parse_selected_terms(const char *response_text,
                                                    const QueryFormulationCandidates *fallback_candidates);
 
 /* Runs the full query formulation step: gathers WordNet candidates,
- * builds the prompt, calls `model` via OpenRouter, and parses the
- * result -- falling back to the original stopword-filtered query terms
- * if the API call itself fails (openrouter_chat_completion returns
- * NULL) or the response is unparseable. Returns an empty TokenList (not
- * NULL) if nothing survives stopword filtering -- a valid "nothing to
- * search for" outcome, not a failure. Returns NULL only on allocation
- * failure. */
-TokenList *query_formulation_formulate_query(const char *query_text, const char *model,
+ * builds the prompt, calls the local model, and parses the result --
+ * falling back to the original stopword-filtered query terms if the call
+ * itself fails (local_llm_chat_completion returns NULL) or the response
+ * is unparseable. Returns an empty TokenList (not NULL) if nothing
+ * survives stopword filtering -- a valid "nothing to search for" outcome,
+ * not a failure. Returns NULL only on allocation failure. */
+TokenList *query_formulation_formulate_query(const char *query_text,
                                               const StopwordSet *stopwords,
                                               const WordNetTable *wordnet,
                                               const Lemmatizer *lemmatizer);

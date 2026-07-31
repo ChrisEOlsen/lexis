@@ -9,6 +9,10 @@
 /data/index/*
 !/data/index/.gitkeep
 
+# Local LLM model weights (large binaries, fetched via scripts/download_model.sh)
+/data/models/*
+!/data/models/.gitkeep
+
 # Python sidecar
 __pycache__/
 *.pyc

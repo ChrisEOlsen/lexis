@@ -4,3 +4,5 @@
 -Iinclude
 -Iinclude/vendor
 -I/opt/homebrew/opt/postgresql@18/include/postgresql
+-I/opt/homebrew/Cellar/llama.cpp/10180/include
+-I/opt/homebrew/Cellar/ggml/0.18.0/include

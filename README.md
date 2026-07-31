@@ -9,8 +9,8 @@ See `LEXIS_Project_Specification.docx` for the full project specification.
 ## Layout
 
 - `src/core/` — C retrieval/indexing core: tokenizer, stopword filter,
-  SQLite-backed inverted index, BM25 scorer, ingestion pipeline, OpenRouter
-  HTTP client, WordNet synonym/hypernym/hyponym lookup
+  Postgres-backed inverted index, BM25 scorer, ingestion pipeline, a
+  llama.cpp-backed local LLM client, WordNet synonym/hypernym/hyponym lookup
 - `src/sidecar/` — Python sidecar, currently scoped to just the optional
   cross-encoder reranker (Stage 9). POS tagging is deferred and synonym
   expansion is implemented natively in C — see LIMITATIONS.md
@@ -22,6 +22,9 @@ See `LEXIS_Project_Specification.docx` for the full project specification.
 - `tests/` — C and Python test suites
 
 ## Build
+
+Requires `docker compose up -d` running (Postgres) and the local model
+downloaded once via `scripts/download_model.sh`.
 
 ```
 make check
