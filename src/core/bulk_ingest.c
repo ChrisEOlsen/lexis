@@ -27,6 +27,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+/* Same helper as main.c's -- duplicated rather than shared across a
+ * translation-unit boundary for four lines of code. */
+static long elapsed_ms(struct timespec start, struct timespec end) {
+    long seconds = end.tv_sec - start.tv_sec;
+    long nanoseconds = end.tv_nsec - start.tv_nsec;
+    return seconds * 1000 + nanoseconds / 1000000;
+}
 
 /* Rows claimed per round trip -- large enough to amortize the network
  * round trip across many documents, small enough that one worker
@@ -276,6 +285,9 @@ long bulk_ingest_tsv(const char *conninfo, const StopwordSet *stopwords,
      * pg_store_copy_documents_raw() and SPEED.md for the format-safety
      * investigation (real MS MARCO passages contain literal, unescaped
      * backslash and double-quote characters) that led here. */
+    struct timespec phase1_start, phase1_end;
+    clock_gettime(CLOCK_MONOTONIC, &phase1_start);
+
     if (pg_store_create_staging_tables(coordinator) != 0 ||
         pg_store_truncate_staging_tables(coordinator) != 0) {
         fprintf(stderr, "bulk_ingest_tsv: failed to prepare staging tables\n");
@@ -290,8 +302,13 @@ long bulk_ingest_tsv(const char *conninfo, const StopwordSet *stopwords,
         return -1;
     }
 
+    clock_gettime(CLOCK_MONOTONIC, &phase1_end);
+
     /* Phase 2: thread_count workers, each with its own connection,
      * race-free by construction -- see this file's header comment. */
+    struct timespec phase2_start, phase2_end;
+    clock_gettime(CLOCK_MONOTONIC, &phase2_start);
+
     pthread_t *threads = malloc(sizeof(pthread_t) * (size_t)thread_count);
     Phase2Worker *workers = malloc(sizeof(Phase2Worker) * (size_t)thread_count);
     if (threads == NULL || workers == NULL) {
@@ -331,6 +348,8 @@ long bulk_ingest_tsv(const char *conninfo, const StopwordSet *stopwords,
         }
     }
 
+    clock_gettime(CLOCK_MONOTONIC, &phase2_end);
+
     pthread_mutex_destroy(&range_mutex);
     free(threads);
     free(workers);
@@ -343,6 +362,9 @@ long bulk_ingest_tsv(const char *conninfo, const StopwordSet *stopwords,
     /* Phase 3: single-threaded, set-based term resolution -- the only
      * point in this whole pipeline that touches the terms table, and the
      * only writer when it does. */
+    struct timespec phase3_start, phase3_end;
+    clock_gettime(CLOCK_MONOTONIC, &phase3_start);
+
     long postings_written = pg_store_finalize_terms_and_postings(coordinator);
     if (postings_written < 0) {
         fprintf(stderr, "bulk_ingest_tsv: Phase 3 (finalize) failed\n");
@@ -350,8 +372,19 @@ long bulk_ingest_tsv(const char *conninfo, const StopwordSet *stopwords,
         return -1;
     }
 
+    clock_gettime(CLOCK_MONOTONIC, &phase3_end);
+
     pg_store_drop_staging_tables(coordinator);
     pg_store_close(coordinator);
+
+    /* Per-phase breakdown -- printed unconditionally on success, same
+     * convention as eval_run()'s own progress printing (see eval.h),
+     * since this pipeline is meant to be watched during a long real run,
+     * not just checked for a final pass/fail. */
+    printf("bulk_ingest_tsv: Phase 1 (raw append) %ldms, Phase 2 (parallel processing) %ldms, "
+           "Phase 3 (finalize) %ldms, %lld rows staged, %ld postings written\n",
+           elapsed_ms(phase1_start, phase1_end), elapsed_ms(phase2_start, phase2_end),
+           elapsed_ms(phase3_start, phase3_end), (long long)total_rows, postings_written);
 
     return total_passages;
 }

@@ -279,10 +279,15 @@ never touch the `terms` table at all until every other thread is done.
    raised to 1GB for this connection only (a session-local `SET`, not a
    `postgresql.conf` change) since this is the one place in the whole
    pipeline actually running a large hash join/distinct. The `TermCache`
-   module (`term_cache.c`/`.h`) is untouched and still used by
+   module (`term_cache.c`/`.h`) was, at this point, still used by
    `concurrent_ingest.c`'s separate directory-ingestion path --
-   `bulk_ingest.c` no longer depends on it at all, since Phase 2 has
-   nothing left for it to coordinate.
+   `bulk_ingest.c` never depended on it, since Phase 2 has nothing for it
+   to coordinate. Both `concurrent_ingest.c` and `term_cache.c` were
+   later deleted outright once this pipeline proved faster and simpler
+   to reason about than the directory-ingestion path -- see the "one
+   ingestion pipeline" cleanup recorded in git history and
+   `CURRENT_STATE.md`; this section is left as-is as the historical
+   record of the state at the time this redesign shipped.
 
 **Real measured result, 200K-row slice, native Postgres, 6 threads:
 3490.9 passages/sec** (`lexis bulk-ingest`, wall clock 57.3s for 200,009
@@ -296,8 +301,31 @@ after the run; pid 226 (one of the real backslash-containing rows from
 the format investigation above) round-tripped with its literal
 `\displaystyle` text intact; a real `lexis query "energy of a photon"`
 against the resulting index returned pid 226 among genuinely relevant
-top-5 BM25 results with correct scores. Not yet run at full 8.84M-row
-scale -- see "Next optimizations" below.
+top-5 BM25 results with correct scores.
+
+### Per-phase profiling: Phase 3 is the real bottleneck, not Phase 2
+
+Before this, it was only a guess which phase actually dominated wall-clock
+time -- `bulk_ingest_tsv()` only reported total elapsed time. Added
+per-phase `clock_gettime()` instrumentation (printed unconditionally on
+success, same convention as `eval_run()`'s own progress printing) and
+re-ran the identical 200K-row benchmark. Real breakdown:
+
+| Phase | Time | Share of total |
+|---|---|---|
+| Phase 1 (raw append / COPY) | 576ms | 1.0% |
+| Phase 2 (parallel processing, 6 threads) | 7,806ms | 13.6% |
+| Phase 3 (finalize) | 49,172ms | **85.4%** |
+| Total | 57,576ms | -- |
+
+This inverts the intuitive assumption that the "embarrassingly parallel"
+phase would dominate at scale. Phase 3 -- a single-threaded `INSERT ...
+SELECT DISTINCT ... ON CONFLICT DO NOTHING` into `terms`, then an
+`INSERT ... SELECT` joining `postings_staged` (5,052,759 rows at this
+scale) against `terms` -- is over 6x slower than the six-thread parallel
+phase that produced its input. Any further optimization effort belongs
+here, not in Phase 2, which was already fast. Not yet run at full
+8.84M-row scale -- see "Next optimizations" below.
 
 ## Next optimizations, roughly in priority order
 
