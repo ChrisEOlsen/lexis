@@ -21,7 +21,7 @@ See `LEXIS_Project_Specification.docx` for the full project specification.
 
 ## Build
 
-Requires `docker compose up -d` running (Postgres) and the local model
+Requires native Postgres running (`make pg-start`) and the local model
 downloaded once via `scripts/download_model.sh`.
 
 ```

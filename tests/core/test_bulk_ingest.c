@@ -1,8 +1,8 @@
 /*
  * Tests for src/core/bulk_ingest.c -- the three-phase, deferred-term-
- * resolution TSV ingestion pipeline. Uses the real docker-compose
- * Postgres instance (lexis_test database) -- `docker compose up -d` must
- * be running for these to pass.
+ * resolution TSV ingestion pipeline. Uses the real native Postgres
+ * instance (lexis_test database, port 5434) -- `make pg-start` must be
+ * running for these to pass.
  */
 
 #include "bulk_ingest.h"
@@ -16,7 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define TEST_CONNINFO "host=127.0.0.1 port=5433 dbname=lexis_test user=lexis password=lexis_dev_only"
+#define TEST_CONNINFO "host=127.0.0.1 port=5434 dbname=lexis_test user=lexis password=lexis_dev_only"
 #define STOPWORD_FILE "data/stopwords/english.txt"
 #define WORDNET_DIR "data/wordnet"
 #define TEST_TSV_PATH "build/test_bulk_ingest.tsv"
@@ -39,7 +39,7 @@ static PgStore *open_fresh_store(void) {
 
 static void test_bulk_ingest_ingests_every_row_exactly_once(void) {
     PgStore *reset_store = open_fresh_store();
-    TEST_ASSERT(reset_store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+    TEST_ASSERT(reset_store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
     pg_store_close(reset_store);
 
     /* Six rows sharing common vocabulary ("hypertension"), TSV-formatted

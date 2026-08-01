@@ -1,7 +1,7 @@
 /*
  * Tests for src/core/eval.c -- the retrieval-quality evaluation harness.
- * Uses the real docker-compose Postgres instance (lexis_test database) --
- * `docker compose up -d` must be running for these to pass.
+ * Uses the real native Postgres instance (lexis_test database, port
+ * 5434) -- `make pg-start` must be running for these to pass.
  *
  * local_llm_client_init() is never called in this test binary, so
  * query_formulation_formulate_query() always falls back to its plain
@@ -21,7 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define TEST_CONNINFO "host=127.0.0.1 port=5433 dbname=lexis_test user=lexis password=lexis_dev_only"
+#define TEST_CONNINFO "host=127.0.0.1 port=5434 dbname=lexis_test user=lexis password=lexis_dev_only"
 #define STOPWORD_FILE "data/stopwords/english.txt"
 #define WORDNET_DIR "data/wordnet"
 #define TEST_QUERIES_PATH "build/test_eval_queries.tsv"
@@ -82,7 +82,7 @@ int main(void) {
          * split into multiple chunks must still count as at most one hit
          * against a qrels row that names it once. */
         PgStore *store = open_fresh_store();
-        TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+        TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
 
         long passages = seed_document(stopwords, wordnet, lemmatizer, "multi_chunk_doc", MULTI_CHUNK_TEXT, 10, 0);
         TEST_ASSERT(passages > 1, "expected the fixture text to split into multiple chunks, got %ld",

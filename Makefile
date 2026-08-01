@@ -3,18 +3,19 @@
 # see LIMITATIONS.md for the sqlite-vs-postgres history), llama.cpp/ggml
 # (local LLM inference -- see LIMITATIONS.md for the OpenRouter-to-local
 # history), and pthreads per spec section 6.
-# `make check` builds + runs every tests/core/test_*.c against the real
-# module sources — one command, exit code reflects pass/fail. Requires
-# `docker compose up -d` running (see docker-compose.yml) -- tests always
-# target that disposable Docker instance, never the native one below.
-# `make lexis` builds the CLI binary (src/core/main.c), which talks to a
-# separate NATIVE Postgres install (port 5434) instead -- see
-# LEXIS_DB_CONNINFO in main.c for why (Docker Desktop's VM networking
-# layer adds real per-round-trip latency a native install doesn't pay).
-# `make pg-start`/`make pg-stop` manage that native instance; it does not
-# auto-start on login and is entirely separate from both the Docker
-# instance and this machine's pre-existing postgresql@14 (port 5432,
-# unrelated projects).
+#
+# Everything -- `make check`'s test suite (database lexis_test) and
+# `make lexis`'s real CLI (database lexis) -- targets the same native
+# Homebrew postgresql@18 install (port 5434), via `make pg-start`/`make
+# pg-stop`; it does not auto-start on login. A separate Docker Postgres
+# instance was used for tests earlier in this project (Docker Desktop's
+# macOS VM networking layer adds real per-round-trip latency a native
+# install doesn't pay, which was already the reason the real CLI moved
+# off it) -- removed once the test suite was verified passing against
+# native Postgres too, so there was no longer a reason to run two
+# separate Postgres processes for one project. Entirely separate from
+# this machine's pre-existing postgresql@14 (port 5432, unrelated
+# projects) -- never touch that.
 
 # Hardcoded to the postgresql@18 keg specifically -- deliberately not
 # `brew link`ed (would shadow whatever postgresql version is already on
@@ -45,8 +46,7 @@ TEST_BINS := $(patsubst $(TESTDIR)/%.c,$(BUILD)/%,$(TEST_SRCS))
 
 # Native Postgres data directory (port 5434) -- see LEXIS_DB_CONNINFO in
 # main.c. Auto-initialized by `brew install postgresql@18`; this just
-# starts/stops it, same UX as `docker compose up -d`/`down` for the
-# Docker instance.
+# starts/stops it.
 PG_NATIVE_BIN  := /opt/homebrew/opt/postgresql@18/bin
 PG_NATIVE_DATA := /opt/homebrew/var/postgresql@18
 

@@ -1,8 +1,8 @@
 /*
  * Tests for src/core/pg_store.c — PgStore lifecycle and the passage/term/
- * posting write path against a real Postgres instance (see
- * docker-compose.yml -- `docker compose up -d` must be running for these
- * to pass). TRUNCATE resets state between tests, since there's no file to
+ * posting write path against a real Postgres instance (the native
+ * install, port 5434 -- `make pg-start` must be running for these to
+ * pass). TRUNCATE resets state between tests, since there's no file to
  * delete the way the SQLite version's tests worked.
  */
 
@@ -13,7 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define TEST_CONNINFO "host=127.0.0.1 port=5433 dbname=lexis_test user=lexis password=lexis_dev_only"
+#define TEST_CONNINFO "host=127.0.0.1 port=5434 dbname=lexis_test user=lexis password=lexis_dev_only"
 
 static PgStore *open_fresh_store(void) {
     PgStore *store = pg_store_open(TEST_CONNINFO);
@@ -28,7 +28,7 @@ static PgStore *open_fresh_store(void) {
 
 static void test_open_creates_store(void) {
     PgStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
     pg_store_close(store);
 }
 
@@ -398,7 +398,7 @@ static void write_staging_csv(const char *contents) {
 
 static void test_staging_tables_create_truncate_drop_round_trip(void) {
     PgStore *store = pg_store_open(TEST_CONNINFO);
-    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
 
     TEST_ASSERT(pg_store_create_staging_tables(store) == 0, "expected staging table creation to succeed");
     /* Idempotent: creating twice must not error (IF NOT EXISTS). */
@@ -417,7 +417,7 @@ static void test_staging_tables_create_truncate_drop_round_trip(void) {
 
 static void test_copy_documents_raw_loads_every_row(void) {
     PgStore *store = pg_store_open(TEST_CONNINFO);
-    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
     TEST_ASSERT(pg_store_create_staging_tables(store) == 0, "expected staging table creation to succeed");
     TEST_ASSERT(pg_store_truncate_staging_tables(store) == 0, "expected truncate to succeed");
 
@@ -452,7 +452,7 @@ static void test_copy_documents_raw_loads_every_row(void) {
 
 static void test_get_raw_documents_range_returns_requested_rows(void) {
     PgStore *store = pg_store_open(TEST_CONNINFO);
-    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
     TEST_ASSERT(pg_store_create_staging_tables(store) == 0, "expected staging table creation to succeed");
     TEST_ASSERT(pg_store_truncate_staging_tables(store) == 0, "expected truncate to succeed");
 
@@ -489,7 +489,7 @@ static void test_get_raw_documents_range_returns_requested_rows(void) {
 
 static void test_insert_staged_postings_batch_writes_raw_term_text(void) {
     PgStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
     TEST_ASSERT(pg_store_create_staging_tables(store) == 0, "expected staging table creation to succeed");
     TEST_ASSERT(pg_store_truncate_staging_tables(store) == 0, "expected truncate to succeed");
 
@@ -518,7 +518,7 @@ static void test_insert_staged_postings_batch_writes_raw_term_text(void) {
 
 static void test_finalize_terms_and_postings_resolves_and_dedups(void) {
     PgStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
     TEST_ASSERT(pg_store_create_staging_tables(store) == 0, "expected staging table creation to succeed");
     TEST_ASSERT(pg_store_truncate_staging_tables(store) == 0, "expected truncate to succeed");
 
@@ -594,7 +594,7 @@ static int postings_has_pk_and_fks(PgStore *store) {
 
 static void test_prepare_bulk_load_defers_constraints_and_durability(void) {
     PgStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
 
     TEST_ASSERT(postings_has_pk_and_fks(store), "expected a fresh schema to have postings' PK + 2 FKs");
     TEST_ASSERT(!table_persistence_is_unlogged(store, "postings"), "expected postings to start LOGGED");
@@ -615,7 +615,7 @@ static void test_prepare_bulk_load_defers_constraints_and_durability(void) {
 
 static void test_finish_bulk_load_restores_constraints_and_durability_and_data_survives(void) {
     PgStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
 
     /* Real data inserted BEFORE deferring constraints, exactly like a
      * real bulk-ingest run -- proves the constraint drop/restore cycle

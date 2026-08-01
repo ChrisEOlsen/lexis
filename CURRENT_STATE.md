@@ -29,22 +29,27 @@ only the retrieved passages as context. No vector embeddings, no external
 API calls at query time -- retrieval is pure lexical scoring (BM25) and
 generation runs a locally hosted GGUF model via llama.cpp, in-process.
 
-## The three Postgres instances
+## The two Postgres instances
 
-This is the single easiest thing to get confused about -- there are
-three separate Postgres servers on this machine, and mixing them up
-means either touching real unrelated data or wondering why your changes
-don't show up.
+There are two Postgres concerns on this machine -- one entirely outside
+this project, one shared by everything LEXIS does.
 
 | Port | What | Managed by | Used by |
 |------|------|------------|---------|
 | 5432 | Pre-existing `postgresql@14`, **not part of this project** | Not LEXIS's concern | Other, unrelated projects on this machine (e.g. `pt_website_builder_*`). Never touch this. |
-| 5433 | Docker `postgres:18` (`docker-compose.yml`) | `docker compose up -d` / `down` | The test suite exclusively (`make check`, `TEST_CONNINFO` in every `tests/core/test_*.c`, database `lexis_test`). Disposable -- `docker compose down -v` wipes it clean. |
-| 5434 | Native Homebrew `postgresql@18` | `make pg-start` / `make pg-stop` | The real CLI (`./lexis bulk-ingest`/`query`/`eval`, database `lexis`). Moved off Docker because Docker Desktop's macOS VM networking layer adds real per-round-trip latency a native install doesn't pay (see `SPEED.md`). Does not auto-start on login. |
+| 5434 | Native Homebrew `postgresql@18` | `make pg-start` / `make pg-stop` | Everything: the test suite (`make check`, `TEST_CONNINFO` in every `tests/core/test_*.c`, database `lexis_test`) and the real CLI (`./lexis bulk-ingest`/`query`/`eval`, database `lexis`) -- two separate databases on the one instance. Does not auto-start on login. |
 
-Neither 5433 nor 5434 auto-starts. Before running `make check`, `docker
-compose up -d` must be running. Before running `./lexis ...` for real,
-`make pg-start` must have been run.
+A separate Docker Postgres instance (port 5433) served the test suite
+earlier in this project's history -- removed once the test suite was
+verified passing against native Postgres too (Docker Desktop's macOS VM
+networking layer adds real per-round-trip latency a native install
+doesn't pay, which was already the reason the real CLI had moved off it;
+see `SPEED.md`), so there was no reason left to run two separate
+Postgres processes for one project. `docker-compose.yml` and `docker/`
+no longer exist in this repo.
+
+5434 does not auto-start -- `make pg-start` must have been run before
+either `make check` or `./lexis ...`.
 
 ## System components
 
@@ -241,10 +246,9 @@ by itself (see `LIMITATIONS.md`).
 **One-time setup:**
 
 ```
-docker compose up -d          # Postgres for the test suite (port 5433)
-make pg-start                 # native Postgres for the real CLI (port 5434)
+make pg-start                 # native Postgres, port 5434 -- serves both the test suite and the real CLI
 scripts/download_model.sh     # fetches the local GGUF model once
-make check                    # build + run the full test suite against Docker
+make check                    # build + run the full test suite
 make lexis                    # build the CLI binary
 ```
 

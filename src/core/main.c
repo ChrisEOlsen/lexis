@@ -33,18 +33,19 @@
 #include <time.h>
 
 /* Postgres connection string -- points at the native Homebrew
- * postgresql@18 install (port 5434), NOT the Docker dev instance
- * (docker-compose.yml, port 5433, which still exists and is what the
- * test suite's TEST_CONNINFO uses -- see LIMITATIONS.md). Moved off
- * Docker Desktop for real ingestion because Docker Desktop on macOS
- * runs everything inside a lightweight Linux VM, so even "localhost"
- * traffic to the containerized Postgres crosses that VM boundary before
- * reaching it -- real per-round-trip latency a native install doesn't
- * pay. `make pg-start`/`make pg-stop` manage this instance (see
- * Makefile) -- it does not auto-start on login. Separate from, and
- * deliberately never touches, this machine's pre-existing
- * postgresql@14 instance on the default port 5432 (unrelated projects'
- * real data) or the Docker instance on 5433. */
+ * postgresql@18 install (port 5434), the same instance the test suite's
+ * TEST_CONNINFO now uses too (database lexis_test, vs. this database
+ * lexis). Originally chosen over a Docker dev instance because Docker
+ * Desktop on macOS runs everything inside a lightweight Linux VM, so
+ * even "localhost" traffic to the containerized Postgres crosses that
+ * VM boundary before reaching it -- real per-round-trip latency a
+ * native install doesn't pay; the Docker instance was later removed
+ * entirely once the test suite was verified passing against native
+ * Postgres too (see CURRENT_STATE.md/SPEED.md). `make pg-start`/`make
+ * pg-stop` manage this instance (see Makefile) -- it does not
+ * auto-start on login. Separate from, and deliberately never touches,
+ * this machine's pre-existing postgresql@14 instance on the default
+ * port 5432 (unrelated projects' real data). */
 #define LEXIS_DB_CONNINFO "host=127.0.0.1 port=5434 dbname=lexis user=lexis password=lexis_dev_only"
 /* Display-only label -- never print LEXIS_DB_CONNINFO itself, it embeds
  * the dev password. */
@@ -56,7 +57,7 @@
  * reused for both query formulation and generation -- replaces the
  * OpenRouter API per the project's move to a locally hosted model. See
  * SPEED.md/LIMITATIONS.md for why this specific model/quantization was
- * chosen (8GB RAM budget, shared with Docker Postgres). */
+ * chosen (8GB RAM budget, shared with Postgres). */
 #define LEXIS_MODEL_PATH "data/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
 #define LEXIS_MODEL_LABEL "Llama-3.2-3B-Instruct-Q4_K_M (local)"
 #define LEXIS_CHUNK_SIZE 200

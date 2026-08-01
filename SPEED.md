@@ -163,8 +163,10 @@ under the "still feels slow" 90-105 minute projection:
    traffic to the containerized Postgres crosses that VM boundary before
    reaching it. Installed postgresql@18 natively via Homebrew (already
    present as a dependency of the client library) on port 5434 --
-   entirely separate from both the Docker instance (port 5433, still used
-   by the test suite) and this machine's pre-existing, unrelated
+   entirely separate from both the Docker instance (port 5433, used by
+   the test suite at the time; later removed entirely once the test
+   suite was verified passing against native Postgres too, see
+   CURRENT_STATE.md) and this machine's pre-existing, unrelated
    postgresql@14 instance (port 5432, real data from other projects, never
    touched). `make pg-start`/`make pg-stop` manage it; it does not
    auto-start on login. `main.c`'s `LEXIS_DB_CONNINFO` now points here.
@@ -536,7 +538,8 @@ scale.
    scattered log output over an hour-plus job. Cheap, and it's the actual
    proof of "clean," not an assumption.
 
-5. **Lower priority:** Postgres server tuning (default Docker settings are
-   conservative, untouched so far -- `shared_buffers`, `work_mem`,
-   `max_connections`), and resumability (nothing currently lets a crashed
-   run pick up where it left off).
+5. **Lower priority:** Postgres server tuning (native postgresql@18's
+   default `postgresql.conf` settings are conservative, untouched so far
+   beyond `work_mem` -- `shared_buffers`, `max_connections`), and
+   resumability (nothing currently lets a crashed run pick up where it
+   left off).

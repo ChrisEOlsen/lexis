@@ -11,7 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define TEST_CONNINFO "host=127.0.0.1 port=5433 dbname=lexis_test user=lexis password=lexis_dev_only"
+#define TEST_CONNINFO "host=127.0.0.1 port=5434 dbname=lexis_test user=lexis password=lexis_dev_only"
 
 static PgStore *open_fresh_store(void) {
     PgStore *store = pg_store_open(TEST_CONNINFO);
@@ -35,7 +35,7 @@ static PgStore *open_fresh_store(void) {
 
 static void test_init_schema_is_idempotent(void) {
     PgStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
 
     /* IF NOT EXISTS -- calling it again on an already-initialized
      * connection must not fail or disturb existing tables. */

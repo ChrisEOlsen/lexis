@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define TEST_CONNINFO "host=127.0.0.1 port=5433 dbname=lexis_test user=lexis password=lexis_dev_only"
+#define TEST_CONNINFO "host=127.0.0.1 port=5434 dbname=lexis_test user=lexis password=lexis_dev_only"
 
 static PgStore *open_fresh_store(void) {
     PgStore *store = pg_store_open(TEST_CONNINFO);
