@@ -29,15 +29,14 @@ only the retrieved passages as context. No vector embeddings, no external
 API calls at query time -- retrieval is pure lexical scoring (BM25) and
 generation runs a locally hosted GGUF model via llama.cpp, in-process.
 
-## The two Postgres instances
+## Postgres
 
-There are two Postgres concerns on this machine -- one entirely outside
-this project, one shared by everything LEXIS does.
-
-| Port | What | Managed by | Used by |
-|------|------|------------|---------|
-| 5432 | Pre-existing `postgresql@14`, **not part of this project** | Not LEXIS's concern | Other, unrelated projects on this machine (e.g. `pt_website_builder_*`). Never touch this. |
-| 5434 | Native Homebrew `postgresql@18` | `make pg-start` / `make pg-stop` | Everything: the test suite (`make check`, `TEST_CONNINFO` in every `tests/core/test_*.c`, database `lexis_test`) and the real CLI (`./lexis bulk-ingest`/`query`/`eval`, database `lexis`) -- two separate databases on the one instance. Does not auto-start on login. |
+LEXIS runs on exactly one Postgres instance: native Homebrew
+`postgresql@18`, port 5434, managed by `make pg-start`/`make pg-stop`
+(does not auto-start on login). It serves everything -- the test suite
+(`make check`, `TEST_CONNINFO` in every `tests/core/test_*.c`, database
+`lexis_test`) and the real CLI (`./lexis bulk-ingest`/`query`/`eval`,
+database `lexis`) -- as two separate databases on the one instance.
 
 A separate Docker Postgres instance (port 5433) served the test suite
 earlier in this project's history -- removed once the test suite was
@@ -47,6 +46,11 @@ doesn't pay, which was already the reason the real CLI had moved off it;
 see `SPEED.md`), so there was no reason left to run two separate
 Postgres processes for one project. `docker-compose.yml` and `docker/`
 no longer exist in this repo.
+
+*(Port 5432 also has a Postgres server on this machine -- a pre-existing
+`postgresql@14` install with other, unrelated projects' real data, e.g.
+`pt_website_builder_*`. It has nothing to do with LEXIS; never touch
+it.)*
 
 5434 does not auto-start -- `make pg-start` must have been run before
 either `make check` or `./lexis ...`.
