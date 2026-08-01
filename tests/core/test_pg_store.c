@@ -66,7 +66,7 @@ static void test_full_round_trip(void) {
 
     int64_t passage_id = pg_store_insert_passage(store, "doc1.txt", 0, "hypertension treatment", 2);
     int64_t term_id = pg_store_get_or_create_term(store, "hypertension");
-    int result = pg_store_insert_posting(store, term_id, passage_id, 1);
+    int result = pg_store_insert_posting(store, term_id, passage_id, 1, 2);
     TEST_ASSERT(result == 0, "expected pg_store_insert_posting to succeed");
 
     char term_id_str[32], passage_id_str[32];
@@ -188,6 +188,21 @@ static void test_rollback_transaction_discards_writes(void) {
     pg_store_close(store);
 }
 
+static void test_disable_synchronous_commit_succeeds(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+    TEST_ASSERT(pg_store_disable_synchronous_commit(store) == 0,
+                "expected disabling synchronous_commit to succeed");
+
+    PGresult *res = PQexec(store->conn, "SHOW synchronous_commit;");
+    TEST_ASSERT(PQresultStatus(res) == PGRES_TUPLES_OK, "expected SHOW to succeed");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 0), "off");
+    PQclear(res);
+
+    pg_store_close(store);
+}
+
 static void test_get_or_create_term_survives_concurrent_style_conflict(void) {
     /* Simulates what two concurrent writer connections racing on the same
      * new term would produce: an ON CONFLICT upsert from one connection
@@ -301,7 +316,7 @@ static void test_insert_postings_batch_zips_not_cross_products(void) {
     TEST_ASSERT(term_ids != NULL, "expected batch resolve to succeed");
 
     int frequencies[3] = {5, 7, 9};
-    int result = pg_store_insert_postings(store, term_ids, passage_id, frequencies, 3);
+    int result = pg_store_insert_postings(store, term_ids, passage_id, frequencies, 3, 3);
     TEST_ASSERT(result == 0, "expected batch posting insert to succeed");
 
     /* If unnest() were a cross product instead of zipping element-wise,
@@ -329,6 +344,235 @@ static void test_insert_postings_batch_zips_not_cross_products(void) {
     pg_store_close(store);
 }
 
+static void test_get_document_names_batch_maps_in_order(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+    int64_t id_a = pg_store_insert_passage(store, "pid-100", 0, "alpha text", 2);
+    int64_t id_b = pg_store_insert_passage(store, "pid-200", 0, "beta text", 2);
+    int64_t id_c = pg_store_insert_passage(store, "pid-300", 0, "gamma text", 2);
+
+    /* Deliberately out of insertion order, and repeats id_a -- the
+     * result must still line up index-for-index with the input, not
+     * insertion or database order. */
+    int64_t passage_ids[4] = {id_c, id_a, id_b, id_a};
+    char **names = pg_store_get_document_names(store, passage_ids, 4);
+    TEST_ASSERT(names != NULL, "expected batch lookup to succeed");
+    TEST_ASSERT_STR_EQ(names[0], "pid-300");
+    TEST_ASSERT_STR_EQ(names[1], "pid-100");
+    TEST_ASSERT_STR_EQ(names[2], "pid-200");
+    TEST_ASSERT_STR_EQ(names[3], "pid-100");
+
+    for (int i = 0; i < 4; i++) {
+        free(names[i]);
+    }
+    free(names);
+    pg_store_close(store);
+}
+
+static void test_get_document_names_batch_null_for_missing_id(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+    int64_t id_a = pg_store_insert_passage(store, "pid-100", 0, "alpha text", 2);
+
+    int64_t passage_ids[2] = {id_a, 999999};
+    char **names = pg_store_get_document_names(store, passage_ids, 2);
+    TEST_ASSERT(names != NULL, "expected batch lookup to succeed");
+    TEST_ASSERT_STR_EQ(names[0], "pid-100");
+    TEST_ASSERT(names[1] == NULL, "expected NULL for a passage id that doesn't exist");
+
+    free(names[0]);
+    free(names);
+    pg_store_close(store);
+}
+
+#define TEST_STAGING_CSV_PATH "build/test_copy_documents_raw.csv"
+
+static void write_staging_csv(const char *contents) {
+    FILE *fp = fopen(TEST_STAGING_CSV_PATH, "wb");
+    fwrite(contents, 1, strlen(contents), fp);
+    fclose(fp);
+}
+
+static void test_staging_tables_create_truncate_drop_round_trip(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+
+    TEST_ASSERT(pg_store_create_staging_tables(store) == 0, "expected staging table creation to succeed");
+    /* Idempotent: creating twice must not error (IF NOT EXISTS). */
+    TEST_ASSERT(pg_store_create_staging_tables(store) == 0,
+                "expected re-creating staging tables to be a no-op");
+
+    TEST_ASSERT(pg_store_truncate_staging_tables(store) == 0,
+                "expected truncating staging tables to succeed");
+
+    TEST_ASSERT(pg_store_drop_staging_tables(store) == 0, "expected dropping staging tables to succeed");
+    /* Idempotent: dropping twice must not error (IF EXISTS). */
+    TEST_ASSERT(pg_store_drop_staging_tables(store) == 0, "expected re-dropping staging tables to be a no-op");
+
+    pg_store_close(store);
+}
+
+static void test_copy_documents_raw_loads_every_row(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+    TEST_ASSERT(pg_store_create_staging_tables(store) == 0, "expected staging table creation to succeed");
+    TEST_ASSERT(pg_store_truncate_staging_tables(store) == 0, "expected truncate to succeed");
+
+    /* Real MS MARCO passages contain literal, unescaped backslashes
+     * (e.g. LaTeX-style "\displaystyle", "\%") and embedded double
+     * quotes/commas -- exactly what motivated CSV format over plain TSV
+     * in the first place (see SPEED.md). This fixture mirrors those
+     * cases directly: row 2 has a raw backslash, row 3 is CSV-quoted
+     * (embedded comma + doubled internal quote per RFC4180). */
+    write_staging_csv("100\tplain text with no special characters\n"
+                       "101\ttext with a literal \\backslash and \\% escape-looking sequence\n"
+                       "102\t\"quoted, with a comma and a \"\"doubled\"\" quote\"\n");
+
+    int64_t rows_loaded = pg_store_copy_documents_raw(store, TEST_STAGING_CSV_PATH);
+    TEST_ASSERT(rows_loaded == 3, "expected all 3 rows to load");
+
+    PGresult *res = PQexec(store->conn, "SELECT pid, text FROM documents_raw ORDER BY row_num;");
+    TEST_ASSERT(PQresultStatus(res) == PGRES_TUPLES_OK, "expected select to succeed");
+    TEST_ASSERT(PQntuples(res) == 3, "expected 3 rows in documents_raw");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 0), "100");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 1), "plain text with no special characters");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 1, 0), "101");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 1, 1),
+                        "text with a literal \\backslash and \\% escape-looking sequence");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 2, 0), "102");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 2, 1), "quoted, with a comma and a \"doubled\" quote");
+    PQclear(res);
+
+    pg_store_drop_staging_tables(store);
+    pg_store_close(store);
+}
+
+static void test_get_raw_documents_range_returns_requested_rows(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+    TEST_ASSERT(pg_store_create_staging_tables(store) == 0, "expected staging table creation to succeed");
+    TEST_ASSERT(pg_store_truncate_staging_tables(store) == 0, "expected truncate to succeed");
+
+    write_staging_csv("100\tfirst\n101\tsecond\n102\tthird\n103\tfourth\n104\tfifth\n");
+    int64_t rows_loaded = pg_store_copy_documents_raw(store, TEST_STAGING_CSV_PATH);
+    TEST_ASSERT(rows_loaded == 5, "expected all 5 rows to load");
+
+    /* [2, 4) -- rows 2 and 3, exclusive of 4 -- exercises the exact
+     * half-open range convention Phase 2's worker partitioning relies
+     * on. */
+    size_t count = 0;
+    PgStoreRawDocument *docs = pg_store_get_raw_documents_range(store, 2, 4, &count);
+    TEST_ASSERT(docs != NULL, "expected range fetch to succeed");
+    TEST_ASSERT(count == 2, "expected exactly 2 rows in [2, 4)");
+    TEST_ASSERT(docs[0].row_num == 2, "expected first row_num to be 2");
+    TEST_ASSERT_STR_EQ(docs[0].pid, "101");
+    TEST_ASSERT_STR_EQ(docs[0].text, "second");
+    TEST_ASSERT(docs[1].row_num == 3, "expected second row_num to be 3");
+    TEST_ASSERT_STR_EQ(docs[1].pid, "102");
+    TEST_ASSERT_STR_EQ(docs[1].text, "third");
+    pg_store_raw_documents_free(docs, count);
+
+    /* A range that runs past the end of the table should just come back
+     * short, not error -- this is exactly what happens to whichever
+     * worker claims the last batch. */
+    docs = pg_store_get_raw_documents_range(store, 4, 100, &count);
+    TEST_ASSERT(docs != NULL, "expected a past-the-end range fetch to still succeed");
+    TEST_ASSERT(count == 2, "expected only 2 rows (row_num 4 and 5) in a range that runs past the table's end");
+    pg_store_raw_documents_free(docs, count);
+
+    pg_store_drop_staging_tables(store);
+    pg_store_close(store);
+}
+
+static void test_insert_staged_postings_batch_writes_raw_term_text(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+    TEST_ASSERT(pg_store_create_staging_tables(store) == 0, "expected staging table creation to succeed");
+    TEST_ASSERT(pg_store_truncate_staging_tables(store) == 0, "expected truncate to succeed");
+
+    int64_t passage_id = pg_store_insert_passage(store, "pid-staged", 0, "some text", 5);
+    TEST_ASSERT(passage_id != -1, "expected passage insert to succeed");
+
+    const char *terms[3] = {"alpha", "beta", "alpha"};
+    int frequencies[3] = {2, 1, 2};
+    TEST_ASSERT(pg_store_insert_staged_postings(store, passage_id, terms, frequencies, 5, 3) == 0,
+                "expected staged postings insert to succeed");
+
+    PGresult *res = PQexec(store->conn,
+                            "SELECT passage_id, term, term_frequency, token_count FROM postings_staged "
+                            "ORDER BY term;");
+    TEST_ASSERT(PQresultStatus(res) == PGRES_TUPLES_OK, "expected select to succeed");
+    TEST_ASSERT(PQntuples(res) == 3, "expected 3 raw staged rows (no dedup at this stage)");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 1), "alpha");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 2), "2");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 3), "5");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 2, 1), "beta");
+    PQclear(res);
+
+    pg_store_drop_staging_tables(store);
+    pg_store_close(store);
+}
+
+static void test_finalize_terms_and_postings_resolves_and_dedups(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+    TEST_ASSERT(pg_store_create_staging_tables(store) == 0, "expected staging table creation to succeed");
+    TEST_ASSERT(pg_store_truncate_staging_tables(store) == 0, "expected truncate to succeed");
+
+    /* A term ("existing") already resolved through the normal path
+     * before Phase 3 ever runs -- finalize must fold staged postings
+     * into its *existing* id via ON CONFLICT DO NOTHING, not create a
+     * second "existing" row. */
+    int64_t existing_term_id = pg_store_get_or_create_term(store, "existing");
+    TEST_ASSERT(existing_term_id != -1, "expected pre-existing term to be created");
+
+    int64_t passage_a = pg_store_insert_passage(store, "pid-a", 0, "text a", 4);
+    int64_t passage_b = pg_store_insert_passage(store, "pid-b", 0, "text b", 3);
+
+    /* "shared" appears in both passages -- must resolve to the SAME
+     * terms.id for both postings rows, not one each. */
+    const char *terms_a[2] = {"existing", "shared"};
+    int freqs_a[2] = {1, 2};
+    TEST_ASSERT(pg_store_insert_staged_postings(store, passage_a, terms_a, freqs_a, 4, 2) == 0,
+                "expected staged postings insert for passage a to succeed");
+
+    const char *terms_b[2] = {"shared", "unique"};
+    int freqs_b[2] = {1, 1};
+    TEST_ASSERT(pg_store_insert_staged_postings(store, passage_b, terms_b, freqs_b, 3, 2) == 0,
+                "expected staged postings insert for passage b to succeed");
+
+    long postings_written = pg_store_finalize_terms_and_postings(store);
+    TEST_ASSERT(postings_written == 4, "expected 4 total postings rows written");
+
+    PGresult *res = PQexec(store->conn, "SELECT count(*) FROM terms WHERE term = 'existing';");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 0), "1");
+    PQclear(res);
+
+    int64_t shared_term_id = pg_store_lookup_term(store, "shared");
+    TEST_ASSERT(shared_term_id != -1, "expected 'shared' to have been resolved into terms");
+
+    res = PQexec(store->conn, "SELECT count(*) FROM postings WHERE term_id = "
+                              "(SELECT id FROM terms WHERE term = 'shared');");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 0), "2");
+    PQclear(res);
+
+    char query[256];
+    snprintf(query, sizeof(query),
+             "SELECT term_frequency, token_count FROM postings WHERE passage_id = %lld "
+             "AND term_id = %lld;",
+             (long long)passage_a, (long long)existing_term_id);
+    res = PQexec(store->conn, query);
+    TEST_ASSERT(PQntuples(res) == 1, "expected exactly one posting for (passage_a, existing)");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 0), "1");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 1), "4");
+    PQclear(res);
+
+    pg_store_drop_staging_tables(store);
+    pg_store_close(store);
+}
+
 int main(void) {
     test_open_creates_store();
     test_insert_passage_returns_ids();
@@ -342,10 +586,18 @@ int main(void) {
     test_passage_free_null_is_safe();
     test_commit_transaction_persists_writes();
     test_rollback_transaction_discards_writes();
+    test_disable_synchronous_commit_succeeds();
     test_get_or_create_term_survives_concurrent_style_conflict();
     test_get_or_create_terms_batch_mixes_new_and_existing();
     test_get_or_create_terms_batch_handles_duplicates_in_input();
     test_get_or_create_terms_batch_handles_special_characters();
     test_insert_postings_batch_zips_not_cross_products();
+    test_get_document_names_batch_maps_in_order();
+    test_get_document_names_batch_null_for_missing_id();
+    test_staging_tables_create_truncate_drop_round_trip();
+    test_copy_documents_raw_loads_every_row();
+    test_get_raw_documents_range_returns_requested_rows();
+    test_insert_staged_postings_batch_writes_raw_term_text();
+    test_finalize_terms_and_postings_resolves_and_dedups();
     return test_summary();
 }

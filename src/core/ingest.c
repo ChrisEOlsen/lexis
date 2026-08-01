@@ -164,13 +164,8 @@ TokenList *ingest_chunk_words(const TokenList *words, size_t chunk_size,
   return chunks;
 }
 
-/* Lemmatizes every term in `terms` (e.g. "nicknamed" -> "nickname") into a
- * freshly allocated TokenList, so the index stores the same base forms
- * query_formulation.c looks words up under at query time. Returns NULL on
- * allocation failure. */
-static TokenList *ingest_lemmatize_terms(const WordNetTable *wordnet,
-                                          const Lemmatizer *lemmatizer,
-                                          const TokenList *terms) {
+TokenList *ingest_lemmatize_terms(const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
+                                   const TokenList *terms) {
   TokenList *lemmas = token_list_create();
   if (lemmas == NULL) {
     return NULL;
@@ -193,25 +188,12 @@ static TokenList *ingest_lemmatize_terms(const WordNetTable *wordnet,
   return lemmas;
 }
 
-/* Indexes one chunk's already-tokenized, already-stopword-filtered,
- * already-lemmatized term list against `passage_id`: for each distinct
- * term, counts how many times it occurs in this chunk and writes exactly
- * one posting row for it. O(n^2) over the chunk's term count -- acceptable
- * at chunk scale (a few hundred terms at most), same tradeoff already made
- * for bm25_result_set_add's linear scan.
- *
- * Batches the whole chunk into pg_store_get_or_create_terms() +
- * pg_store_insert_postings() -- a fixed handful of round trips regardless
- * of how many distinct terms the chunk has, instead of two round trips
- * *per term*. That per-term round-trip cost, at ~0.13ms each measured
- * against this project's Docker Postgres, dominated single-threaded
- * ingestion latency badly enough to make it slower than the SQLite
- * version it replaced (see LIMITATIONS.md) -- SQLite's in-process calls
- * never paid a network round trip at all. Returns 0 on success, -1 on a
- * database error. */
-static int ingest_index_chunk_terms(PgStore *store, const TokenList *terms,
-                                    int64_t passage_id) {
+int ingest_count_distinct_terms(const TokenList *terms, const char ***distinct_terms_out,
+                                 int **frequencies_out, size_t *distinct_count_out) {
   if (terms->count == 0) {
+    *distinct_terms_out = NULL;
+    *frequencies_out = NULL;
+    *distinct_count_out = 0;
     return 0;
   }
 
@@ -248,30 +230,76 @@ static int ingest_index_chunk_terms(PgStore *store, const TokenList *terms,
     distinct_count++;
   }
 
-  int64_t *term_ids = pg_store_get_or_create_terms(store, distinct_terms, distinct_count);
+  *distinct_terms_out = distinct_terms;
+  *frequencies_out = frequencies;
+  *distinct_count_out = distinct_count;
+  return 0;
+}
+
+/* Indexes one chunk's already-tokenized, already-stopword-filtered,
+ * already-lemmatized term list against `passage_id`: resolves each
+ * distinct term (see ingest_count_distinct_terms()) to a terms.id and
+ * writes exactly one posting row for it.
+ *
+ * Batches the whole chunk into pg_store_get_or_create_terms() +
+ * pg_store_insert_postings() -- a fixed handful of round trips regardless
+ * of how many distinct terms the chunk has, instead of two round trips
+ * *per term*. That per-term round-trip cost, at ~0.13ms each measured
+ * against this project's Docker Postgres, dominated single-threaded
+ * ingestion latency badly enough to make it slower than the SQLite
+ * version it replaced (see LIMITATIONS.md) -- SQLite's in-process calls
+ * never paid a network round trip at all. `terms->count` (the full,
+ * non-distinct lemma count) doubles as this passage's token_count --
+ * the same value already passed to pg_store_insert_passage() -- and gets
+ * denormalized onto every posting row here too (see pg_store.c's schema
+ * comment for why). Returns 0 on success, -1 on a database error. */
+static int ingest_index_chunk_terms(PgStore *store, const TokenList *terms,
+                                    int64_t passage_id, TermCache *cache,
+                                    TermCachePending *pending) {
+  if (terms->count == 0) {
+    return 0;
+  }
+
+  const char **distinct_terms;
+  int *frequencies;
+  size_t distinct_count;
+  if (ingest_count_distinct_terms(terms, &distinct_terms, &frequencies, &distinct_count) != 0) {
+    return -1;
+  }
+
+  int64_t *term_ids =
+      (cache != NULL)
+          ? term_cache_get_or_create_terms(cache, pending, store, distinct_terms, distinct_count)
+          : pg_store_get_or_create_terms(store, distinct_terms, distinct_count);
   free(distinct_terms);
   if (term_ids == NULL) {
     free(frequencies);
     return -1;
   }
 
-  int result = pg_store_insert_postings(store, term_ids, passage_id, frequencies, distinct_count);
+  int result = pg_store_insert_postings(store, term_ids, passage_id, frequencies, (int)terms->count,
+                                        distinct_count);
   free(term_ids);
   free(frequencies);
   return result;
 }
 
-long ingest_document(PgStore *store, const StopwordSet *stopwords,
-                     const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
-                     const char *path, const char *document_name,
-                     size_t chunk_size, size_t overlap) {
-  char *text = ingest_read_file(path);
-  if (text == NULL) {
-    return -1;
-  }
-
+/* The real per-document work -- chunking, tokenizing, lemmatizing,
+ * persisting each chunk's passage and postings -- WITHOUT managing any
+ * transaction or the term cache pending lifecycle. The caller must
+ * already have an open transaction (or be inside a savepoint) and is
+ * responsible for rolling back whatever that implies on failure, and for
+ * committing/discarding `pending` itself. Shared core both
+ * ingest_document_from_text() (one document, one transaction) and
+ * ingest_document_from_text_in_batch() (many documents, one shared
+ * transaction, isolated via savepoints) build on. Returns the number of
+ * passages ingested (>= 0) on success, or -1 on failure. */
+static long ingest_document_body(PgStore *store, const StopwordSet *stopwords,
+                                  const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
+                                  const char *text, const char *document_name,
+                                  size_t chunk_size, size_t overlap, TermCache *cache,
+                                  TermCachePending *pending) {
   TokenList *words = ingest_split_words(text);
-  free(text);
   if (words == NULL) {
     return -1;
   }
@@ -282,24 +310,12 @@ long ingest_document(PgStore *store, const StopwordSet *stopwords,
     return -1;
   }
 
-  /* One transaction for the whole document, instead of an implicit
-   * (auto-committing, fsync-per-statement) transaction for every single
-   * passage/term/posting INSERT -- both a large latency win (see
-   * LIMITATIONS.md for measured numbers) and real atomicity: a failure
-   * partway through rolls back this document's writes entirely, rather
-   * than leaving it half-indexed. */
-  if (pg_store_begin_transaction(store) != 0) {
-    token_list_free(chunks);
-    return -1;
-  }
-
   long passages_ingested = 0;
   for (size_t i = 0; i < chunks->count; i++) {
     const char *chunk_text = chunks->terms[i];
 
     TokenList *terms = tokenize(chunk_text);
     if (terms == NULL) {
-      pg_store_rollback_transaction(store);
       token_list_free(chunks);
       return -1;
     }
@@ -308,7 +324,6 @@ long ingest_document(PgStore *store, const StopwordSet *stopwords,
     TokenList *lemmas = ingest_lemmatize_terms(wordnet, lemmatizer, terms);
     token_list_free(terms);
     if (lemmas == NULL) {
-      pg_store_rollback_transaction(store);
       token_list_free(chunks);
       return -1;
     }
@@ -317,14 +332,12 @@ long ingest_document(PgStore *store, const StopwordSet *stopwords,
         store, document_name, (int)i, chunk_text, (int)lemmas->count);
     if (passage_id == -1) {
       token_list_free(lemmas);
-      pg_store_rollback_transaction(store);
       token_list_free(chunks);
       return -1;
     }
 
-    if (ingest_index_chunk_terms(store, lemmas, passage_id) != 0) {
+    if (ingest_index_chunk_terms(store, lemmas, passage_id, cache, pending) != 0) {
       token_list_free(lemmas);
-      pg_store_rollback_transaction(store);
       token_list_free(chunks);
       return -1;
     }
@@ -333,11 +346,71 @@ long ingest_document(PgStore *store, const StopwordSet *stopwords,
     passages_ingested++;
   }
   token_list_free(chunks);
+  return passages_ingested;
+}
 
-  if (pg_store_commit_transaction(store) != 0) {
+long ingest_document_from_text(PgStore *store, const StopwordSet *stopwords,
+                               const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
+                               const char *text, const char *document_name,
+                               size_t chunk_size, size_t overlap, TermCache *cache) {
+  /* Newly resolved terms stay document-local until this document's
+   * transaction actually commits -- see TermCachePending's doc comment
+   * for why writing them straight into the shared cache is unsafe (a
+   * verified, real bug: a term "created" inside a transaction that later
+   * rolls back never actually persists in Postgres, but the shared cache
+   * would still claim it does, poisoning every future document that
+   * uses it with a term_id that fails postings' foreign key
+   * constraint). NULL when cache is NULL (the uncached path). */
+  TermCachePending *pending = (cache != NULL) ? term_cache_pending_create() : NULL;
+  if (cache != NULL && pending == NULL) {
     return -1;
   }
+
+  /* One transaction for the whole document, instead of an implicit
+   * (auto-committing, fsync-per-statement) transaction for every single
+   * passage/term/posting INSERT -- both a large latency win (see
+   * LIMITATIONS.md for measured numbers) and real atomicity: a failure
+   * partway through rolls back this document's writes entirely, rather
+   * than leaving it half-indexed. */
+  if (pg_store_begin_transaction(store) != 0) {
+    term_cache_pending_free(pending);
+    return -1;
+  }
+
+  long passages_ingested = ingest_document_body(store, stopwords, wordnet, lemmatizer, text,
+                                                 document_name, chunk_size, overlap, cache, pending);
+  if (passages_ingested < 0) {
+    pg_store_rollback_transaction(store);
+    term_cache_pending_free(pending);
+    return -1;
+  }
+
+  if (pg_store_commit_transaction(store) != 0) {
+    term_cache_pending_free(pending);
+    return -1;
+  }
+
+  /* Only now, with the transaction actually durable, fold any newly
+   * resolved terms into the shared cache -- safe for every other worker
+   * thread to see from this point on. No-ops safely if cache/pending are
+   * both NULL (the uncached path). */
+  term_cache_commit_pending(cache, pending);
   return passages_ingested;
+}
+
+long ingest_document(PgStore *store, const StopwordSet *stopwords,
+                     const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
+                     const char *path, const char *document_name,
+                     size_t chunk_size, size_t overlap, TermCache *cache) {
+  char *text = ingest_read_file(path);
+  if (text == NULL) {
+    return -1;
+  }
+
+  long result = ingest_document_from_text(store, stopwords, wordnet, lemmatizer, text,
+                                          document_name, chunk_size, overlap, cache);
+  free(text);
+  return result;
 }
 
 long ingest_corpus(PgStore *store, const StopwordSet *stopwords,
@@ -367,7 +440,7 @@ long ingest_corpus(PgStore *store, const StopwordSet *stopwords,
     }
 
     long passages = ingest_document(store, stopwords, wordnet, lemmatizer, full_path,
-                                    entry->d_name, chunk_size, overlap);
+                                    entry->d_name, chunk_size, overlap, NULL);
     if (passages < 0) {
       fprintf(stderr, "ingest_corpus: failed to ingest %s, skipping\n",
               full_path);

@@ -68,14 +68,28 @@ typedef struct {
     double score;
 } BM25ScoredPassage;
 
+/* Opaque hash index (passage_id -> its slot in BM25ResultSet.items[]),
+ * defined in bm25.c. Internal implementation detail -- exists purely so
+ * bm25_result_set_add() can find an existing passage_id in O(1)
+ * amortized time instead of a linear scan over every entry added so far.
+ * That linear scan was invisible at a handful of matching passages, but
+ * a single common query term can match hundreds of thousands to
+ * millions of passages at real corpus scale (measured directly against
+ * the full MS MARCO ingest -- see LIMITATIONS.md), where an O(n) check
+ * per insert becomes an O(n^2) accumulation overall. */
+typedef struct BM25ResultIndex BM25ResultIndex;
+
 /* A growable, unsorted collection of BM25ScoredPassage entries -- same
  * doubling-capacity growth pattern as TokenList (tokenizer.h). Lets
  * per-term scores accumulate into one running total per passage, before
- * the eventual sort + top-K truncation. */
+ * the eventual sort + top-K truncation. `index` is an internal detail
+ * (see BM25ResultIndex) -- callers should only ever touch `items`/
+ * `count`. */
 typedef struct {
     BM25ScoredPassage *items;
     size_t count;
     size_t capacity;
+    BM25ResultIndex *index;
 } BM25ResultSet;
 
 /* Allocates an empty result set. Returns NULL on allocation failure. */
@@ -104,9 +118,15 @@ int bm25_accumulate_term_scores(PgStore *store, int64_t term_id, BM25CorpusStats
  * (unrecognized terms are silently skipped -- they simply contribute no
  * score, same as any other term with zero matching passages), accumulates
  * scores across every matching passage, sorts descending by score, and
- * truncates to the top `top_k`. Returns a result set the caller must free
+ * truncates to the top `top_k`. `stats` must come from a prior
+ * bm25_corpus_stats() call -- deliberately NOT computed internally here
+ * anymore, since it's a full-corpus aggregate (a real cost at real corpus
+ * scale, see LIMITATIONS.md) that stays valid for as long as the corpus
+ * itself doesn't change; callers serving many searches in a row (a query
+ * loop, an eval harness) should compute it once and reuse it, not pay for
+ * it on every single search. Returns a result set the caller must free
  * with bm25_result_set_free(), or NULL on a database/allocation failure. */
 BM25ResultSet *bm25_search(PgStore *store, const char **query_terms, size_t num_terms, size_t top_k,
-                            BM25Params params);
+                            BM25CorpusStats stats, BM25Params params);
 
 #endif /* LEXIS_BM25_H */

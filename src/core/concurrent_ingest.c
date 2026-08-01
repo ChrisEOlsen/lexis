@@ -10,6 +10,7 @@
 
 #include "ingest.h"
 #include "pg_store.h"
+#include "term_cache.h"
 #include "tokenizer.h"
 
 #include <dirent.h>
@@ -35,6 +36,7 @@ typedef struct {
     const Lemmatizer *lemmatizer;
     size_t chunk_size;
     size_t overlap;
+    TermCache *cache;
     long passages_ingested;
     int failed;
 } ConcurrentWorker;
@@ -52,6 +54,13 @@ static void *concurrent_worker_run(void *arg) {
         w->failed = 1;
         return NULL;
     }
+    /* This is a rebuildable index build, not live/irreplaceable data --
+     * see pg_store_disable_synchronous_commit()'s doc comment. Unlike
+     * batching multiple documents per transaction (tried and reverted,
+     * see SPEED.md for why: it widens each transaction's lock footprint
+     * enough to cause severe contention under real concurrency), this
+     * doesn't touch locking behavior at all. */
+    pg_store_disable_synchronous_commit(store);
 
     while (1) {
         pthread_mutex_lock(w->index_mutex);
@@ -85,7 +94,7 @@ static void *concurrent_worker_run(void *arg) {
         int attempt;
         for (attempt = 0; attempt < 3 && passages < 0; attempt++) {
             passages = ingest_document(store, w->stopwords, w->wordnet, w->lemmatizer, full_path,
-                                        w->filenames[idx], w->chunk_size, w->overlap);
+                                        w->filenames[idx], w->chunk_size, w->overlap, w->cache);
         }
         if (passages < 0) {
             fprintf(stderr, "concurrent_worker_run: failed to ingest %s after %d attempts, skipping\n",
@@ -138,11 +147,33 @@ long concurrent_ingest_corpus(const char *conninfo, const StopwordSet *stopwords
     }
     closedir(dir);
 
+    /* Shared across every worker thread -- see term_cache.h for why this
+     * turns "already resolved by any thread, even moments ago" into a
+     * fast in-process lookup instead of a Postgres round trip. Preloaded
+     * once, up front, from a throwaway connection so vocabulary already
+     * known from a prior ingestion run costs zero Postgres traffic
+     * during this one. */
+    TermCache *cache = term_cache_create();
+    if (cache == NULL) {
+        token_list_free(filenames);
+        return -1;
+    }
+    PgStore *preload_store = pg_store_open(conninfo);
+    if (preload_store == NULL || term_cache_preload(cache, preload_store) != 0) {
+        fprintf(stderr, "concurrent_ingest_corpus: failed to preload the term cache\n");
+        pg_store_close(preload_store);
+        term_cache_free(cache);
+        token_list_free(filenames);
+        return -1;
+    }
+    pg_store_close(preload_store);
+
     pthread_t *threads = malloc(sizeof(pthread_t) * (size_t)thread_count);
     ConcurrentWorker *workers = malloc(sizeof(ConcurrentWorker) * (size_t)thread_count);
     if (threads == NULL || workers == NULL) {
         free(threads);
         free(workers);
+        term_cache_free(cache);
         token_list_free(filenames);
         return -1;
     }
@@ -163,6 +194,7 @@ long concurrent_ingest_corpus(const char *conninfo, const StopwordSet *stopwords
             .lemmatizer = lemmatizer,
             .chunk_size = chunk_size,
             .overlap = overlap,
+            .cache = cache,
             .passages_ingested = 0,
             .failed = 0,
         };
@@ -179,6 +211,7 @@ long concurrent_ingest_corpus(const char *conninfo, const StopwordSet *stopwords
         }
     }
     pthread_mutex_destroy(&index_mutex);
+    term_cache_free(cache);
     token_list_free(filenames);
     free(threads);
     free(workers);

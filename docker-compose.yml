@@ -8,6 +8,15 @@
 services:
   postgres:
     image: postgres:18
+    # work_mem raised well above Postgres's 4MB default -- measured
+    # directly (see LIMITATIONS.md) that the default caused large bitmap
+    # index scans against postings (a query term with 100K+ matching
+    # rows, common at real MS MARCO scale) to go "lossy" and re-check
+    # far more heap pages than necessary: 9.28s -> 0.87s (10.7x) for one
+    # such term once raised to 256MB. Safe to set server-wide here since
+    # this dev instance only ever serves LEXIS's own bounded-concurrency
+    # ingestion/query workloads, not arbitrary multi-tenant traffic.
+    command: postgres -c work_mem=256MB
     environment:
       POSTGRES_USER: lexis
       POSTGRES_PASSWORD: lexis_dev_only

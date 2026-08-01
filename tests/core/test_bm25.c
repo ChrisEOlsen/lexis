@@ -68,8 +68,8 @@ static void test_document_frequency_counts_matching_passages(void) {
     int64_t p3 = pg_store_insert_passage(store, "doc2.txt", 0, "hypertension causes", 2);
 
     int64_t term_id = pg_store_get_or_create_term(store, "hypertension");
-    pg_store_insert_posting(store, term_id, p1, 1);
-    pg_store_insert_posting(store, term_id, p3, 1);
+    pg_store_insert_posting(store, term_id, p1, 1, 2);
+    pg_store_insert_posting(store, term_id, p3, 1, 2);
 
     /* p2 never gets a posting for this term — df should count only p1/p3. */
     (void)p2;
@@ -252,6 +252,54 @@ static void test_result_set_add_grows_past_initial_capacity(void) {
     bm25_result_set_free(set);
 }
 
+static void test_result_set_add_merges_correctly_across_index_growth(void) {
+    BM25ResultSet *set = bm25_result_set_create();
+    TEST_ASSERT(set != NULL, "expected bm25_result_set_create to succeed");
+
+    /* The internal hash index starts at capacity 16 and grows past a 0.7
+     * load factor -- 500 distinct passages forces several resizes.
+     * Interleave a second and third score contribution for every
+     * passage_id (simulating multiple query terms matching the same
+     * passages) so a lookup miss after a resize (an old bug class: probe
+     * sequences depend on capacity, so re-inserting at the old slot
+     * position after growing would silently break lookups) would show up
+     * as a wrong accumulated score or a duplicate entry, not just a
+     * crash. */
+    const int64_t distinct_passages = 500;
+    for (int64_t i = 0; i < distinct_passages; i++) {
+        TEST_ASSERT(bm25_result_set_add(set, i, 1.0) == 0, "expected first add %lld to succeed",
+                    (long long)i);
+    }
+    for (int64_t i = 0; i < distinct_passages; i++) {
+        TEST_ASSERT(bm25_result_set_add(set, i, 2.0) == 0, "expected second add %lld to succeed",
+                    (long long)i);
+    }
+    for (int64_t i = distinct_passages - 1; i >= 0; i--) {
+        TEST_ASSERT(bm25_result_set_add(set, i, 3.0) == 0, "expected third add %lld to succeed",
+                    (long long)i);
+    }
+
+    TEST_ASSERT(set->count == (size_t)distinct_passages,
+                "expected exactly %lld distinct entries (no duplicates from a broken merge), got %zu",
+                (long long)distinct_passages, set->count);
+
+    for (int64_t i = 0; i < distinct_passages; i++) {
+        int found = 0;
+        for (size_t j = 0; j < set->count; j++) {
+            if (set->items[j].passage_id == i) {
+                found = 1;
+                TEST_ASSERT(fabs(set->items[j].score - 6.0) < IDF_EPSILON,
+                            "expected passage_id %lld to have merged score 6.0 (1+2+3), got %f",
+                            (long long)i, set->items[j].score);
+                break;
+            }
+        }
+        TEST_ASSERT(found, "expected passage_id %lld to be present", (long long)i);
+    }
+
+    bm25_result_set_free(set);
+}
+
 static void test_result_set_free_null_is_safe(void) {
     bm25_result_set_free(NULL);
 }
@@ -270,10 +318,14 @@ static void seed_search_corpus(PgStore *store, int64_t *hypertension_id,
     *hypertension_id = pg_store_get_or_create_term(store, "hypertension");
     *treatment_id = pg_store_get_or_create_term(store, "treatment");
 
-    pg_store_insert_posting(store, *hypertension_id, *p1, 1);
-    pg_store_insert_posting(store, *hypertension_id, *p2, 1);
-    pg_store_insert_posting(store, *hypertension_id, *p4, 1);
-    pg_store_insert_posting(store, *treatment_id, *p1, 1);
+    /* token_count here must match the passage's own token_count above --
+     * it's denormalized onto postings now (see pg_store.c's schema
+     * comment), not read back via a join, so nothing enforces this
+     * consistency automatically the way a single source of truth would. */
+    pg_store_insert_posting(store, *hypertension_id, *p1, 1, 3);
+    pg_store_insert_posting(store, *hypertension_id, *p2, 1, 6);
+    pg_store_insert_posting(store, *hypertension_id, *p4, 1, 6);
+    pg_store_insert_posting(store, *treatment_id, *p1, 1, 3);
 }
 
 static void test_accumulate_term_scores_matches_only_relevant_passages(void) {
@@ -313,7 +365,8 @@ static void test_search_ranks_multi_term_match_highest(void) {
 
     const char *query_terms[] = {"hypertension", "treatment"};
     BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B};
-    BM25ResultSet *results = bm25_search(store, query_terms, 2, 10, params);
+    BM25CorpusStats stats = bm25_corpus_stats(store);
+    BM25ResultSet *results = bm25_search(store, query_terms, 2, 10, stats, params);
     TEST_ASSERT(results != NULL, "expected bm25_search to succeed");
 
     /* p1 matches both query terms; p2/p4 match only one; p3 matches
@@ -348,7 +401,8 @@ static void test_search_respects_top_k(void) {
 
     const char *query_terms[] = {"hypertension", "treatment"};
     BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B};
-    BM25ResultSet *results = bm25_search(store, query_terms, 2, 1, params);
+    BM25CorpusStats stats = bm25_corpus_stats(store);
+    BM25ResultSet *results = bm25_search(store, query_terms, 2, 1, stats, params);
     TEST_ASSERT(results != NULL, "expected bm25_search to succeed");
 
     TEST_ASSERT(results->count == 1, "expected top_k=1 to truncate to 1 result, got %zu", results->count);
@@ -369,7 +423,8 @@ static void test_search_skips_unindexed_query_terms(void) {
 
     const char *query_terms[] = {"nonexistentword"};
     BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B};
-    BM25ResultSet *results = bm25_search(store, query_terms, 1, 10, params);
+    BM25CorpusStats stats = bm25_corpus_stats(store);
+    BM25ResultSet *results = bm25_search(store, query_terms, 1, 10, stats, params);
     TEST_ASSERT(results != NULL,
                 "expected an unindexed query term to produce an empty result set, not a failure");
     TEST_ASSERT(results->count == 0, "expected 0 matches for a term never in the corpus, got %zu",
@@ -385,7 +440,8 @@ static void test_search_empty_corpus_returns_empty_results(void) {
 
     const char *query_terms[] = {"anything"};
     BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B};
-    BM25ResultSet *results = bm25_search(store, query_terms, 1, 10, params);
+    BM25CorpusStats stats = bm25_corpus_stats(store);
+    BM25ResultSet *results = bm25_search(store, query_terms, 1, 10, stats, params);
     TEST_ASSERT(results != NULL, "expected an empty corpus to return an empty result set, not NULL");
     TEST_ASSERT(results->count == 0, "expected 0 results from an empty corpus, got %zu", results->count);
 
@@ -410,6 +466,7 @@ int main(void) {
     test_result_set_add_accumulates_same_passage();
     test_result_set_add_distinct_passages_stay_separate();
     test_result_set_add_grows_past_initial_capacity();
+    test_result_set_add_merges_correctly_across_index_growth();
     test_result_set_free_null_is_safe();
     test_accumulate_term_scores_matches_only_relevant_passages();
     test_search_ranks_multi_term_match_highest();

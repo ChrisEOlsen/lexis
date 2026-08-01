@@ -56,30 +56,301 @@ deadlock regardless of `DO NOTHING` vs `DO UPDATE` (verified directly).
 recover -- correctness held at every thread count tested (zero documents
 dropped), but retries cost real throughput at high concurrency.
 
+## The real full corpus run, and the term cache fix
+
+The full 8,841,823-passage MS MARCO corpus was actually bulk-ingested
+(`lexis bulk-ingest`, 4 threads): **972.6 passages/sec average, 151.5
+minutes total, 184 deadlocks (zero documents permanently dropped)**. This
+undercut the synthetic-benchmark projection (~1866/sec, ~1.3 hours) by
+roughly 2x. The 184 deadlocks are negligible against 8.84M documents --
+that's not the gap. The more likely cause: the synthetic benchmark's
+~20K-word vocabulary saturates almost immediately (most of its documents
+hit `pg_store_get_or_create_terms()`'s cheap SELECT-only path), while
+real language keeps introducing brand-new vocabulary deep into a corpus
+this large (Zipf's law) -- the real ingest has 3,492,916 distinct terms,
+so a much larger share of documents pay the network round trip for term
+resolution throughout the *entire* run, not just at the start.
+
+Fix: a shared, thread-safe in-memory term cache (`term_cache.c`) sitting
+in front of `pg_store_get_or_create_terms()` -- every worker thread
+shares one cache, so a term resolved by any thread (new or previously
+known) costs zero further Postgres traffic for every other thread from
+then on. **Real, measured result on the identical first 500,000 rows of
+the corpus: 1654.6 passages/sec, vs. 972.6 passages/sec for the original
+full run's overall average -- a genuine ~1.7x improvement**, not a
+projection. Full-corpus re-ingest with the cache is expected to land
+somewhere in the 90-105 minute range (vs. 151.5 minutes), though the very
+large final terms table (3.49M rows) may erode the improvement somewhat
+by the end of a full run versus this partial-corpus measurement.
+
+**A real, serious bug was found and fixed during this work**: the first
+version of the cache wrote a newly-resolved (term, id) pair straight into
+the shared cache the moment `pg_store_get_or_create_terms()` returned an
+id -- but that `INSERT` only really happens if the document's surrounding
+transaction actually commits. If it later rolls back (e.g. a deadlock on
+a *later* chunk in the same document), the term row never persists, but
+the shared cache still claimed it did -- poisoning every future document
+using that term for the rest of the run with a `term_id` that fails
+`postings`' foreign-key constraint. Verified directly: running the fixed
+benchmark against the same 500K-row slice produced zero foreign-key
+violations (deadlocks still occur and retry normally, as expected). Fix:
+newly resolved terms stay in a document-local `TermCachePending` list and
+only get merged into the shared cache after that document's transaction
+actually commits (`term_cache_commit_pending()`) -- discarded, not
+committed, on rollback. Covered by a dedicated regression test
+(`test_pending_discarded_on_rollback_does_not_poison_cache`).
+
+## Re-swept thread count after the cache fix
+
+The original thread-count sweep (above) was dominated by contention on
+the `terms` unique index, which the term cache now mostly eliminates --
+worth re-checking whether more threads helps once that's no longer the
+limiting factor. Re-swept on a 200K-row slice (consistent across
+configs, same machine, 8 physical/logical cores):
+
+| Threads | Throughput |
+|---|---|
+| 4 | 1396.0/sec |
+| **6** | **1542.4/sec (nominal peak)** |
+| 8 | 1287.6/sec |
+| 10 | 1125.4/sec |
+| 12 | 1408.8/sec |
+| 16 | 1341.5/sec |
+
+427 deadlocks total across all 6 runs combined (~1.2M document-ingestions),
+1 document permanently dropped after 3 retries -- both negligible, no sign
+of the old contention collapse returning at higher thread counts.
+
+Honest read: **the 1125-1542/sec spread here is roughly the same
+magnitude as run-to-run noise** -- a separate 4-thread measurement on a
+different 500K-row slice got 1654.6/sec, a ~16% swing from nothing but
+re-running on different data, comparable to the differences between
+threads in this table. 6 nominally won this single-run sweep and is now
+`LEXIS_INGEST_THREADS` in main.c, but this isn't a confident ranking
+(each config only ran once) -- more threads past 4-6 is not a real lever
+on this machine. The actual win was the term cache itself (~1.7x); chasing
+thread count further is diminishing returns on an 8-core machine where
+Postgres itself needs some of that CPU too.
+
+**Possible confound not controlled for**: this sweep ran as six back-to-
+back configs with no cooldown between them on a fanless M2 MacBook Air.
+Sustained multi-core load on a chassis with no active cooling is a real,
+documented mechanism for clock throttling that a fan-equipped Mac
+wouldn't show the same way -- the sweep's non-monotonic bounce (8/10 dip,
+12/16 recover) is at least as consistent with drifting thermal state
+across the ~15-minute session as with the thread count itself. No hard
+telemetry either way (`pmset -g therm` doesn't report useful data on
+Apple Silicon, and `powermetrics` needs an interactive sudo password this
+environment doesn't have) -- flagging the confound rather than the
+(likely partly thermal) ranking as the real finding.
+
+## Native Postgres, synchronous_commit, and a failed batching attempt
+
+Three further ideas explored after the thread re-sweep, to get well
+under the "still feels slow" 90-105 minute projection:
+
+1. **`synchronous_commit = off`** during ingestion (`pg_store_disable_
+   synchronous_commit()`, called once per worker connection) -- every
+   COMMIT returns once its WAL record reaches the OS, without waiting for
+   a physical disk fsync. Safe here specifically because this is a
+   rebuildable index build, not live/irreplaceable data: if ingestion
+   crashes, the fix is re-running it, not recovering unflushed commits.
+   **Measured: 1786.4/sec vs. 1542.4/sec (same 6-thread, 200K-row config)
+   -- a real, free ~16%.**
+
+2. **Native Postgres instead of Docker Desktop.** Docker Desktop on macOS
+   runs everything inside a lightweight Linux VM, so even "localhost"
+   traffic to the containerized Postgres crosses that VM boundary before
+   reaching it. Installed postgresql@18 natively via Homebrew (already
+   present as a dependency of the client library) on port 5434 --
+   entirely separate from both the Docker instance (port 5433, still used
+   by the test suite) and this machine's pre-existing, unrelated
+   postgresql@14 instance (port 5432, real data from other projects, never
+   touched). `make pg-start`/`make pg-stop` manage it; it does not
+   auto-start on login. `main.c`'s `LEXIS_DB_CONNINFO` now points here.
+
+3. **Batching multiple documents per transaction -- tried, and reverted
+   after it made things dramatically worse, not better.** The idea (see
+   the "next optimizations" list below, written before this was actually
+   tried): wrap N documents in one transaction with per-document
+   SAVEPOINT isolation, amortizing the BEGIN/COMMIT round trip (and its
+   fsync) across the whole batch. Implemented with a full mechanism
+   (`ingest_document_from_text_in_batch()`, SAVEPOINT/ROLLBACK TO
+   SAVEPOINT/RELEASE SAVEPOINT support in pg_store.c, whole-batch retry
+   escalation, one-document-at-a-time fallback) and thoroughly tested at
+   small scale -- but under real concurrent load it caused **severe,
+   sustained contention, not occasional retries**: 109 passages ingested
+   in 5+ minutes on one run, a process that had to be force-killed after
+   timing out on another. Root cause: a batch transaction holds locks on
+   every term it's touched *so far*, for its *entire duration* -- 20
+   documents' worth of distinct terms, held for 20 documents' worth of
+   time, instead of one document's worth of terms held for one
+   document's worth of time. With 6 threads each running a long,
+   wide-locking batch transaction simultaneously, the contention surface
+   multiplied badly enough that even the whole-batch-retry escalation
+   logic and the proven one-document-per-transaction fallback kept
+   re-triggering rather than recovering. **Fully reverted** -- back to
+   one document per transaction, which is structurally the right shape
+   for this concurrency model (small, short-lived transactions, small
+   lock footprint, so N threads rarely collide) even though it means
+   more COMMITs. The SAVEPOINT primitives and
+   `ingest_document_from_text_in_batch()` were removed entirely (not
+   left as dead code) once nothing called them anymore -- this section is
+   the permanent record of why, since the code itself is gone.
+
+**Combined real result (native Postgres + synchronous_commit=off, no
+batching), same 200K-row slice, 6 threads: 2211.3 passages/sec** -- up
+from 972.6/sec (the original full-corpus run) and 1654.6/sec (term cache
+alone, Docker). Projected full-corpus time: 8,841,823 / 2211.3 ≈ 66.6
+minutes, down from the original 151.5 minutes (~2.3x). A smaller,
+20K-row run of the same configuration measured only 579.1/sec --
+consistent with cold-start contention (an empty term cache means every
+thread races on the very same first few common words simultaneously)
+dominating a short run's average in a way it doesn't over a longer one;
+not a sign the 200K/2211.3 number is unrepresentative of a full run's
+steady state. Both runs preserved data correctly (20,002/20,000 and
+200,007/199,998 passages/distinct documents respectively -- 2 documents
+dropped out of 200,000 after exhausting retries under contention, a
+~0.001% loss rate consistent with the project's existing retry policy,
+which deliberately doesn't retry forever).
+
+## The three-phase deferred-term-resolution redesign
+
+Every single deadlock measured in this whole document, without exception,
+traced back to the same thing: `CONTEXT: while inserting index tuple ...
+in relation "terms"` -- Postgres's `ON CONFLICT` speculative insertion on
+`terms.term`'s unique index, colliding whenever two or more threads race
+on the same new word. Nothing else (`passages`, `postings`) ever caused
+contention -- `GENERATED ALWAYS AS IDENTITY` sequences are safe under
+concurrency by construction. Real measurement at the previous best config
+(native PG, `synchronous_commit=off`, term cache, 6 threads): 90
+deadlocks across 200,009 documents, roughly 21x the deadlock *rate* of
+the original Docker/4-thread run (184 across 8.84M docs).
+
+Rather than continue tuning thread count/batch size around that
+contention, the redesign below eliminates it structurally: worker threads
+never touch the `terms` table at all until every other thread is done.
+
+1. **Phase 1 -- raw append.** One `COPY` loads the whole TSV/CSV file into
+   an `UNLOGGED` staging table, `documents_raw` (`row_num` identity PK,
+   `pid`, `text`), via libpq's COPY protocol (`pg_store_copy_documents_
+   raw()`, streaming the file client-side in 64KB chunks -- no per-row
+   parsing on our side at all).
+
+   This required re-investigating the real `corpus.tsv`'s format first:
+   14,480 of 8,841,823 lines contain literal, unescaped backslash
+   characters (LaTeX-style `\displaystyle`, `\%`, IPA pronunciation
+   markers), and a smaller sample showed unescaped double quotes too --
+   both unsafe for Postgres's default `COPY` TEXT format, which treats
+   backslash as its escape character. Fix: re-exported the corpus from
+   duckdb with explicit `FORMAT CSV` (RFC4180 quoting) instead of the
+   original unquoted-TSV export, and verified byte-for-byte round-trip
+   correctness directly against Postgres -- both via `psql \copy` on the
+   real problem rows (pid 226, 2799, 4866, 5663, 8637) and via this
+   project's own `pg_store_copy_documents_raw()` at 149,461-row scale --
+   before trusting it at full corpus size.
+
+2. **Phase 2 -- parallel, contention-free processing.** Worker threads
+   claim independent `row_num` ranges out of `documents_raw` (plain
+   `SELECT ... WHERE row_num >= $1 AND row_num < $2` -- nothing to lock,
+   unlike `terms`' unique index), run the existing, unchanged tokenize ->
+   stopword-filter -> lemmatize pipeline, insert real rows into
+   `passages`, and stage each passage's term postings by their raw *text*
+   (not a resolved `terms.id`) into another `UNLOGGED`, unconstrained
+   staging table, `postings_staged`. `ingest_lemmatize_terms()` and a new
+   `ingest_count_distinct_terms()` (the per-chunk dedup+frequency-count
+   logic, extracted out of `ingest_index_chunk_terms()` so both the old
+   per-document path and this one share it instead of drifting) were
+   exposed from `ingest.c`/`ingest.h` for this. Because Phase 2 never
+   touches `terms`, batching many documents into one transaction is
+   *safe* here -- unlike the earlier, reverted batching attempt above,
+   there's no shared unique index for a wide transaction to hold locks
+   on. Each worker batches `BULK_PHASE2_BATCH_SIZE` (500) documents per
+   transaction, with a few retries before giving up on just that batch
+   (logged, not fatal to the run -- matches `concurrent_worker_run()`'s
+   existing per-document-failure tolerance).
+
+3. **Phase 3 -- finalize.** After every Phase 2 worker joins, one
+   single-threaded, single-writer pass (`pg_store_finalize_terms_and_
+   postings()`, zero contention risk by construction) resolves every
+   distinct staged term into `terms` (`INSERT ... SELECT DISTINCT ...
+   ON CONFLICT (term) DO NOTHING`), then writes the real `postings` rows
+   by joining `postings_staged` against `terms` on text. `work_mem` is
+   raised to 1GB for this connection only (a session-local `SET`, not a
+   `postgresql.conf` change) since this is the one place in the whole
+   pipeline actually running a large hash join/distinct. The `TermCache`
+   module (`term_cache.c`/`.h`) is untouched and still used by
+   `concurrent_ingest.c`'s separate directory-ingestion path --
+   `bulk_ingest.c` no longer depends on it at all, since Phase 2 has
+   nothing left for it to coordinate.
+
+**Real measured result, 200K-row slice, native Postgres, 6 threads:
+3490.9 passages/sec** (`lexis bulk-ingest`, wall clock 57.3s for 200,009
+passages) -- up from the previous best of 2211.3/sec, a genuine further
+~1.58x, and ~3.6x over the original 972.6/sec. Projected full-corpus
+time: 8,841,823 / 3490.9 ≈ 42.2 minutes, down from the original 151.5.
+Correctness verified directly, not just "it ran without crashing": 200,009
+passages / 214,010 distinct terms / 5,052,759 postings with zero
+duplicate `(term_id, passage_id)` pairs; staging tables confirmed dropped
+after the run; pid 226 (one of the real backslash-containing rows from
+the format investigation above) round-tripped with its literal
+`\displaystyle` text intact; a real `lexis query "energy of a photon"`
+against the resulting index returned pid 226 among genuinely relevant
+top-5 BM25 results with correct scores. Not yet run at full 8.84M-row
+scale -- see "Next optimizations" below.
+
 ## Next optimizations, roughly in priority order
 
-1. **Pre-load the entire term vocabulary before the concurrent phase
-   starts.** MS MARCO is static, known text -- the vocabulary doesn't need
-   to be discovered incrementally. One pass that tokenizes/lemmatizes the
-   whole corpus, collects every distinct term, and bulk-inserts them all
-   into `terms` before any concurrent worker touches a passage would mean
-   `pg_store_get_or_create_terms()` almost never hits its INSERT path
-   during the actual parallel run -- just fast SELECT-only lookups. This
-   attacks the deadlock/contention problem at its root rather than
-   retrying around it, and likely unlocks higher thread counts too, since
-   the collapse above was contention-driven, not raw CPU-scheduling
-   overhead (see the discussion in chat history for the reasoning that
-   separates these two).
+1. **Shared in-memory term cache across worker threads, refined from the
+   original "pre-load the vocabulary" idea below after the real
+   8.84M-passage MS MARCO bulk-ingest measurably underperformed the
+   synthetic-corpus benchmark (~1,126-1,184 passages/sec actual vs. the
+   ~1,866/sec peak measured on the earlier 3,000-doc benchmark corpus) --
+   real evidence the much larger real vocabulary drives meaningfully more
+   deadlock/retry overhead than the benchmark predicted. Design: one
+   mutex-guarded hash map (`term -> id`, modeled on `wordnet.c`'s
+   bucket-chained table) shared by every worker thread instead of each
+   thread's private, isolated `PgStore` connection today. (a) Pre-load it
+   with one `SELECT id, term FROM terms` before spawning workers -- any
+   previously-known term costs zero Postgres traffic ever again. (b) The
+   moment any thread successfully creates a genuinely new term, it writes
+   `term -> id` into the shared map before continuing, so a *different*
+   thread needing that same term moments later finds it in-process (a
+   mutex lock + hash lookup, single-digit microseconds) instead of racing
+   Postgres (a ~0.13ms round trip in the best case, a full transaction
+   abort + whole-document reingest in the deadlock case). Given MS
+   MARCO's word frequencies are Zipfian, this should eliminate the large
+   majority of contention, since a small number of common words getting
+   hit by multiple threads repeatedly is the likely dominant cause. Does
+   *not* fully close the race for two threads discovering the exact same
+   brand-new word in the same instant, before either's Postgres insert
+   completes -- fully closing that needs a "single-flight" pattern
+   (writing a *pending* placeholder into the map under the lock so a
+   second thread waits on a condition variable instead of also hitting
+   Postgres), meaningfully more concurrency code than the simple
+   cache -- worth building only if the simple cache alone doesn't get
+   contention low enough once measured. Original, simpler version of this
+   idea (a one-time whole-corpus pre-scan pass before any concurrent work
+   starts, rather than a live/shared cache) kept below for context: it
+   would still work, but duplicates the tokenize/lemmatize work in a
+   separate pass and doesn't help with terms only discovered mid-run,
+   which the live-shared-cache design handles for free.
 
-2. **Batch multiple documents per transaction, not just per document.**
-   Each document currently costs ~4-5 round trips (begin, batched term
-   resolve, batched posting insert, commit). At 8.8M documents that's
-   still tens of millions of round trips even in the best case. Grouping
-   e.g. 50-100 documents into one transaction with bulk multi-row inserts
-   would cut this further. Real tradeoff: coarser failure granularity --
-   one bad document in a batch would need per-document handling inside
-   the batch to avoid rolling back everything else in it, more bookkeeping
-   than the current clean one-document-one-transaction model.
+2. ~~Batch multiple documents per transaction, not just per document.~~
+   **Tried against the old per-document pipeline and reverted -- see
+   "Native Postgres, synchronous_commit, and a failed batching attempt"
+   above -- then successfully reintroduced under the three-phase redesign
+   (see "The three-phase deferred-term-resolution redesign" above).** The
+   original attempt's round-trip-amortization logic was sound, but it
+   ignored the lock-footprint cost: a batch transaction holds every term
+   it's touched for its whole duration, which under real 4-6 thread
+   concurrency caused severe, sustained contention (109 passages ingested
+   in 5+ minutes on one run). The fundamentally different approach that
+   entry said this would need turned out to be Phase 2's design itself:
+   batching is only dangerous when the batched transaction touches a
+   shared unique index (`terms`), so a pipeline that structurally never
+   does that during the batched phase can batch freely. 500 documents per
+   transaction, zero contention, real measured throughput above.
 
 3. **Sharper retry logic.** `concurrent_ingest.c` currently retries *any*
    `ingest_document()` failure up to 3 times, not specifically deadlocks.

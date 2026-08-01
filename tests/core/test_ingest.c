@@ -241,7 +241,7 @@ static void test_ingest_document_end_to_end(void) {
      * one chunk -- isolates this test to ingest_document's own wiring
      * rather than re-testing windowing, which already has its own tests. */
     long passages = ingest_document(store, stopwords, wordnet, lemmatizer,
-                                     TEST_FILE_PATH, "doc1.txt", 100, 0);
+                                     TEST_FILE_PATH, "doc1.txt", 100, 0, NULL);
     TEST_ASSERT(passages == 1, "expected exactly 1 passage ingested, got %ld", passages);
 
     PGresult *res = PQexec(store->conn, "SELECT document_name, text, token_count FROM passages;");
@@ -296,7 +296,7 @@ static void test_ingest_document_counts_repeated_terms(void) {
     TEST_ASSERT(lemmatizer != NULL, "expected lemmatizer_load to succeed");
 
     long passages = ingest_document(store, stopwords, wordnet, lemmatizer,
-                                     TEST_FILE_PATH, "doc1.txt", 100, 0);
+                                     TEST_FILE_PATH, "doc1.txt", 100, 0, NULL);
     TEST_ASSERT(passages == 1, "expected exactly 1 passage ingested, got %ld", passages);
 
     int64_t term_id = pg_store_lookup_term(store, "treatment");

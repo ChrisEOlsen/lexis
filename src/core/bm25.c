@@ -8,6 +8,120 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* Open-addressing (linear probing) hash table mapping passage_id -> its
+ * index into the owning BM25ResultSet's items[] array. See bm25.h's
+ * BM25ResultIndex forward declaration for why this exists. */
+typedef struct {
+    int64_t passage_id;
+    size_t item_index;
+    int occupied;
+} BM25IndexSlot;
+
+struct BM25ResultIndex {
+    BM25IndexSlot *slots;
+    size_t capacity;
+    size_t count;
+};
+
+/* Multiplicative hash (Knuth's method, the golden-ratio constant) --
+ * passage_ids are sequential (GENERATED ALWAYS AS IDENTITY), so a naive
+ * modulo would cluster badly; this scrambles the bits well regardless of
+ * table size. */
+static uint64_t bm25_hash_passage_id(int64_t passage_id) {
+    uint64_t x = (uint64_t)passage_id;
+    x *= 0x9E3779B97F4A7C15ULL;
+    return x;
+}
+
+/* Finds passage_id's slot via linear probing -- either an existing
+ * occupied slot (already present) or the first empty slot found along
+ * the probe sequence (not present, ready for insertion there). Assumes
+ * the table is never allowed to fill completely (see the load-factor
+ * check in bm25_result_index_insert()), so this always terminates. */
+static size_t bm25_result_index_find_slot(const BM25IndexSlot *slots, size_t capacity,
+                                           int64_t passage_id) {
+    size_t slot = (size_t)(bm25_hash_passage_id(passage_id) % capacity);
+    while (slots[slot].occupied && slots[slot].passage_id != passage_id) {
+        slot = (slot + 1) % capacity;
+    }
+    return slot;
+}
+
+static BM25ResultIndex *bm25_result_index_create(void) {
+    BM25ResultIndex *index = malloc(sizeof(BM25ResultIndex));
+    if (index == NULL) {
+        return NULL;
+    }
+    index->capacity = 16;
+    index->slots = calloc(index->capacity, sizeof(BM25IndexSlot));
+    if (index->slots == NULL) {
+        free(index);
+        return NULL;
+    }
+    index->count = 0;
+    return index;
+}
+
+static void bm25_result_index_free(BM25ResultIndex *index) {
+    if (index == NULL) {
+        return;
+    }
+    free(index->slots);
+    free(index);
+}
+
+/* Doubles the table and re-inserts every occupied slot at its new
+ * position -- probe sequences depend on capacity, so old positions can't
+ * just be copied over. Returns 0 on success, -1 on allocation failure
+ * (the table is left unchanged). */
+static int bm25_result_index_grow(BM25ResultIndex *index) {
+    size_t new_capacity = index->capacity * 2;
+    BM25IndexSlot *new_slots = calloc(new_capacity, sizeof(BM25IndexSlot));
+    if (new_slots == NULL) {
+        return -1;
+    }
+    for (size_t i = 0; i < index->capacity; i++) {
+        if (!index->slots[i].occupied) {
+            continue;
+        }
+        size_t slot = bm25_result_index_find_slot(new_slots, new_capacity, index->slots[i].passage_id);
+        new_slots[slot] = index->slots[i];
+    }
+    free(index->slots);
+    index->slots = new_slots;
+    index->capacity = new_capacity;
+    return 0;
+}
+
+/* Returns 1 and sets *out_item_index if passage_id is already indexed, 0
+ * if not (nothing to look up yet). */
+static int bm25_result_index_lookup(const BM25ResultIndex *index, int64_t passage_id,
+                                     size_t *out_item_index) {
+    size_t slot = bm25_result_index_find_slot(index->slots, index->capacity, passage_id);
+    if (index->slots[slot].occupied) {
+        *out_item_index = index->slots[slot].item_index;
+        return 1;
+    }
+    return 0;
+}
+
+/* Records that passage_id lives at item_index. Grows the table first if
+ * inserting would push the load factor past 0.7 (kept low to keep probe
+ * sequences short). Returns 0 on success, -1 on allocation failure. */
+static int bm25_result_index_insert(BM25ResultIndex *index, int64_t passage_id, size_t item_index) {
+    if ((index->count + 1) * 10 >= index->capacity * 7) {
+        if (bm25_result_index_grow(index) != 0) {
+            return -1;
+        }
+    }
+    size_t slot = bm25_result_index_find_slot(index->slots, index->capacity, passage_id);
+    index->slots[slot].passage_id = passage_id;
+    index->slots[slot].item_index = item_index;
+    index->slots[slot].occupied = 1;
+    index->count++;
+    return 0;
+}
+
 BM25CorpusStats bm25_corpus_stats(PgStore *store) {
     BM25CorpusStats stats = {-1, 0.0};
 
@@ -72,6 +186,13 @@ BM25ResultSet *bm25_result_set_create(void) {
         free(set);
         return NULL;
     }
+    set->index = bm25_result_index_create();
+    if (set->index == NULL) {
+        fprintf(stderr, "malloc failed: bm25_result_set_create, result->index");
+        free(set->items);
+        free(set);
+        return NULL;
+    }
     set->count = 0;
     set->capacity = init_capacity;
 
@@ -79,12 +200,12 @@ BM25ResultSet *bm25_result_set_create(void) {
 }
 
 int bm25_result_set_add(BM25ResultSet *set, int64_t passage_id, double score) {
-    for (size_t i = 0; i < set->count; i++) {
-        if (set->items[i].passage_id == passage_id) {
-            set->items[i].score += score;
-            return 0;
-        }
+    size_t item_index;
+    if (bm25_result_index_lookup(set->index, passage_id, &item_index)) {
+        set->items[item_index].score += score;
+        return 0;
     }
+
     if (set->count == set->capacity) {
         size_t new_capacity = set->capacity * 2;
         BM25ScoredPassage *new_items = realloc(set->items, new_capacity * sizeof(BM25ScoredPassage));
@@ -98,6 +219,12 @@ int bm25_result_set_add(BM25ResultSet *set, int64_t passage_id, double score) {
 
     set->items[set->count].passage_id = passage_id;
     set->items[set->count].score = score;
+
+    if (bm25_result_index_insert(set->index, passage_id, set->count) != 0) {
+        fprintf(stderr, "failed to grow index: bm25_result_set_add");
+        return -1;
+    }
+
     set->count++;
 
     return 0;
@@ -106,6 +233,7 @@ int bm25_result_set_add(BM25ResultSet *set, int64_t passage_id, double score) {
 void bm25_result_set_free(BM25ResultSet *set) {
     if (set == NULL) return;
     free(set->items);
+    bm25_result_index_free(set->index);
     free(set);
 }
 
@@ -122,10 +250,15 @@ int bm25_accumulate_term_scores(PgStore *store, int64_t term_id, BM25CorpusStats
     snprintf(term_id_str, sizeof(term_id_str), "%lld", (long long)term_id);
     const char *params_arr[1] = {term_id_str};
 
-    static const char *sql = "SELECT postings.passage_id, postings.term_frequency, passages.token_count "
-                              "FROM postings "
-                              "JOIN passages ON postings.passage_id = passages.id "
-                              "WHERE postings.term_id = $1;";
+    /* No JOIN against passages -- token_count is denormalized directly
+     * onto postings (see pg_store.c's schema comment) specifically so
+     * this stays a single index-only scan. Measured directly at real MS
+     * MARCO scale: the joined version cost 11-14+ seconds for a term
+     * with 100K+ matches (one random-access lookup into passages per
+     * matching row), worse for genuinely common words -- see
+     * LIMITATIONS.md. */
+    static const char *sql =
+        "SELECT passage_id, term_frequency, token_count FROM postings WHERE term_id = $1;";
 
     PGresult *res = PQexecParams(store->conn, sql, 1, NULL, params_arr, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -171,9 +304,8 @@ static int bm25_compare_score_desc(const void *a, const void *b) {
     return 0;
 }
 
-BM25ResultSet *bm25_search(PgStore *store, const char **query_terms, size_t num_terms, size_t top_k,
-                            BM25Params params) {
-    BM25CorpusStats stats = bm25_corpus_stats(store);
+BM25ResultSet *bm25_search(PgStore *store, const char **query_terms, size_t num_terms,
+                            size_t top_k, BM25CorpusStats stats, BM25Params params) {
     if (stats.total_passages < 0) {
         return NULL;
     }

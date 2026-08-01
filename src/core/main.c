@@ -12,8 +12,10 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "bm25.h"
+#include "bulk_ingest.h"
 #include "concurrent_ingest.h"
 #include "config.h"
+#include "eval.h"
 #include "generation.h"
 #include "ingest.h"
 #include "lemmatizer.h"
@@ -29,14 +31,23 @@
 #include <string.h>
 #include <time.h>
 
-/* Postgres connection string -- matches docker-compose.yml's dev instance
- * (experiment/postgres-migration branch only; see LIMITATIONS.md for the
- * still-open question of how/whether the shipped app would ever need this
- * to be user-configurable). */
-#define LEXIS_DB_CONNINFO "host=127.0.0.1 port=5433 dbname=lexis user=lexis password=lexis_dev_only"
+/* Postgres connection string -- points at the native Homebrew
+ * postgresql@18 install (port 5434), NOT the Docker dev instance
+ * (docker-compose.yml, port 5433, which still exists and is what the
+ * test suite's TEST_CONNINFO uses -- see LIMITATIONS.md). Moved off
+ * Docker Desktop for real ingestion because Docker Desktop on macOS
+ * runs everything inside a lightweight Linux VM, so even "localhost"
+ * traffic to the containerized Postgres crosses that VM boundary before
+ * reaching it -- real per-round-trip latency a native install doesn't
+ * pay. `make pg-start`/`make pg-stop` manage this instance (see
+ * Makefile) -- it does not auto-start on login. Separate from, and
+ * deliberately never touches, this machine's pre-existing
+ * postgresql@14 instance on the default port 5432 (unrelated projects'
+ * real data) or the Docker instance on 5433. */
+#define LEXIS_DB_CONNINFO "host=127.0.0.1 port=5434 dbname=lexis user=lexis password=lexis_dev_only"
 /* Display-only label -- never print LEXIS_DB_CONNINFO itself, it embeds
  * the dev password. */
-#define LEXIS_DB_LABEL "127.0.0.1:5433/lexis"
+#define LEXIS_DB_LABEL "127.0.0.1:5434/lexis (native)"
 #define LEXIS_STOPWORDS_PATH "data/stopwords/english.txt"
 #define LEXIS_WORDNET_DIR "data/wordnet"
 #define LEXIS_CONFIG_PATH "config/lexis.conf"
@@ -49,12 +60,16 @@
 #define LEXIS_MODEL_LABEL "Llama-3.2-3B-Instruct-Q4_K_M (local)"
 #define LEXIS_CHUNK_SIZE 200
 #define LEXIS_CHUNK_OVERLAP 40
-/* Measured sweet spot on this machine's 8 logical cores (see SPEED.md's
- * thread-count sweep) -- throughput peaked at 4 threads and *dropped
- * below the single-threaded number* past ~16, driven by contention on
- * the terms unique index, not just diminishing returns. Not
- * auto-detected from core count yet; see LIMITATIONS.md. */
-#define LEXIS_INGEST_THREADS 4
+/* Re-measured after adding the shared term cache (term_cache.c), which
+ * removed most of the terms-unique-index contention the original
+ * pre-cache sweep was dominated by (see SPEED.md). Re-swept at 4/6/8/
+ * 10/12/16 threads on this machine's 8 physical/logical cores: 6 came
+ * out nominally fastest (1542.4 passages/sec on a 200K-row slice), but
+ * the whole 1125-1542/sec spread across that sweep is within the same
+ * noise band as separate re-runs of the same thread count -- not a
+ * confident ranking, just the best single-run result. Not auto-detected
+ * from core count yet; see LIMITATIONS.md. */
+#define LEXIS_INGEST_THREADS 6
 #define LEXIS_TOP_K 5
 
 static long elapsed_ms(struct timespec start, struct timespec end) {
@@ -66,11 +81,13 @@ static long elapsed_ms(struct timespec start, struct timespec end) {
 static void print_usage(const char *program_name) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s ingest <corpus_dir>    Build/rebuild the index from a directory of documents\n"
-            "  %s query \"<question>\"     Ask a question against the current index\n"
+            "  %s ingest <corpus_dir>                  Build/rebuild the index from a directory of documents\n"
+            "  %s bulk-ingest <tsv_path>                Build/rebuild the index from a TSV of \"<id><TAB><text>\" rows\n"
+            "  %s query \"<question>\"                   Ask a question against the current index\n"
+            "  %s eval <queries_tsv> <qrels_tsv>        Score retrieval quality (MRR@10/Recall@K) against labeled queries\n"
             "\n"
             "Must be run from the project root.\n",
-            program_name, program_name);
+            program_name, program_name, program_name, program_name);
 }
 
 static int run_ingest(const char *corpus_dir) {
@@ -117,6 +134,55 @@ static int run_ingest(const char *corpus_dir) {
         long ms = elapsed_ms(start, end);
         printf("Ingested %ld passages from %s into %s in %ldms (%d threads, %.1f passages/sec)\n",
                passages, corpus_dir, LEXIS_DB_LABEL, ms, LEXIS_INGEST_THREADS,
+               ms > 0 ? (double)passages / ((double)ms / 1000.0) : 0.0);
+    }
+
+    stopword_set_free(stopwords);
+    wordnet_table_free(wordnet);
+    lemmatizer_free(lemmatizer);
+    return exit_code;
+}
+
+static int run_bulk_ingest(const char *tsv_path) {
+    StopwordSet *stopwords = stopword_set_load(LEXIS_STOPWORDS_PATH);
+    WordNetTable *wordnet = wordnet_table_load(LEXIS_WORDNET_DIR);
+    Lemmatizer *lemmatizer = lemmatizer_load(LEXIS_WORDNET_DIR);
+    if (stopwords == NULL || wordnet == NULL || lemmatizer == NULL) {
+        fprintf(stderr,
+                "lexis: failed to load stopwords/wordnet/lemmatizer -- "
+                "are you running this from the project root?\n");
+        stopword_set_free(stopwords);
+        wordnet_table_free(wordnet);
+        lemmatizer_free(lemmatizer);
+        return 1;
+    }
+
+    /* Same fail-fast probe as run_ingest() -- one clear error message
+     * before spawning bulk_ingest_tsv()'s worker threads. */
+    PgStore *probe_store = pg_store_open(LEXIS_DB_CONNINFO);
+    if (probe_store == NULL) {
+        fprintf(stderr, "lexis: failed to open index at %s\n", LEXIS_DB_LABEL);
+        stopword_set_free(stopwords);
+        wordnet_table_free(wordnet);
+        lemmatizer_free(lemmatizer);
+        return 1;
+    }
+    pg_store_close(probe_store);
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    long passages = bulk_ingest_tsv(LEXIS_DB_CONNINFO, stopwords, wordnet, lemmatizer, tsv_path,
+                                     LEXIS_CHUNK_SIZE, LEXIS_CHUNK_OVERLAP, LEXIS_INGEST_THREADS);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    int exit_code = 0;
+    if (passages < 0) {
+        fprintf(stderr, "lexis: failed to bulk-ingest %s\n", tsv_path);
+        exit_code = 1;
+    } else {
+        long ms = elapsed_ms(start, end);
+        printf("Ingested %ld passages from %s into %s in %ldms (%d threads, %.1f passages/sec)\n",
+               passages, tsv_path, LEXIS_DB_LABEL, ms, LEXIS_INGEST_THREADS,
                ms > 0 ? (double)passages / ((double)ms / 1000.0) : 0.0);
     }
 
@@ -263,7 +329,11 @@ static int run_query(const char *question) {
         struct timespec search_start, search_end;
         clock_gettime(CLOCK_MONOTONIC, &search_start);
         BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B};
-        BM25ResultSet *results = bm25_search(store, query_terms, terms->count, LEXIS_TOP_K, params);
+        BM25CorpusStats stats = bm25_corpus_stats(store);
+        BM25ResultSet *results =
+            (stats.total_passages >= 0)
+                ? bm25_search(store, query_terms, terms->count, LEXIS_TOP_K, stats, params)
+                : NULL;
         clock_gettime(CLOCK_MONOTONIC, &search_end);
         free(query_terms);
         token_list_free(terms);
@@ -352,6 +422,73 @@ cleanup:
     return exit_code;
 }
 
+static int run_eval(const char *queries_path, const char *qrels_path) {
+    StopwordSet *stopwords = stopword_set_load(LEXIS_STOPWORDS_PATH);
+    WordNetTable *wordnet = wordnet_table_load(LEXIS_WORDNET_DIR);
+    Lemmatizer *lemmatizer = lemmatizer_load(LEXIS_WORDNET_DIR);
+    if (stopwords == NULL || wordnet == NULL || lemmatizer == NULL) {
+        fprintf(stderr,
+                "lexis: failed to load stopwords/wordnet/lemmatizer -- "
+                "are you running this from the project root?\n");
+        stopword_set_free(stopwords);
+        wordnet_table_free(wordnet);
+        lemmatizer_free(lemmatizer);
+        return 1;
+    }
+
+    PgStore *store = pg_store_open(LEXIS_DB_CONNINFO);
+    if (store == NULL) {
+        fprintf(stderr, "lexis: failed to open index at %s\n", LEXIS_DB_LABEL);
+        stopword_set_free(stopwords);
+        wordnet_table_free(wordnet);
+        lemmatizer_free(lemmatizer);
+        return 1;
+    }
+
+    /* eval_run() only exercises query formulation (WordNet expansion +
+     * local-model term selection), never generation_generate_answer() --
+     * MRR@10/Recall@K don't depend on what the large model says about
+     * the results. Still needs the local model loaded exactly once here,
+     * up front, for the same reason main.c's other modes do: a fresh
+     * process-per-query would pay the ~9-19s model-load cost thousands
+     * of times over (see LIMITATIONS.md). */
+    if (local_llm_client_init(LEXIS_MODEL_PATH) != 0) {
+        fprintf(stderr, "lexis: failed to load local model from %s\n", LEXIS_MODEL_PATH);
+        pg_store_close(store);
+        stopword_set_free(stopwords);
+        wordnet_table_free(wordnet);
+        lemmatizer_free(lemmatizer);
+        return 1;
+    }
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    EvalMetrics metrics = eval_run(store, stopwords, wordnet, lemmatizer, queries_path, qrels_path);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    int exit_code = 0;
+    if (metrics.queries_evaluated < 0) {
+        fprintf(stderr, "lexis: eval failed\n");
+        exit_code = 1;
+    } else {
+        long ms = elapsed_ms(start, end);
+        printf("\n=== Eval complete ===\n");
+        printf("Queries evaluated: %ld (skipped %ld with no qrels judgments)\n",
+               metrics.queries_evaluated, metrics.queries_skipped);
+        printf("MRR@10:      %.4f\n", metrics.mrr_at_10);
+        printf("Recall@10:   %.4f\n", metrics.recall_at_10);
+        printf("Recall@100:  %.4f\n", metrics.recall_at_100);
+        printf("Total time:  %.1f minutes\n", (double)ms / 60000.0);
+    }
+
+    local_llm_client_cleanup();
+    pg_store_close(store);
+    stopword_set_free(stopwords);
+    wordnet_table_free(wordnet);
+    lemmatizer_free(lemmatizer);
+    return exit_code;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         print_usage(argv[0]);
@@ -361,8 +498,18 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "ingest") == 0) {
         return run_ingest(argv[2]);
     }
+    if (strcmp(argv[1], "bulk-ingest") == 0) {
+        return run_bulk_ingest(argv[2]);
+    }
     if (strcmp(argv[1], "query") == 0) {
         return run_query(argv[2]);
+    }
+    if (strcmp(argv[1], "eval") == 0) {
+        if (argc < 4) {
+            print_usage(argv[0]);
+            return 1;
+        }
+        return run_eval(argv[2], argv[3]);
     }
 
     print_usage(argv[0]);
