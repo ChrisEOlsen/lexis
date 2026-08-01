@@ -420,7 +420,56 @@ return) was fully reverted -- confirmed via an empty `git diff` on
 (same zero-C-code, schema-only shape as the experiment above) before
 spending any effort on parallel query or the hash-partitioned C refactor
 -- neither is likely to matter much until the much larger FK-checking
-cost is addressed first. See "Next optimizations" for what's next.
+cost is addressed first.
+
+### Made permanent: `pg_store_prepare_bulk_load()` / `pg_store_finish_bulk_load()`
+
+Implemented the combined finding as real, permanent code rather than a
+one-off `psql` experiment: two new `pg_store.c` functions bracket Phase
+3 in `bulk_ingest_tsv()`. `pg_store_prepare_bulk_load()` drops
+`postings`' PK and both FKs (`IF EXISTS`, so a prior crashed run's
+already-weakened state doesn't wedge the next one) and sets
+`postings`/`terms` `UNLOGGED`; `pg_store_finish_bulk_load()` rebuilds the
+PK and both FKs (while still `UNLOGGED`, so the build itself is free),
+then restores `LOGGED` status. `passages` is deliberately left alone --
+`query_log.c`'s `search_results` table holds a `LOGGED` FK referencing
+it, and `passages` isn't written by Phase 3 anyway.
+
+Hit and fixed one real ordering bug in the process, caught by a test, not
+assumed correct: `SET LOGGED` has to happen on `terms` before `postings`
+during restore (the reverse of the drop order) -- once `postings`' FK to
+`terms` exists again, Postgres refuses to mark the referencing table
+`LOGGED` while what it points at is still `UNLOGGED`. New tests
+(`test_prepare_bulk_load_defers_constraints_and_durability`,
+`test_finish_bulk_load_restores_constraints_and_durability_and_data_
+survives`) caught this directly before it ever reached a real benchmark
+run.
+
+**Real measured result, full pipeline, 200K-row slice, native Postgres,
+6 threads** (`bulk_ingest_tsv()` now reports five buckets, not three):
+
+| Phase | Time |
+|---|---|
+| Phase 1 (raw append) | 459ms |
+| Phase 2 (parallel processing) | 8,277ms |
+| Prepare (defer constraints) | 15ms |
+| Phase 3 (finalize) | 5,060ms |
+| Restore (rebuild constraints) | 11,892ms |
+| **Total** | **25,712ms** |
+
+**7,778.8 passages/sec -- a 2.24x speedup over the original 57,576ms
+baseline, and 1.93x over the Step 1-only (PK+UNLOGGED, no FK deferral)
+result of 49,515ms.** Projected full-corpus time: 8,841,823 / 7,778.8 ≈
+**18.9 minutes**, down from the original 151.5 minutes and from this
+redesign's own earlier 42.2-minute projection -- landing at the edge of
+the 12-18 minute range the original external suggestion predicted,
+despite that suggestion never having identified foreign keys as the
+real lever. Correctness verified identical to every prior run (200,009 /
+214,010 / 5,052,759 passages/terms/postings, zero duplicate postings,
+schema fully restored -- PK, both FKs, both tables LOGGED -- staging
+tables dropped, pid 226's backslash content intact, a real `lexis query`
+returning the same relevant top-5 results). Not yet run at full 8.84M-row
+scale.
 
 ## Next optimizations, roughly in priority order
 

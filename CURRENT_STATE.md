@@ -160,13 +160,25 @@ speculative insertion racing on `terms.term`'s unique index, see
    contention; see `SPEED.md` for why that failure mode is structurally
    absent here.
 
-3. **Phase 3 -- finalize** (`pg_store_finalize_terms_and_postings`). Once
-   every Phase 2 worker has joined, one single-threaded, single-writer
-   pass resolves every distinct staged term into `terms`
-   (`INSERT ... SELECT DISTINCT ... ON CONFLICT (term) DO NOTHING`),
-   then writes the real `postings` rows by joining `postings_staged`
-   against `terms` on text. `work_mem` is raised to 1GB for this
-   connection only. The staging tables are dropped once this succeeds.
+3. **Phase 3 -- finalize** (`pg_store_finalize_terms_and_postings`),
+   bracketed by `pg_store_prepare_bulk_load()`/`pg_store_finish_bulk_
+   load()`. `prepare` drops `postings`' PRIMARY KEY and both FOREIGN KEY
+   constraints and sets `postings`/`terms` `UNLOGGED` (measured as the
+   single largest lever in this whole pipeline -- the two foreign keys
+   alone accounted for a ~6.5x difference, bigger than the PK, see
+   `SPEED.md`). Once every Phase 2 worker has joined, one single-
+   threaded, single-writer pass resolves every distinct staged term into
+   `terms` (`INSERT ... SELECT DISTINCT ... ON CONFLICT (term) DO
+   NOTHING`), then writes the real `postings` rows by joining
+   `postings_staged` against `terms` on text. `work_mem` is raised to
+   1GB for this connection only. `finish` then rebuilds the PK and both
+   FKs (while still `UNLOGGED`, so the build itself generates no WAL)
+   and restores `LOGGED` status -- `terms` before `postings`, since
+   Postgres refuses to mark a table `LOGGED` while it holds a live FK
+   pointing at a still-`UNLOGGED` table. `passages` is deliberately never
+   touched by this -- `query_log.c`'s `search_results` table holds a
+   `LOGGED` FK referencing it, and `passages` isn't written by Phase 3
+   anyway. The staging tables are dropped once this all succeeds.
 
 **Failure handling**: because Phase 1 is one atomic `COPY`, a single
 malformed row (wrong column count, bad CSV) fails the *entire* load, not
@@ -174,15 +186,20 @@ just that row -- there's no per-row skip for a bulk loader whose whole
 point is trusting the source file's format. Phase 2 batch failures, by
 contrast, are tolerant: a batch that exhausts its retries is logged and
 skipped (costing at most that batch's ~500 documents), not fatal to the
-run.
+run. A failure between `prepare` and `finish` leaves `postings`/`terms`
+without their constraints and `UNLOGGED` until the next successful run
+restores them -- an accepted trade-off matching this pipeline's existing
+"rebuildable, not crash-safe mid-run" philosophy, not a gap.
 
 **Real measured throughput** (200K-row slice, native Postgres, 6
-threads): **3490.9 passages/sec**, verified correct (exact passage/term/
-posting counts, zero duplicate postings, a real `lexis query` sanity
-check). Full corpus (8,841,823 rows) projected at ~42 minutes. See
-`SPEED.md` for the complete performance history this number comes out
-of. **Not yet run at full corpus scale** -- see "Where things actually
-stand" below.
+threads): **7,778.8 passages/sec**, verified correct (exact passage/term/
+posting counts, zero duplicate postings, schema fully restored, a real
+`lexis query` sanity check). Full corpus (8,841,823 rows) projected at
+~18.9 minutes, down from this pipeline's original 42-minute projection
+and the pre-redesign 151.5 minutes. See `SPEED.md` for the complete
+performance history and the full per-phase breakdown this number comes
+out of. **Not yet run at full corpus scale** -- see "Where things
+actually stand" below.
 
 ## Query pipeline (`lexis query "<question>"`)
 
@@ -246,7 +263,7 @@ Plain (non-CSV) TSV is not safe here -- see "Ingestion" above.
 **Ingest:**
 
 ```
-./lexis bulk-ingest corpus_csv.tsv     # ~42 minutes projected for the full 8.84M-row corpus
+./lexis bulk-ingest corpus_csv.tsv     # ~18.9 minutes projected for the full 8.84M-row corpus
 ```
 
 If re-running against a database that already has data in it, truncate

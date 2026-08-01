@@ -246,4 +246,52 @@ int pg_store_insert_staged_postings(PgStore *store, int64_t passage_id, const ch
  * rows written (>= 0) on success, or -1 on failure. */
 long pg_store_finalize_terms_and_postings(PgStore *store);
 
+/* Bracket Phase 3 with this (prepare, called first) and
+ * pg_store_finish_bulk_load() (restore, called last) to defer postings'
+ * PRIMARY KEY and both FOREIGN KEY constraints, and terms/postings'
+ * durability, to one bulk pass at the very end instead of paying for
+ * them per-row during the load. Measured directly (see SPEED.md): the
+ * two foreign keys turned out to be the single largest lever found so
+ * far in this whole pipeline -- bigger than the primary key itself, and
+ * far bigger than parallelizing the join (which barely mattered).
+ *
+ * Drops (with IF EXISTS, so a prior crashed run's already-weakened state
+ * doesn't wedge this one -- matches this pipeline's existing
+ * "rebuildable, not crash-safe mid-run" philosophy, see
+ * pg_store_disable_synchronous_commit()) postings_pkey,
+ * postings_term_id_fkey, and postings_passage_id_fkey, then sets
+ * `postings` and `terms` UNLOGGED. Constraints are dropped before the
+ * UNLOGGED conversion specifically because Postgres refuses to weaken a
+ * table's persistence while a still-LOGGED table holds a foreign key
+ * referencing it -- dropping postings' FK to terms first removes that
+ * dependency.
+ *
+ * `passages` is deliberately left untouched -- query_log.c's
+ * search_results table (LOGGED, only populated in testing mode) holds a
+ * foreign key referencing it, which the same rule above would block, and
+ * passages isn't written by Phase 3 (the actual target) anyway.
+ *
+ * A run that fails after calling this and before calling
+ * pg_store_finish_bulk_load() leaves the schema in this weakened state
+ * until the next successful bulk-ingest run restores it -- an accepted
+ * trade-off given the "just re-run it" philosophy already in place, not
+ * a gap. Returns 0 on success, -1 on failure. */
+int pg_store_prepare_bulk_load(PgStore *store);
+
+/* Reverses pg_store_prepare_bulk_load(): re-adds postings' PRIMARY KEY
+ * and both FOREIGN KEY constraints -- built/validated once in a single
+ * bulk pass against whatever's actually in the table, far cheaper than
+ * maintaining them incrementally during the load (see SPEED.md) -- then
+ * sets `postings` and `terms` back to LOGGED. The constraints are
+ * rebuilt before restoring LOGGED status, not after: an index or
+ * constraint built on a still-UNLOGGED table is itself unlogged, so
+ * building them first avoids paying WAL for that build entirely: SET
+ * LOGGED then generates WAL once, in bulk, for the fully-built table
+ * instead. Must be called after every successful
+ * pg_store_prepare_bulk_load() -- unlike the throwaway staging tables,
+ * `passages`/`terms`/`postings` are the real index, and a run that never
+ * restores this leaves it durably weakened. Returns 0 on success, -1 on
+ * failure. */
+int pg_store_finish_bulk_load(PgStore *store);
+
 #endif /* LEXIS_PG_STORE_H */

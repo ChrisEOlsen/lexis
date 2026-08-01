@@ -359,6 +359,26 @@ long bulk_ingest_tsv(const char *conninfo, const StopwordSet *stopwords,
         return -1;
     }
 
+    /* Defer postings' PK/FK constraints and terms/postings' durability
+     * to one bulk pass at the very end, rather than paying for them
+     * per-row during Phase 3 -- measured directly as the single largest
+     * lever in this whole pipeline, bigger than the primary key alone
+     * (see SPEED.md). A failure anywhere between here and
+     * pg_store_finish_bulk_load() leaves the schema in this weakened
+     * state until the next successful run restores it -- an accepted
+     * trade-off, not a gap, matching this pipeline's existing
+     * "rebuildable, not crash-safe mid-run" philosophy. */
+    struct timespec prepare_start, prepare_end;
+    clock_gettime(CLOCK_MONOTONIC, &prepare_start);
+
+    if (pg_store_prepare_bulk_load(coordinator) != 0) {
+        fprintf(stderr, "bulk_ingest_tsv: failed to prepare postings/terms for bulk load\n");
+        pg_store_close(coordinator);
+        return -1;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &prepare_end);
+
     /* Phase 3: single-threaded, set-based term resolution -- the only
      * point in this whole pipeline that touches the terms table, and the
      * only writer when it does. */
@@ -374,6 +394,18 @@ long bulk_ingest_tsv(const char *conninfo, const StopwordSet *stopwords,
 
     clock_gettime(CLOCK_MONOTONIC, &phase3_end);
 
+    struct timespec restore_start, restore_end;
+    clock_gettime(CLOCK_MONOTONIC, &restore_start);
+
+    if (pg_store_finish_bulk_load(coordinator) != 0) {
+        fprintf(stderr, "bulk_ingest_tsv: failed to restore postings/terms constraints -- schema "
+                        "left weakened, will be restored by the next successful run\n");
+        pg_store_close(coordinator);
+        return -1;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &restore_end);
+
     pg_store_drop_staging_tables(coordinator);
     pg_store_close(coordinator);
 
@@ -382,9 +414,11 @@ long bulk_ingest_tsv(const char *conninfo, const StopwordSet *stopwords,
      * since this pipeline is meant to be watched during a long real run,
      * not just checked for a final pass/fail. */
     printf("bulk_ingest_tsv: Phase 1 (raw append) %ldms, Phase 2 (parallel processing) %ldms, "
-           "Phase 3 (finalize) %ldms, %lld rows staged, %ld postings written\n",
+           "prepare (defer constraints) %ldms, Phase 3 (finalize) %ldms, "
+           "restore (rebuild constraints) %ldms, %lld rows staged, %ld postings written\n",
            elapsed_ms(phase1_start, phase1_end), elapsed_ms(phase2_start, phase2_end),
-           elapsed_ms(phase3_start, phase3_end), (long long)total_rows, postings_written);
+           elapsed_ms(prepare_start, prepare_end), elapsed_ms(phase3_start, phase3_end),
+           elapsed_ms(restore_start, restore_end), (long long)total_rows, postings_written);
 
     return total_passages;
 }

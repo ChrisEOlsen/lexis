@@ -11,6 +11,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define TEST_CONNINFO "host=127.0.0.1 port=5433 dbname=lexis_test user=lexis password=lexis_dev_only"
 
@@ -573,6 +574,73 @@ static void test_finalize_terms_and_postings_resolves_and_dedups(void) {
     pg_store_close(store);
 }
 
+static int table_persistence_is_unlogged(PgStore *store, const char *table_name) {
+    const char *params[1] = {table_name};
+    PGresult *res = PQexecParams(store->conn, "SELECT relpersistence FROM pg_class WHERE relname = $1;", 1,
+                                  NULL, params, NULL, NULL, 0);
+    int is_unlogged = (PQntuples(res) == 1 && strcmp(PQgetvalue(res, 0, 0), "u") == 0);
+    PQclear(res);
+    return is_unlogged;
+}
+
+static int postings_has_pk_and_fks(PgStore *store) {
+    PGresult *res = PQexec(store->conn,
+                            "SELECT count(*) FROM pg_constraint WHERE conrelid = 'postings'::regclass "
+                            "AND contype IN ('p', 'f');");
+    int count = atoi(PQgetvalue(res, 0, 0));
+    PQclear(res);
+    return count == 3; /* 1 primary key + 2 foreign keys */
+}
+
+static void test_prepare_bulk_load_defers_constraints_and_durability(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+
+    TEST_ASSERT(postings_has_pk_and_fks(store), "expected a fresh schema to have postings' PK + 2 FKs");
+    TEST_ASSERT(!table_persistence_is_unlogged(store, "postings"), "expected postings to start LOGGED");
+    TEST_ASSERT(!table_persistence_is_unlogged(store, "terms"), "expected terms to start LOGGED");
+
+    TEST_ASSERT(pg_store_prepare_bulk_load(store) == 0, "expected prepare_bulk_load to succeed");
+
+    TEST_ASSERT(!postings_has_pk_and_fks(store), "expected PK + FKs to be dropped after prepare");
+    TEST_ASSERT(table_persistence_is_unlogged(store, "postings"), "expected postings to be UNLOGGED");
+    TEST_ASSERT(table_persistence_is_unlogged(store, "terms"), "expected terms to be UNLOGGED");
+
+    /* Idempotent: a prior crashed run may have already left things in
+     * exactly this state -- calling prepare again must not error. */
+    TEST_ASSERT(pg_store_prepare_bulk_load(store) == 0, "expected a second prepare_bulk_load to be a no-op");
+
+    pg_store_close(store);
+}
+
+static void test_finish_bulk_load_restores_constraints_and_durability_and_data_survives(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
+
+    /* Real data inserted BEFORE deferring constraints, exactly like a
+     * real bulk-ingest run -- proves the constraint drop/restore cycle
+     * doesn't lose or corrupt anything already written. */
+    int64_t term_id = pg_store_get_or_create_term(store, "hypertension");
+    int64_t passage_id = pg_store_insert_passage(store, "pid-1", 0, "some text", 3);
+    TEST_ASSERT(pg_store_insert_posting(store, term_id, passage_id, 2, 3) == 0,
+                "expected posting insert to succeed");
+
+    TEST_ASSERT(pg_store_prepare_bulk_load(store) == 0, "expected prepare_bulk_load to succeed");
+    TEST_ASSERT(pg_store_finish_bulk_load(store) == 0, "expected finish_bulk_load to succeed");
+
+    TEST_ASSERT(postings_has_pk_and_fks(store), "expected PK + FKs restored after finish");
+    TEST_ASSERT(!table_persistence_is_unlogged(store, "postings"), "expected postings restored to LOGGED");
+    TEST_ASSERT(!table_persistence_is_unlogged(store, "terms"), "expected terms restored to LOGGED");
+
+    PGresult *res = PQexec(store->conn, "SELECT term_frequency, token_count FROM postings;");
+    TEST_ASSERT(PQntuples(res) == 1, "expected the posting inserted before prepare to survive");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 0), "2");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 1), "3");
+    PQclear(res);
+
+    pg_store_close(store);
+}
+
 int main(void) {
     test_open_creates_store();
     test_insert_passage_returns_ids();
@@ -599,5 +667,7 @@ int main(void) {
     test_get_raw_documents_range_returns_requested_rows();
     test_insert_staged_postings_batch_writes_raw_term_text();
     test_finalize_terms_and_postings_resolves_and_dedups();
+    test_prepare_bulk_load_defers_constraints_and_durability();
+    test_finish_bulk_load_restores_constraints_and_durability_and_data_survives();
     return test_summary();
 }

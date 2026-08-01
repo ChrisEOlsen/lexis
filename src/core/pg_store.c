@@ -833,3 +833,42 @@ long pg_store_finalize_terms_and_postings(PgStore *store) {
 
     return postings_written;
 }
+
+int pg_store_prepare_bulk_load(PgStore *store) {
+    /* Constraints dropped before the UNLOGGED conversion -- Postgres
+     * refuses to weaken a table's persistence while a still-LOGGED
+     * table holds a foreign key referencing it, and dropping postings'
+     * FK to terms is what removes that dependency. See this function's
+     * doc comment for why passages is deliberately left out. */
+    static const char *sql =
+        "ALTER TABLE postings DROP CONSTRAINT IF EXISTS postings_pkey;"
+        "ALTER TABLE postings DROP CONSTRAINT IF EXISTS postings_term_id_fkey;"
+        "ALTER TABLE postings DROP CONSTRAINT IF EXISTS postings_passage_id_fkey;"
+        "ALTER TABLE postings SET UNLOGGED;"
+        "ALTER TABLE terms SET UNLOGGED;";
+    return exec_simple(store->conn, sql, "pg_store_prepare_bulk_load");
+}
+
+int pg_store_finish_bulk_load(PgStore *store) {
+    /* Constraints rebuilt while still UNLOGGED (so their own build pays
+     * no WAL cost); SET LOGGED last, paying that cost once in bulk for
+     * the whole finished table -- see this function's doc comment.
+     * `terms` must go LOGGED before `postings`, the reverse of
+     * pg_store_prepare_bulk_load()'s drop order: by this point postings
+     * already has a live FK pointing at terms again, and Postgres
+     * refuses to make a table LOGGED while it references a still-
+     * UNLOGGED table (same rule pg_store_prepare_bulk_load() works
+     * around from the other direction). Got this backwards on the first
+     * attempt -- caught directly by
+     * test_finish_bulk_load_restores_constraints_and_durability_and_data_survives(),
+     * not assumed correct. */
+    static const char *sql =
+        "ALTER TABLE postings ADD PRIMARY KEY (term_id, passage_id);"
+        "ALTER TABLE postings ADD CONSTRAINT postings_term_id_fkey "
+        "    FOREIGN KEY (term_id) REFERENCES terms(id);"
+        "ALTER TABLE postings ADD CONSTRAINT postings_passage_id_fkey "
+        "    FOREIGN KEY (passage_id) REFERENCES passages(id);"
+        "ALTER TABLE terms SET LOGGED;"
+        "ALTER TABLE postings SET LOGGED;";
+    return exec_simple(store->conn, sql, "pg_store_finish_bulk_load");
+}
