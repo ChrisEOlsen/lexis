@@ -38,7 +38,7 @@ TESTDIR := tests/core
 BUILD   := build
 
 # Real (non-stub) module sources — grows as stub .c files gain content.
-CORE_SRCS := src/core/tokenizer.c src/core/stopwords.c src/core/pg_store.c src/core/bm25.c src/core/ingest.c src/core/local_llm_client.c src/core/vendor/cJSON.c src/core/wordnet.c src/core/query_formulation.c src/core/string_builder.c src/core/generation.c src/core/lemmatizer.c src/core/query_log.c src/core/config.c src/core/concurrent_ingest.c src/core/bulk_ingest.c src/core/eval.c src/core/term_cache.c
+CORE_SRCS := src/core/tokenizer.c src/core/stopwords.c src/core/pg_store.c src/core/bm25.c src/core/ingest.c src/core/local_llm_client.c src/core/vendor/cJSON.c src/core/wordnet.c src/core/query_formulation.c src/core/string_builder.c src/core/generation.c src/core/lemmatizer.c src/core/query_log.c src/core/config.c src/core/bulk_ingest.c src/core/eval.c
 
 TEST_SRCS := $(wildcard $(TESTDIR)/test_*.c)
 TEST_BINS := $(patsubst $(TESTDIR)/%.c,$(BUILD)/%,$(TEST_SRCS))

@@ -1,9 +1,8 @@
 /*
- * Tests for src/core/bulk_ingest.c -- TSV-streaming concurrent ingestion
- * via multiple Postgres connections. Uses the real docker-compose
+ * Tests for src/core/bulk_ingest.c -- the three-phase, deferred-term-
+ * resolution TSV ingestion pipeline. Uses the real docker-compose
  * Postgres instance (lexis_test database) -- `docker compose up -d` must
- * be running for these to pass. Mirrors test_concurrent_ingest.c's
- * pattern.
+ * be running for these to pass.
  */
 
 #include "bulk_ingest.h"

@@ -1,8 +1,10 @@
 /*
- * CLI entrypoint for the LEXIS C core. Dispatches to ingestion mode
- * (build/update the index from a corpus) or query mode (run the
- * retrieval + generation pipeline for a single question), per spec
- * section 5.1's high-level data flow.
+ * CLI entrypoint for the LEXIS C core. Dispatches to bulk-ingest (build/
+ * rebuild the index from a TSV corpus via bulk_ingest.c's three-phase
+ * pipeline -- see SPEED.md), query (run the retrieval + generation
+ * pipeline for a single question), or eval (score retrieval quality
+ * against labeled queries, see eval.c), per spec section 5.1's
+ * high-level data flow.
  *
  * Must be run from the project root -- data/stopwords, data/wordnet,
  * and the index file are all located via relative paths, same
@@ -13,7 +15,6 @@
 
 #include "bm25.h"
 #include "bulk_ingest.h"
-#include "concurrent_ingest.h"
 #include "config.h"
 #include "eval.h"
 #include "generation.h"
@@ -60,15 +61,12 @@
 #define LEXIS_MODEL_LABEL "Llama-3.2-3B-Instruct-Q4_K_M (local)"
 #define LEXIS_CHUNK_SIZE 200
 #define LEXIS_CHUNK_OVERLAP 40
-/* Re-measured after adding the shared term cache (term_cache.c), which
- * removed most of the terms-unique-index contention the original
- * pre-cache sweep was dominated by (see SPEED.md). Re-swept at 4/6/8/
- * 10/12/16 threads on this machine's 8 physical/logical cores: 6 came
- * out nominally fastest (1542.4 passages/sec on a 200K-row slice), but
- * the whole 1125-1542/sec spread across that sweep is within the same
- * noise band as separate re-runs of the same thread count -- not a
- * confident ranking, just the best single-run result. Not auto-detected
- * from core count yet; see LIMITATIONS.md. */
+/* Thread count for bulk_ingest.c's Phase 2 worker pool. 6 measured at
+ * 3490.9 passages/sec on a real 200K-row slice against native Postgres
+ * (see SPEED.md's three-phase-redesign section) -- not an exhaustive
+ * sweep of this specific pipeline, just the count carried over from
+ * earlier thread-count experiments on this 8 physical/logical-core
+ * machine. Not auto-detected from core count yet; see LIMITATIONS.md. */
 #define LEXIS_INGEST_THREADS 6
 #define LEXIS_TOP_K 5
 
@@ -81,66 +79,12 @@ static long elapsed_ms(struct timespec start, struct timespec end) {
 static void print_usage(const char *program_name) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s ingest <corpus_dir>                  Build/rebuild the index from a directory of documents\n"
             "  %s bulk-ingest <tsv_path>                Build/rebuild the index from a TSV of \"<id><TAB><text>\" rows\n"
             "  %s query \"<question>\"                   Ask a question against the current index\n"
             "  %s eval <queries_tsv> <qrels_tsv>        Score retrieval quality (MRR@10/Recall@K) against labeled queries\n"
             "\n"
             "Must be run from the project root.\n",
-            program_name, program_name, program_name, program_name);
-}
-
-static int run_ingest(const char *corpus_dir) {
-    StopwordSet *stopwords = stopword_set_load(LEXIS_STOPWORDS_PATH);
-    WordNetTable *wordnet = wordnet_table_load(LEXIS_WORDNET_DIR);
-    Lemmatizer *lemmatizer = lemmatizer_load(LEXIS_WORDNET_DIR);
-    if (stopwords == NULL || wordnet == NULL || lemmatizer == NULL) {
-        fprintf(stderr,
-                "lexis: failed to load stopwords/wordnet/lemmatizer -- "
-                "are you running this from the project root?\n");
-        stopword_set_free(stopwords);
-        wordnet_table_free(wordnet);
-        lemmatizer_free(lemmatizer);
-        return 1;
-    }
-
-    /* A quick connect-and-close up front: fails fast with one clear error
-     * message (and creates the schema as a side effect of pg_store_open)
-     * before spawning concurrent_ingest_corpus()'s worker threads, rather
-     * than having every worker independently discover the database is
-     * unreachable. */
-    PgStore *probe_store = pg_store_open(LEXIS_DB_CONNINFO);
-    if (probe_store == NULL) {
-        fprintf(stderr, "lexis: failed to open index at %s\n", LEXIS_DB_LABEL);
-        stopword_set_free(stopwords);
-        wordnet_table_free(wordnet);
-        lemmatizer_free(lemmatizer);
-        return 1;
-    }
-    pg_store_close(probe_store);
-
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    long passages =
-        concurrent_ingest_corpus(LEXIS_DB_CONNINFO, stopwords, wordnet, lemmatizer, corpus_dir,
-                                  LEXIS_CHUNK_SIZE, LEXIS_CHUNK_OVERLAP, LEXIS_INGEST_THREADS);
-    clock_gettime(CLOCK_MONOTONIC, &end);
-
-    int exit_code = 0;
-    if (passages < 0) {
-        fprintf(stderr, "lexis: failed to ingest %s\n", corpus_dir);
-        exit_code = 1;
-    } else {
-        long ms = elapsed_ms(start, end);
-        printf("Ingested %ld passages from %s into %s in %ldms (%d threads, %.1f passages/sec)\n",
-               passages, corpus_dir, LEXIS_DB_LABEL, ms, LEXIS_INGEST_THREADS,
-               ms > 0 ? (double)passages / ((double)ms / 1000.0) : 0.0);
-    }
-
-    stopword_set_free(stopwords);
-    wordnet_table_free(wordnet);
-    lemmatizer_free(lemmatizer);
-    return exit_code;
+            program_name, program_name, program_name);
 }
 
 static int run_bulk_ingest(const char *tsv_path) {
@@ -157,8 +101,11 @@ static int run_bulk_ingest(const char *tsv_path) {
         return 1;
     }
 
-    /* Same fail-fast probe as run_ingest() -- one clear error message
-     * before spawning bulk_ingest_tsv()'s worker threads. */
+    /* A quick connect-and-close up front: fails fast with one clear error
+     * message (and creates the schema as a side effect of pg_store_open)
+     * before spawning bulk_ingest_tsv()'s worker threads, rather than
+     * having every worker independently discover the database is
+     * unreachable. */
     PgStore *probe_store = pg_store_open(LEXIS_DB_CONNINFO);
     if (probe_store == NULL) {
         fprintf(stderr, "lexis: failed to open index at %s\n", LEXIS_DB_LABEL);
@@ -495,9 +442,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (strcmp(argv[1], "ingest") == 0) {
-        return run_ingest(argv[2]);
-    }
     if (strcmp(argv[1], "bulk-ingest") == 0) {
         return run_bulk_ingest(argv[2]);
     }

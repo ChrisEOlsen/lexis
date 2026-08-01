@@ -26,8 +26,9 @@
  * handed to the small model so it can decide which specific words are
  * worth adding to the actual BM25 query. `term` is the LEMMATIZED base
  * form (e.g. "call", not "called") -- not the raw surface form the user
- * typed -- so it matches the lemmatized terms ingest_document() now
- * stores in the index (see ingest.c). An owned copy. `candidates` is a
+ * typed -- so it matches the lemmatized terms bulk_ingest.c's Phase 2
+ * worker stores in the index (see ingest.c's ingest_lemmatize_terms()).
+ * An owned copy. `candidates` is a
  * borrowed pointer into `wordnet` (the long-lived table loaded once at
  * startup) -- never freed here. `candidates` is NULL if the lemma isn't
  * in WordNet at all; it's still a valid term to search for on its own,

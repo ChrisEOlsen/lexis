@@ -12,6 +12,14 @@ treat a stale entry here as a bug.
 migration and describe a SQLite-backed pipeline that no longer exists) --
 this file supersedes them until they're rewritten.
 
+There is exactly one ingestion pipeline (`bulk_ingest.c`'s three-phase
+design, see below) -- an earlier, separate directory-based pipeline
+(`concurrent_ingest.c`, plus the shared in-memory `term_cache.c` it
+depended on) was deleted outright once the three-phase pipeline proved
+both faster and simpler to reason about, rather than being kept around
+as a second, slower option. See SPEED.md for that pipeline's full
+performance history before it was replaced.
+
 ## What LEXIS is
 
 A retrieval-augmented pipeline that answers a question by: expanding it
@@ -32,7 +40,7 @@ don't show up.
 |------|------|------------|---------|
 | 5432 | Pre-existing `postgresql@14`, **not part of this project** | Not LEXIS's concern | Other, unrelated projects on this machine (e.g. `pt_website_builder_*`). Never touch this. |
 | 5433 | Docker `postgres:18` (`docker-compose.yml`) | `docker compose up -d` / `down` | The test suite exclusively (`make check`, `TEST_CONNINFO` in every `tests/core/test_*.c`, database `lexis_test`). Disposable -- `docker compose down -v` wipes it clean. |
-| 5434 | Native Homebrew `postgresql@18` | `make pg-start` / `make pg-stop` | The real CLI (`./lexis ingest`/`bulk-ingest`/`query`/`eval`, database `lexis`). Moved off Docker because Docker Desktop's macOS VM networking layer adds real per-round-trip latency a native install doesn't pay (see `SPEED.md`). Does not auto-start on login. |
+| 5434 | Native Homebrew `postgresql@18` | `make pg-start` / `make pg-stop` | The real CLI (`./lexis bulk-ingest`/`query`/`eval`, database `lexis`). Moved off Docker because Docker Desktop's macOS VM networking layer adds real per-round-trip latency a native install doesn't pay (see `SPEED.md`). Does not auto-start on login. |
 
 Neither 5433 nor 5434 auto-starts. Before running `make check`, `docker
 compose up -d` must be running. Before running `./lexis ...` for real,
@@ -47,10 +55,8 @@ compose up -d` must be running. Before running `./lexis ...` for real,
 | `wordnet.c` | Loads WordNet 3.0's real database files into an in-memory synonym/hypernym/hyponym lookup table. |
 | `lemmatizer.c` | Reduces a word to its base form (`"called"` -> `"call"`), WordNet-backed. Used at both index time and query time so the two sides match. |
 | `pg_store.c` | All Postgres I/O: schema (`passages`/`terms`/`postings`), passage/term/posting reads and writes, transaction control, and the bulk-ingest staging tables (see below). The only module that issues SQL. |
-| `term_cache.c` | Shared, thread-safe in-memory `term -> id` cache used by the directory-ingestion path (`concurrent_ingest.c`) to avoid a Postgres round trip for already-resolved terms. Not used by `bulk_ingest.c` -- see "Two ingestion paths." |
-| `ingest.c` | The core per-document pipeline: split into chunks, tokenize, stopword-filter, lemmatize, persist. Used by both ingestion paths below. |
-| `concurrent_ingest.c` | `lexis ingest <dir>` -- ingests every file in a directory across worker threads, each processing one whole document per transaction, coordinated through `term_cache.c`. |
-| `bulk_ingest.c` | `lexis bulk-ingest <tsv>` -- the three-phase, deferred-term-resolution pipeline for large TSV corpora (MS MARCO scale). See "Two ingestion paths" below. |
+| `ingest.c` | Document-chunking/tokenizing/lemmatizing primitives (split into overlapping word windows, tokenize, stopword-filter, lemmatize, dedup+count terms). Used exclusively by `bulk_ingest.c`'s Phase 2 worker -- see "Ingestion" below. |
+| `bulk_ingest.c` | `lexis bulk-ingest <tsv>` -- the three-phase, deferred-term-resolution ingestion pipeline. The only ingestion path in this codebase. |
 | `bm25.c` | BM25 scoring: corpus stats, per-term document frequency/IDF, the result-set hash index, `bm25_search()`. |
 | `query_formulation.c` | Turns a question into search terms: tokenize, stopword-filter, lemmatize, look up WordNet candidates, ask the local LLM which candidates to include. |
 | `generation.c` | Builds the "answer using only this context" prompt from BM25 results and asks the local LLM for a final answer. |
@@ -58,7 +64,14 @@ compose up -d` must be running. Before running `./lexis ...` for real,
 | `eval.c` | `lexis eval <queries_tsv> <qrels_tsv>` -- runs the real query-formulation + BM25 path against a labeled query set and reports MRR@10/Recall@10/Recall@100. |
 | `query_log.c` | Optional pipeline observability (testing mode only) -- records every stage's inputs/outputs/timing to its own tables, keyed by `query_id`. |
 | `config.c` | Reads `config/lexis.conf`'s `mode = testing|production` setting. |
-| `main.c` | CLI dispatch (`ingest`/`bulk-ingest`/`query`/`eval`) and orchestration of the above. |
+| `main.c` | CLI dispatch (`bulk-ingest`/`query`/`eval`) and orchestration of the above. |
+
+`pg_store_get_or_create_term()`/`pg_store_get_or_create_terms()` (single
+and batch term resolution against the real `terms` table) remain in
+`pg_store.c` as tested, general-purpose API surface, but currently have
+no production caller -- `bulk_ingest.c`'s Phase 2/3 resolve terms through
+a different, staging-table-based path instead (see "Ingestion" below).
+See `LIMITATIONS.md`.
 
 ## Database schema
 
@@ -68,7 +81,7 @@ to run repeatedly):
 ```sql
 CREATE TABLE passages (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    document_name TEXT NOT NULL,   -- source filename, or a TSV row's own id (e.g. an MS MARCO pid)
+    document_name TEXT NOT NULL,   -- a TSV row's own id (e.g. an MS MARCO pid)
     chunk_id INTEGER NOT NULL,
     text TEXT NOT NULL,
     token_count INTEGER NOT NULL
@@ -112,37 +125,13 @@ CREATE UNLOGGED TABLE postings_staged (
 );
 ```
 
-## Two ingestion paths
+## Ingestion (`lexis bulk-ingest <tsv>`, `bulk_ingest.c`)
 
-Both end up calling the same core per-document logic in `ingest.c`
-(`ingest_split_words` -> `ingest_chunk_words` -> `tokenize` ->
-`stopwords_filter` -> `ingest_lemmatize_terms` -> `ingest_count_distinct_terms`),
-but they resolve terms differently, and that difference is the whole
-story of this project's ingestion-performance work (`SPEED.md`).
-
-### `lexis ingest <dir>` -- directory ingestion (`concurrent_ingest.c`)
-
-One worker thread per file (work-stealing over a shared file list), each
-worker on its own Postgres connection, each document in its own
-transaction. Terms are resolved live, per document, through the shared
-`TermCache` -- a mutex-guarded hash map that turns "some other thread
-already resolved this term" into an in-process lookup instead of a
-Postgres round trip. A deadlock on Postgres's `terms.term` unique index
-(the only thing that ever contends under concurrency) is retried up to 3
-times per document before that document is logged and skipped.
-
-Meant for smaller, directory-of-files corpora (the intended long-term
-production ingestion path once documents arrive incrementally, not just
-a one-time bulk load).
-
-### `lexis bulk-ingest <tsv>` -- three-phase deferred-term-resolution (`bulk_ingest.c`)
-
-Built specifically for MS MARCO-scale (8.84M row) one-shot loads, where
-`concurrent_ingest.c`'s per-document term resolution -- even cached --
-still contends on `terms.term`'s unique index badly enough to cap
-achievable thread count. This pipeline restructures the work into three
-phases so worker threads never touch the `terms` table at all until
-every one of them is done:
+A three-phase, deferred-term-resolution pipeline, built so worker
+threads never touch the `terms` table -- the sole source of every
+deadlock ever measured in this project (Postgres's `ON CONFLICT`
+speculative insertion racing on `terms.term`'s unique index, see
+`SPEED.md`) -- until every worker is done:
 
 1. **Phase 1 -- raw append** (`pg_store_copy_documents_raw`). One
    `COPY ... FROM STDIN` streams the entire input file into
@@ -157,16 +146,19 @@ every one of them is done:
 
 2. **Phase 2 -- parallel, contention-free processing.** Worker threads
    claim independent `row_num` ranges out of `documents_raw` (plain
-   `SELECT` range queries -- nothing to lock), run the same
-   tokenize/stopword-filter/lemmatize pipeline as the directory path,
-   insert real rows into `passages`, and stage each passage's postings
-   by raw term *text* (not a resolved `terms.id`) into
-   `postings_staged`. Because this phase never touches `terms`, batching
-   many documents into one transaction is safe here (`BULK_PHASE2_BATCH_SIZE`
-   = 500 docs/transaction) -- unlike an earlier, fully reverted attempt
-   to batch the *old* per-document pipeline this way, which caused
-   severe lock contention because that pipeline's transactions did touch
-   `terms` (see `SPEED.md`).
+   `SELECT` range queries -- nothing to lock), run `ingest.c`'s
+   tokenize/stopword-filter/lemmatize pipeline
+   (`ingest_split_words` -> `ingest_chunk_words` -> `tokenize` ->
+   `stopwords_filter` -> `ingest_lemmatize_terms` ->
+   `ingest_count_distinct_terms`), insert real rows into `passages`,
+   and stage each passage's postings by raw term *text* (not a resolved
+   `terms.id`) into `postings_staged`. Because this phase never touches
+   `terms`, batching many documents into one transaction is safe here
+   (`BULK_PHASE2_BATCH_SIZE` = 500 docs/transaction) -- batching a
+   transaction that *did* touch `terms` was tried once, on the earlier
+   (now-deleted) per-document pipeline, and caused severe lock
+   contention; see `SPEED.md` for why that failure mode is structurally
+   absent here.
 
 3. **Phase 3 -- finalize** (`pg_store_finalize_terms_and_postings`). Once
    every Phase 2 worker has joined, one single-threaded, single-writer
@@ -176,16 +168,13 @@ every one of them is done:
    against `terms` on text. `work_mem` is raised to 1GB for this
    connection only. The staging tables are dropped once this succeeds.
 
-`term_cache.c` is not used anywhere in this path -- Phase 2 has nothing
-for it to coordinate.
-
-**Failure handling differs meaningfully from the directory path**: because
-Phase 1 is one atomic `COPY`, a single malformed row (wrong column count,
-bad CSV) fails the *entire* load, not just that row -- there's no
-per-row skip for a bulk loader whose whole point is trusting the source
-file's format. Phase 2 batch failures, by contrast, are tolerant: a
-batch that exhausts its retries is logged and skipped (costing at most
-that batch's ~500 documents), not fatal to the run.
+**Failure handling**: because Phase 1 is one atomic `COPY`, a single
+malformed row (wrong column count, bad CSV) fails the *entire* load, not
+just that row -- there's no per-row skip for a bulk loader whose whole
+point is trusting the source file's format. Phase 2 batch failures, by
+contrast, are tolerant: a batch that exhausts its retries is logged and
+skipped (costing at most that batch's ~500 documents), not fatal to the
+run.
 
 **Real measured throughput** (200K-row slice, native Postgres, 6
 threads): **3490.9 passages/sec**, verified correct (exact passage/term/
@@ -252,7 +241,7 @@ COPY (SELECT _id, text FROM 'hf://datasets/BeIR/msmarco/corpus/*.parquet')
 TO 'corpus_csv.tsv' (FORMAT CSV, DELIMITER '\t', HEADER false);
 ```
 
-Plain (non-CSV) TSV is not safe here -- see "Two ingestion paths" above.
+Plain (non-CSV) TSV is not safe here -- see "Ingestion" above.
 
 **Ingest:**
 
@@ -285,12 +274,9 @@ first: `TRUNCATE postings, terms, passages RESTART IDENTITY CASCADE;`
 ## Known gaps
 
 - **Corpus export isn't scripted.** The duckdb `FORMAT CSV` export shown
-  above was run ad hoc this session and isn't captured anywhere in
-  `scripts/` -- `scripts/download_msmarco.py` is currently just a
-  docstring stub. Re-deriving `corpus_csv.tsv` from scratch today means
-  re-typing that duckdb command by hand.
-- **`data/index/lexis.db`** is a leftover SQLite file from before the
-  Postgres migration. Nothing reads it anymore; it's dead weight.
+  above was run ad hoc and isn't captured anywhere in `scripts/`.
+  Re-deriving `corpus_csv.tsv` from scratch today means re-typing that
+  duckdb command by hand.
 - **`README.md`/`INGESTION.md`** describe the pre-Postgres, SQLite-backed
   system and are stale (see this file's intro).
 - Everything else known-and-accepted (thread-count uncertainty, WordNet

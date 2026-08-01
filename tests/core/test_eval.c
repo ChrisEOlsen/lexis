@@ -10,7 +10,7 @@
  */
 
 #include "eval.h"
-#include "ingest.h"
+#include "bulk_ingest.h"
 #include "pg_store.h"
 #include "stopwords.h"
 #include "wordnet.h"
@@ -26,11 +26,30 @@
 #define WORDNET_DIR "data/wordnet"
 #define TEST_QUERIES_PATH "build/test_eval_queries.tsv"
 #define TEST_QRELS_PATH "build/test_eval_qrels.tsv"
+#define TEST_SEED_TSV_PATH "build/test_eval_seed.tsv"
 
 static void write_file(const char *path, const char *contents) {
     FILE *fp = fopen(path, "wb");
     fwrite(contents, 1, strlen(contents), fp);
     fclose(fp);
+}
+
+/* Seeds one document into the index via the real ingestion pipeline
+ * (bulk_ingest_tsv(), single-threaded) instead of any lower-level
+ * document-ingestion primitive -- bulk_ingest.c's three-phase pipeline
+ * is the only ingestion path this codebase has, so eval's own test
+ * fixtures go through the same path real corpora do. `pid`/`text` must
+ * not themselves contain a literal tab, double-quote, or newline (none
+ * of this file's fixtures do) -- see pg_store.c's pg_store_copy_
+ * documents_raw() for why those specifically would need CSV quoting. */
+static long seed_document(const StopwordSet *stopwords, const WordNetTable *wordnet,
+                           const Lemmatizer *lemmatizer, const char *pid, const char *text,
+                           size_t chunk_size, size_t overlap) {
+    char line[4096];
+    snprintf(line, sizeof(line), "%s\t%s\n", pid, text);
+    write_file(TEST_SEED_TSV_PATH, line);
+    return bulk_ingest_tsv(TEST_CONNINFO, stopwords, wordnet, lemmatizer, TEST_SEED_TSV_PATH, chunk_size,
+                            overlap, 1);
 }
 
 static PgStore *open_fresh_store(void) {
@@ -65,8 +84,7 @@ int main(void) {
         PgStore *store = open_fresh_store();
         TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is docker compose up?");
 
-        long passages = ingest_document_from_text(store, stopwords, wordnet, lemmatizer, MULTI_CHUNK_TEXT,
-                                                    "multi_chunk_doc", 10, 0, NULL);
+        long passages = seed_document(stopwords, wordnet, lemmatizer, "multi_chunk_doc", MULTI_CHUNK_TEXT, 10, 0);
         TEST_ASSERT(passages > 1, "expected the fixture text to split into multiple chunks, got %ld",
                     passages);
 
@@ -97,9 +115,8 @@ int main(void) {
         PgStore *store = open_fresh_store();
         TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
-        long passages = ingest_document_from_text(store, stopwords, wordnet, lemmatizer,
-                                                    "cardiac arrest response plan", "unrelated_doc", 100, 0,
-                                                    NULL);
+        long passages = seed_document(stopwords, wordnet, lemmatizer, "unrelated_doc",
+                                       "cardiac arrest response plan", 100, 0);
         TEST_ASSERT(passages == 1, "expected setup ingest to succeed");
 
         write_file(TEST_QUERIES_PATH, "q1\tcardiac arrest\n");
@@ -172,6 +189,7 @@ int main(void) {
 
     remove(TEST_QUERIES_PATH);
     remove(TEST_QRELS_PATH);
+    remove(TEST_SEED_TSV_PATH);
     stopword_set_free(stopwords);
     wordnet_table_free(wordnet);
     lemmatizer_free(lemmatizer);

@@ -1,7 +1,0 @@
-# Python sidecar dependencies (spec section 6).
-# sentence-transformers for the optional cross-encoder reranker (Stage 9).
-#
-# spaCy (POS tagging) is NOT currently a dependency -- deferred, see
-# LIMITATIONS.md. NLTK/WordNet is not needed at all: synonym expansion is
-# implemented natively in C (src/core/wordnet.c) against the real WordNet
-# 3.0 database files, not via Python.

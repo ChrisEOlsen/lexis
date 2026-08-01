@@ -133,11 +133,10 @@ int64_t pg_store_get_or_create_term(PgStore *store, const char *term) {
      * "ON CONFLICT (term) DO UPDATE SET term = EXCLUDED.term RETURNING id"
      * specifically so RETURNING would yield a row on conflict too -- but
      * DO UPDATE takes a row lock even for that no-op self-assignment, and
-     * under real concurrent writers racing on overlapping term sets
-     * (concurrent_ingest.c, verified via concurrent_ingest_corpus() on a
-     * 3000-document corpus at 4+ threads) that caused genuine Postgres
-     * deadlocks -- "deadlock detected ... while inserting index tuple ...
-     * in relation terms" -- silently dropping whole documents. DO NOTHING
+     * under real concurrent writers racing on overlapping term sets that
+     * caused genuine Postgres deadlocks -- "deadlock detected ... while
+     * inserting index tuple ... in relation terms" -- silently dropping
+     * whole documents (verified directly, see SPEED.md). DO NOTHING
      * skips the row lock entirely, at the cost of one extra round trip
      * below to fetch the id when we lost the race. */
     const char *params[1] = {term};
@@ -260,7 +259,7 @@ static char *build_int_array_literal(const int *items, size_t count) {
  * `res` (columns: id, term) -- shared by every phase of
  * pg_store_get_or_create_terms() below. O(rows * count), fine at
  * chunk scale (a few dozen terms), same tradeoff already made for
- * ingest_index_chunk_terms()'s dedup loop. */
+ * ingest.c's ingest_count_distinct_terms()'s dedup loop. */
 static void fill_ids_from_result(PGresult *res, const char *const *terms, size_t count, int64_t *ids) {
     int rows = PQntuples(res);
     for (int r = 0; r < rows; r++) {

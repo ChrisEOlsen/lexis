@@ -11,15 +11,13 @@ See `LEXIS_Project_Specification.docx` for the full project specification.
 - `src/core/` — C retrieval/indexing core: tokenizer, stopword filter,
   Postgres-backed inverted index, BM25 scorer, ingestion pipeline, a
   llama.cpp-backed local LLM client, WordNet synonym/hypernym/hyponym lookup
-- `src/sidecar/` — Python sidecar, currently scoped to just the optional
-  cross-encoder reranker (Stage 9). POS tagging is deferred and synonym
-  expansion is implemented natively in C — see LIMITATIONS.md
 - `include/` — public headers for the C core
 - `config/` — pipeline configuration templates
 - `data/` — corpus, WordNet 3.0 database files (committed, real data),
   stopword lists, generated index
-- `scripts/` — benchmarking and baseline comparison scripts
-- `tests/` — C and Python test suites
+- `scripts/` — one-time setup scripts (e.g. `download_model.sh`, fetching
+  the local GGUF model)
+- `tests/` — the C test suite (`tests/core/`)
 
 ## Build
 

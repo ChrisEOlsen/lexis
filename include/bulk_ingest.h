@@ -56,13 +56,12 @@
  * built to depend on it). A Phase 2 batch (many documents sharing one
  * transaction, see bulk_ingest.c) that fails is retried a few times as a
  * fresh transaction before being logged and skipped -- costing at most
- * that batch's documents, not the whole run, matching
- * concurrent_ingest.c's established per-document-failure tolerance.
+ * that batch's documents, not the whole run (see phase2_worker_run()'s
+ * own comment for why this doesn't abort the rest of the pipeline).
  * Returns the total number of passages ingested (>= 0) on success, or -1
  * if the file can't be COPYed in, any worker's connection fails to open
- * (matching bulk_worker_run()'s prior convention -- a full run needs
- * every requested thread actually working), or Phase 3's finalize
- * fails. */
+ * (a full run needs every requested thread actually working), or
+ * Phase 3's finalize fails. */
 long bulk_ingest_tsv(const char *conninfo, const StopwordSet *stopwords,
                       const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
                       const char *tsv_path, size_t chunk_size, size_t overlap,

@@ -80,10 +80,10 @@ static int phase2_claim_batch(Phase2Worker *w, int64_t *start, int64_t *end) {
 
 /* Stages one already-tokenized/stopword-filtered/lemmatized chunk's
  * distinct terms (see ingest_count_distinct_terms()) into postings_staged
- * against `passage_id` -- the Phase 2 counterpart to ingest.c's
- * ingest_index_chunk_terms(), except it writes raw term text instead of
- * resolving a terms.id, since Phase 2 never touches the terms table.
- * Returns 0 on success, -1 on a database or allocation error. */
+ * against `passage_id` -- writes raw term text rather than resolving a
+ * terms.id, since Phase 2 never touches the terms table at all (that's
+ * Phase 3's job, see pg_store_finalize_terms_and_postings()). Returns 0
+ * on success, -1 on a database or allocation error. */
 static int phase2_stage_chunk_terms(PgStore *store, const TokenList *terms, int64_t passage_id) {
     if (terms->count == 0) {
         return 0;
@@ -104,11 +104,10 @@ static int phase2_stage_chunk_terms(PgStore *store, const TokenList *terms, int6
 }
 
 /* The real per-document work for one documents_raw row: chunk, tokenize,
- * lemmatize, insert the passage, stage its postings. Mirrors
- * ingest.c's ingest_document_body(), but staging term text instead of
- * resolving term ids (no TermCache involved at all -- Phase 2 has
- * nothing for it to coordinate). Returns the number of passages ingested
- * (>= 0) on success, or -1 on failure. */
+ * lemmatize, insert the passage, stage its postings -- built on ingest.c's
+ * chunking/lemmatizing primitives, but staging term text directly instead
+ * of resolving term ids against Postgres. Returns the number of passages
+ * ingested (>= 0) on success, or -1 on failure. */
 static long phase2_process_document(PgStore *store, const StopwordSet *stopwords,
                                      const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
                                      const char *text, const char *pid, size_t chunk_size, size_t overlap) {
@@ -208,8 +207,9 @@ static long phase2_process_batch(PgStore *store, const StopwordSet *stopwords, c
 static void *phase2_worker_run(void *arg) {
     Phase2Worker *w = (Phase2Worker *)arg;
 
-    /* Each worker owns its own connection, same reasoning as
-     * concurrent_worker_run() in concurrent_ingest.c. */
+    /* Each worker owns its own connection -- a single PGconn isn't safe
+     * for concurrent use from multiple threads, and nothing stops N
+     * separate connections from all writing to the same tables at once. */
     PgStore *store = pg_store_open(w->conninfo);
     if (store == NULL) {
         fprintf(stderr, "phase2_worker_run: failed to open a connection\n");

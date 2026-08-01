@@ -90,7 +90,8 @@ QueryFormulationCandidates *query_formulation_gather_candidates(
         /* Lemmatize before lookup ("called" -> "call") so candidates
          * come from the right WordNet entry, and before storing `term`
          * itself so the eventual BM25 search term matches what
-         * ingest_document() now stores in the index (also lemmatized). */
+         * bulk_ingest.c's Phase 2 worker stores in the index (also
+         * lemmatized). */
         char *lemma = lemmatize(lemmatizer, wordnet, terms->terms[i]);
         if (lemma == NULL) {
             query_formulation_candidates_free(result);

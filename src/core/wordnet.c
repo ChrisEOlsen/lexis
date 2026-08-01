@@ -586,7 +586,7 @@ static WordNetLookupResult *wordnet_table_find_or_create(WordNetTable *table, co
 
 /* Appends `word` to `list` only if it isn't already present -- a linear
  * scan, same tradeoff as bm25_result_set_add's and
- * ingest_index_chunk_terms's dedup checks: candidate lists here are a
+ * ingest_count_distinct_terms's dedup checks: candidate lists here are a
  * handful of words at most, so O(n) per add is negligible. Returns 0 on
  * success (whether or not it was already present), -1 on allocation
  * failure. */

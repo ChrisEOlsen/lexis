@@ -17,7 +17,8 @@
  * id either way -- deliberately not `DO UPDATE ... RETURNING id` (which
  * would avoid the extra round trip), since DO UPDATE takes a row lock even
  * for a no-op self-assignment, and that caused real Postgres deadlocks
- * under genuine concurrent writers (see concurrent_ingest.c). */
+ * under genuine concurrent writers (see pg_store_get_or_create_term()'s
+ * own doc comment below, and SPEED.md, for the full story). */
 
 #ifndef LEXIS_PG_STORE_H
 #define LEXIS_PG_STORE_H

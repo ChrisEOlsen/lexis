@@ -1,6 +1,9 @@
 /*
- * Tests for src/core/ingest.c — reading a document's full contents into
- * memory as the first step of the ingestion pipeline.
+ * Tests for src/core/ingest.c — reading, splitting, chunking, and
+ * lemmatizing a document's text, the primitives bulk_ingest.c's Phase 2
+ * worker builds on. No database or WordNet-backed lemmatizer tests here
+ * (ingest_lemmatize_terms/ingest_count_distinct_terms are exercised
+ * indirectly via test_bulk_ingest.c's real end-to-end tests instead).
  */
 
 #include "ingest.h"
@@ -9,30 +12,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #define TEST_FILE_PATH "build/test_ingest_file.txt"
-#define TEST_CONNINFO "host=127.0.0.1 port=5433 dbname=lexis_test user=lexis password=lexis_dev_only"
-#define STOPWORD_FILE "data/stopwords/english.txt"
-#define WORDNET_DIR "data/wordnet"
-#define TEST_CORPUS_DIR "build/test_corpus"
-
-static PgStore *open_fresh_store(void) {
-    PgStore *store = pg_store_open(TEST_CONNINFO);
-    if (store == NULL) {
-        return NULL;
-    }
-    PGresult *res = PQexec(store->conn, "TRUNCATE postings, terms, passages RESTART IDENTITY CASCADE;");
-    PQclear(res);
-    return store;
-}
-
-static void write_file_at(const char *path, const char *contents) {
-    FILE *fp = fopen(path, "wb");
-    fwrite(contents, 1, strlen(contents), fp);
-    fclose(fp);
-}
 
 static void write_test_file(const char *contents) {
     FILE *fp = fopen(TEST_FILE_PATH, "wb");
@@ -224,204 +205,6 @@ static void test_chunk_words_rejects_invalid_params(void) {
     token_list_free(words);
 }
 
-static void test_ingest_document_end_to_end(void) {
-    write_test_file("The hypertension treatment options are effective.");
-
-    PgStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
-
-    StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
-    TEST_ASSERT(stopwords != NULL, "expected stopword_set_load to succeed");
-    WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
-    TEST_ASSERT(wordnet != NULL, "expected wordnet_table_load to succeed");
-    Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
-    TEST_ASSERT(lemmatizer != NULL, "expected lemmatizer_load to succeed");
-
-    /* chunk_size large enough that the whole (short) document is exactly
-     * one chunk -- isolates this test to ingest_document's own wiring
-     * rather than re-testing windowing, which already has its own tests. */
-    long passages = ingest_document(store, stopwords, wordnet, lemmatizer,
-                                     TEST_FILE_PATH, "doc1.txt", 100, 0, NULL);
-    TEST_ASSERT(passages == 1, "expected exactly 1 passage ingested, got %ld", passages);
-
-    PGresult *res = PQexec(store->conn, "SELECT document_name, text, token_count FROM passages;");
-    TEST_ASSERT(PQresultStatus(res) == PGRES_TUPLES_OK, "expected verification query to succeed");
-    TEST_ASSERT(PQntuples(res) == 1, "expected a passage row to exist");
-    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 0), "doc1.txt");
-    /* Passage text is the raw chunk -- original casing/punctuation intact,
-     * NOT the lowercased/stripped tokenizer output. */
-    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 1), "The hypertension treatment options are effective.");
-    /* "The" and "are" are stopwords -- token_count reflects the 4 terms
-     * that survive tokenize() + stopwords_filter(), not the 6 raw words. */
-    TEST_ASSERT(atoi(PQgetvalue(res, 0, 2)) == 4,
-                "expected token_count 4 after stopword filtering, got %s", PQgetvalue(res, 0, 2));
-    PQclear(res);
-
-    int64_t the_id = pg_store_lookup_term(store, "the");
-    int64_t are_id = pg_store_lookup_term(store, "are");
-    TEST_ASSERT(the_id == -1, "expected \"the\" to be filtered out as a stopword");
-    TEST_ASSERT(are_id == -1, "expected \"are\" to be filtered out as a stopword");
-
-    int64_t hypertension_id = pg_store_lookup_term(store, "hypertension");
-    TEST_ASSERT(hypertension_id != -1, "expected \"hypertension\" to have been indexed");
-
-    char hypertension_id_str[32];
-    snprintf(hypertension_id_str, sizeof(hypertension_id_str), "%lld", (long long)hypertension_id);
-    const char *freq_params[1] = {hypertension_id_str};
-    res = PQexecParams(store->conn, "SELECT term_frequency FROM postings WHERE term_id = $1;", 1, NULL,
-                        freq_params, NULL, NULL, 0);
-    TEST_ASSERT(PQresultStatus(res) == PGRES_TUPLES_OK, "expected frequency query to succeed");
-    TEST_ASSERT(PQntuples(res) == 1, "expected a posting row for \"hypertension\"");
-    TEST_ASSERT(atoi(PQgetvalue(res, 0, 0)) == 1, "expected term_frequency 1, got %s",
-                PQgetvalue(res, 0, 0));
-    PQclear(res);
-
-    stopword_set_free(stopwords);
-    wordnet_table_free(wordnet);
-    lemmatizer_free(lemmatizer);
-    pg_store_close(store);
-}
-
-static void test_ingest_document_counts_repeated_terms(void) {
-    write_test_file("treatment treatment treatment");
-
-    PgStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
-
-    StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
-    TEST_ASSERT(stopwords != NULL, "expected stopword_set_load to succeed");
-    WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
-    TEST_ASSERT(wordnet != NULL, "expected wordnet_table_load to succeed");
-    Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
-    TEST_ASSERT(lemmatizer != NULL, "expected lemmatizer_load to succeed");
-
-    long passages = ingest_document(store, stopwords, wordnet, lemmatizer,
-                                     TEST_FILE_PATH, "doc1.txt", 100, 0, NULL);
-    TEST_ASSERT(passages == 1, "expected exactly 1 passage ingested, got %ld", passages);
-
-    int64_t term_id = pg_store_lookup_term(store, "treatment");
-    TEST_ASSERT(term_id != -1, "expected \"treatment\" to have been indexed");
-
-    /* A repeated term within one chunk must collapse into exactly ONE
-     * posting row with the correct total frequency -- not three separate
-     * rows (which the postings table's composite primary key would
-     * reject as a duplicate insert anyway, but the count should never
-     * have been attempted 3 times to begin with). */
-    /* Just SELECT the rows themselves and check the count via PQntuples()
-     * -- SELECT COUNT(*), term_frequency in one query (no GROUP BY) is
-     * SQLite-only leniency (it returns an arbitrary row's value for the
-     * non-aggregated column); Postgres correctly rejects it as invalid
-     * standard SQL. */
-    char term_id_str[32];
-    snprintf(term_id_str, sizeof(term_id_str), "%lld", (long long)term_id);
-    const char *params[1] = {term_id_str};
-    PGresult *res = PQexecParams(store->conn, "SELECT term_frequency FROM postings WHERE term_id = $1;",
-                                  1, NULL, params, NULL, NULL, 0);
-    TEST_ASSERT(PQresultStatus(res) == PGRES_TUPLES_OK, "expected verification query to succeed");
-    TEST_ASSERT(PQntuples(res) == 1,
-                "expected exactly 1 posting row for a repeated term, got %d", PQntuples(res));
-    TEST_ASSERT(atoi(PQgetvalue(res, 0, 0)) == 3, "expected term_frequency 3, got %s",
-                PQgetvalue(res, 0, 0));
-    PQclear(res);
-
-    stopword_set_free(stopwords);
-    wordnet_table_free(wordnet);
-    lemmatizer_free(lemmatizer);
-    pg_store_close(store);
-}
-
-static void reset_test_corpus_dir(void) {
-    /* Best-effort cleanup of a previous run -- ignore errors, since these
-     * paths may not exist yet on the first run. */
-    remove(TEST_CORPUS_DIR "/doc1.txt");
-    remove(TEST_CORPUS_DIR "/doc2.txt");
-    remove(TEST_CORPUS_DIR "/subdir/nested.txt");
-    rmdir(TEST_CORPUS_DIR "/subdir");
-    rmdir(TEST_CORPUS_DIR);
-
-    mkdir(TEST_CORPUS_DIR, 0755);
-}
-
-static void test_ingest_corpus_ingests_every_top_level_file(void) {
-    reset_test_corpus_dir();
-    write_file_at(TEST_CORPUS_DIR "/doc1.txt", "hypertension treatment options");
-    write_file_at(TEST_CORPUS_DIR "/doc2.txt", "cardiac arrest response plan");
-
-    PgStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
-
-    StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
-    TEST_ASSERT(stopwords != NULL, "expected stopword_set_load to succeed");
-    WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
-    TEST_ASSERT(wordnet != NULL, "expected wordnet_table_load to succeed");
-    Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
-    TEST_ASSERT(lemmatizer != NULL, "expected lemmatizer_load to succeed");
-
-    long total = ingest_corpus(store, stopwords, wordnet, lemmatizer, TEST_CORPUS_DIR, 100, 0);
-    TEST_ASSERT(total == 2, "expected 2 total passages (1 per file), got %ld", total);
-
-    /* Each passage's document_name should be the bare filename, not the
-     * full directory-joined path. */
-    PGresult *res =
-        PQexec(store->conn, "SELECT COUNT(*) FROM passages WHERE document_name = 'doc1.txt';");
-    TEST_ASSERT(PQresultStatus(res) == PGRES_TUPLES_OK, "expected verification query to succeed");
-    TEST_ASSERT(atoi(PQgetvalue(res, 0, 0)) == 1,
-                "expected exactly 1 passage tagged \"doc1.txt\", got %s", PQgetvalue(res, 0, 0));
-    PQclear(res);
-
-    stopword_set_free(stopwords);
-    wordnet_table_free(wordnet);
-    lemmatizer_free(lemmatizer);
-    pg_store_close(store);
-}
-
-static void test_ingest_corpus_skips_subdirectories(void) {
-    reset_test_corpus_dir();
-    write_file_at(TEST_CORPUS_DIR "/doc1.txt", "hypertension treatment");
-    mkdir(TEST_CORPUS_DIR "/subdir", 0755);
-    write_file_at(TEST_CORPUS_DIR "/subdir/nested.txt", "should not be ingested");
-
-    PgStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
-
-    StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
-    TEST_ASSERT(stopwords != NULL, "expected stopword_set_load to succeed");
-    WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
-    TEST_ASSERT(wordnet != NULL, "expected wordnet_table_load to succeed");
-    Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
-    TEST_ASSERT(lemmatizer != NULL, "expected lemmatizer_load to succeed");
-
-    /* Non-recursive: only doc1.txt should be ingested, "subdir" itself
-     * (and anything inside it) skipped entirely. */
-    long total = ingest_corpus(store, stopwords, wordnet, lemmatizer, TEST_CORPUS_DIR, 100, 0);
-    TEST_ASSERT(total == 1, "expected only the top-level file to be ingested, got %ld", total);
-
-    stopword_set_free(stopwords);
-    wordnet_table_free(wordnet);
-    lemmatizer_free(lemmatizer);
-    pg_store_close(store);
-}
-
-static void test_ingest_corpus_missing_directory_returns_negative_one(void) {
-    PgStore *store = open_fresh_store();
-    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
-
-    StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
-    TEST_ASSERT(stopwords != NULL, "expected stopword_set_load to succeed");
-    WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
-    TEST_ASSERT(wordnet != NULL, "expected wordnet_table_load to succeed");
-    Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
-    TEST_ASSERT(lemmatizer != NULL, "expected lemmatizer_load to succeed");
-
-    long total = ingest_corpus(store, stopwords, wordnet, lemmatizer, "build/does_not_exist_dir", 100, 0);
-    TEST_ASSERT(total == -1, "expected -1 for a missing directory, got %ld", total);
-
-    stopword_set_free(stopwords);
-    wordnet_table_free(wordnet);
-    lemmatizer_free(lemmatizer);
-    pg_store_close(store);
-}
-
 int main(void) {
     test_read_file_returns_exact_contents();
     test_read_file_handles_empty_file();
@@ -439,16 +222,6 @@ int main(void) {
     test_chunk_words_short_document_single_chunk();
     test_chunk_words_empty_input_returns_empty_list();
     test_chunk_words_rejects_invalid_params();
-    test_ingest_document_end_to_end();
-    test_ingest_document_counts_repeated_terms();
-    test_ingest_corpus_ingests_every_top_level_file();
-    test_ingest_corpus_skips_subdirectories();
-    test_ingest_corpus_missing_directory_returns_negative_one();
     remove(TEST_FILE_PATH);
-    remove(TEST_CORPUS_DIR "/doc1.txt");
-    remove(TEST_CORPUS_DIR "/doc2.txt");
-    remove(TEST_CORPUS_DIR "/subdir/nested.txt");
-    rmdir(TEST_CORPUS_DIR "/subdir");
-    rmdir(TEST_CORPUS_DIR);
     return test_summary();
 }
