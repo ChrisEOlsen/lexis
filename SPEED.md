@@ -324,8 +324,103 @@ SELECT DISTINCT ... ON CONFLICT DO NOTHING` into `terms`, then an
 `INSERT ... SELECT` joining `postings_staged` (5,052,759 rows at this
 scale) against `terms` -- is over 6x slower than the six-thread parallel
 phase that produced its input. Any further optimization effort belongs
-here, not in Phase 2, which was already fast. Not yet run at full
-8.84M-row scale -- see "Next optimizations" below.
+here, not in Phase 2, which was already fast.
+
+### Schema-only experiment: `UNLOGGED` + deferred `postings` PK
+
+Zero C code changes -- tests whether Phase 3's cost is dominated by live
+index maintenance and WAL generation, or by the join/resolve work itself.
+Before the run: `ALTER TABLE postings DROP CONSTRAINT postings_pkey;`,
+then `ALTER TABLE terms SET UNLOGGED; ALTER TABLE postings SET
+UNLOGGED;` (`passages` could not be included -- see below). After the
+run: `ALTER TABLE postings ADD PRIMARY KEY (term_id, passage_id);`, then
+`SET LOGGED` on both. Real numbers, same 200K-row benchmark, both
+reaching the identical durable/constrained end state:
+
+| | Baseline | Experiment |
+|---|---|---|
+| Phase 1 | 451ms | 576ms |
+| Phase 2 | 7,481ms | 7,806ms |
+| Phase 3 | **30,373ms** | 49,172ms |
+| `ADD PRIMARY KEY` (postings, 5,052,759 rows) | -- | 2,498ms |
+| `SET LOGGED` (terms) | -- | 732ms |
+| `SET LOGGED` (postings) | -- | 7,958ms |
+| **Total** | **49,515ms** | **57,576ms** |
+
+**Net: 57,576ms -> 49,515ms, a real but modest 14% reduction (~1.16x) --
+not the ~38% Phase 3 alone looked like in isolation.** `SET LOGGED` on
+`postings` alone cost 7,958ms, clawing back nearly half of Phase 3's raw
+improvement -- confirming directly (not just suspected) that `SET
+LOGGED` is not free: it's the same WAL-generation work as normal
+inserts, paid in one lump sum at the end instead of spread across the
+run, not eliminated. Correctness verified identical to every prior run
+(200,009 / 214,010 / 5,052,759 passages/terms/postings, zero duplicate
+postings even after the PK was added back retroactively).
+
+`passages` could not be made `UNLOGGED` in this experiment -- Postgres
+refuses to change a table's persistence while a still-`LOGGED` table
+holds a foreign key referencing it, and `query_log.c`'s `search_results`
+table (unrelated to bulk ingestion, only populated in testing mode)
+references `passages`. Not a real blocker (`passages` isn't written by
+Phase 3, the actual target, and Phase 2 was already fast), but worth
+noting as a real dependency, not an oversight, if this is ever made
+permanent.
+
+**Verdict**: real, free win, worth keeping -- but on its own, nowhere
+near enough to reach a 12-18 minute full-corpus target. The dominant
+remaining cost is Phase 3's join/resolve work itself, which this
+experiment deliberately did not touch (Phase 3's SQL and thread count
+were left exactly as they were, per the point of isolating this one
+variable). See the next section for what actually dominates that
+remaining cost.
+
+### Parallel query experiment: a red herring -- the real cost was foreign keys
+
+Postgres's own docs are explicit that a plain `INSERT ... SELECT` never
+gets a parallel plan at all -- the planner refuses parallelism for any
+query that writes data, full stop, with the sole documented exception of
+`CREATE TABLE AS SELECT` (CTAS), which *can* parallelize its `SELECT`
+side. Verified directly via `EXPLAIN`: the plain `INSERT` (identical to
+`pg_store_finalize_terms_and_postings()`'s real second statement) never
+showed a `Gather` node, matching the docs exactly. A CTAS-equivalent bare
+`SELECT` didn't either, at first -- Postgres's default cost model judged
+a serial plan cheaper even after `ANALYZE`, requiring `parallel_setup_
+cost = 0; parallel_tuple_cost = 0;` to force a parallel plan at this row
+count (whether it would kick in naturally at full 8.84M-row scale,
+without forcing costs, is untested).
+
+Isolated all three variables against the same 5,052,759 staged rows
+(terms pre-resolved, ~2.9s, held constant):
+
+| Target | Constraints | Parallelism | Time |
+|---|---|---|---|
+| Real `postings` (current production path) | PK + both FKs live | off | 45,064ms |
+| Real `postings`, PK + both FKs dropped | none | off | 6,931ms |
+| New table via CTAS | none (new table) | off | 5,194ms |
+| New table via CTAS | none (new table) | forced on | 4,962ms |
+
+**Parallelism itself accounts for only ~230ms of the gap (5,194ms ->
+4,962ms, ~4%) -- noise-adjacent, not a real lever at this scale.** The
+actual finding: dropping `postings`' two foreign keys
+(`postings_term_id_fkey`, `postings_passage_id_fkey`), which neither the
+original suggestion nor this document's own earlier evaluation had
+identified as a cost at all, accounts for the overwhelming majority of
+the difference (45,064ms -> 6,931ms, a genuine ~6.5x). Combined with the
+PK finding above, deferring FK constraints turns out to matter about as
+much as deferring the PK, likely more -- a bigger, previously-invisible
+lever than parallel query ever was. Every number here fully verified
+correct afterward (postings' PK and both FKs re-added successfully
+against the real, already-loaded data with zero violations; 200,009 /
+214,010 / 5,052,759 counts unchanged). The temporary code used to pause
+`bulk_ingest_tsv()` after Phase 2 for this test (an env-var-gated early
+return) was fully reverted -- confirmed via an empty `git diff` on
+`bulk_ingest.c` -- before anything else changed.
+
+**Updated priority**: defer `postings`' foreign keys alongside its PK
+(same zero-C-code, schema-only shape as the experiment above) before
+spending any effort on parallel query or the hash-partitioned C refactor
+-- neither is likely to matter much until the much larger FK-checking
+cost is addressed first. See "Next optimizations" for what's next.
 
 ## Next optimizations, roughly in priority order
 
