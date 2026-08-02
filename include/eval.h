@@ -49,10 +49,21 @@ typedef struct {
  * for non-judged/non-relevant pairs); a query with no relevant rows at
  * all is skipped. Prints periodic progress (running metrics + elapsed/
  * estimated time remaining) to stdout, since a full 6,980-query run
- * takes on the order of hours (see LIMITATIONS.md) and this is meant to
- * run in the background with the user checking in periodically. */
+ * with LLM query expansion takes on the order of hours (see
+ * LIMITATIONS.md) and this is meant to run in the background with the
+ * user checking in periodically.
+ *
+ * `use_llm_expansion` selects which query formulation path scores get
+ * measured against: nonzero runs the real product path
+ * (query_formulation_formulate_query() -- WordNet expansion + a local-
+ * model call to select candidates, one model call per query); zero runs
+ * query_formulation_terms_only() instead -- plain lemmatized query terms,
+ * no WordNet expansion, no model call at all. Exists to answer directly,
+ * with real numbers, how much the LLM expansion step is actually
+ * contributing to retrieval quality versus its (measured: ~23s/query)
+ * cost, rather than assuming either way. */
 EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNetTable *wordnet,
                       const Lemmatizer *lemmatizer, const char *queries_tsv_path,
-                      const char *qrels_tsv_path);
+                      const char *qrels_tsv_path, int use_llm_expansion);
 
 #endif /* LEXIS_EVAL_H */

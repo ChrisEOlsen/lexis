@@ -275,3 +275,21 @@ TokenList *query_formulation_formulate_query(const char *query_text,
     query_formulation_candidates_free(candidates);
     return selected_terms;
 }
+
+TokenList *query_formulation_terms_only(const char *query_text, const StopwordSet *stopwords,
+                                         const WordNetTable *wordnet, const Lemmatizer *lemmatizer) {
+    QueryFormulationCandidates *candidates =
+        query_formulation_gather_candidates(query_text, stopwords, wordnet, lemmatizer);
+    if (candidates == NULL) {
+        return NULL;
+    }
+
+    /* Same "nothing survived stopword filtering" empty-outcome handling
+     * as query_formulation_formulate_query() -- no prompt, no model call,
+     * just the plain lemmatized terms query_formulation_fallback_terms()
+     * would have produced anyway had the LLM call failed. */
+    TokenList *terms = (candidates->count == 0) ? token_list_create()
+                                                 : query_formulation_fallback_terms(candidates);
+    query_formulation_candidates_free(candidates);
+    return terms;
+}

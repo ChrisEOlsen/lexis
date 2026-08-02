@@ -92,7 +92,7 @@ int main(void) {
         write_file(TEST_QRELS_PATH, "query-id\tcorpus-id\tscore\nq1\tmulti_chunk_doc\t1\n");
 
         EvalMetrics metrics =
-            eval_run(store, stopwords, wordnet, lemmatizer, TEST_QUERIES_PATH, TEST_QRELS_PATH);
+            eval_run(store, stopwords, wordnet, lemmatizer, TEST_QUERIES_PATH, TEST_QRELS_PATH, 1);
         TEST_ASSERT(metrics.queries_evaluated == 1, "expected 1 query evaluated, got %ld",
                     metrics.queries_evaluated);
         TEST_ASSERT(metrics.recall_at_10 <= 1.0 + 1e-9, "expected Recall@10 <= 1.0, got %f",
@@ -123,7 +123,7 @@ int main(void) {
         write_file(TEST_QRELS_PATH, "query-id\tcorpus-id\tscore\nq1\tsome_other_doc_never_indexed\t1\n");
 
         EvalMetrics metrics =
-            eval_run(store, stopwords, wordnet, lemmatizer, TEST_QUERIES_PATH, TEST_QRELS_PATH);
+            eval_run(store, stopwords, wordnet, lemmatizer, TEST_QUERIES_PATH, TEST_QRELS_PATH, 1);
         TEST_ASSERT(metrics.queries_evaluated == 1, "expected 1 query evaluated, got %ld",
                     metrics.queries_evaluated);
         TEST_ASSERT(metrics.mrr_at_10 == 0.0, "expected MRR@10 == 0 for a miss, got %f", metrics.mrr_at_10);
@@ -143,7 +143,7 @@ int main(void) {
         write_file(TEST_QRELS_PATH, "query-id\tcorpus-id\tscore\nq1\tsome_doc\t1\n");
 
         EvalMetrics metrics =
-            eval_run(store, stopwords, wordnet, lemmatizer, TEST_QUERIES_PATH, TEST_QRELS_PATH);
+            eval_run(store, stopwords, wordnet, lemmatizer, TEST_QUERIES_PATH, TEST_QRELS_PATH, 1);
         TEST_ASSERT(metrics.queries_evaluated == 1, "expected 1 query evaluated (q1), got %ld",
                     metrics.queries_evaluated);
         TEST_ASSERT(metrics.queries_skipped == 1, "expected 1 query skipped (q2, no qrels), got %ld",
@@ -162,7 +162,7 @@ int main(void) {
         write_file(TEST_QRELS_PATH, "query-id\tcorpus-id\tscore\nq1\tsome_doc\t0\n");
 
         EvalMetrics metrics =
-            eval_run(store, stopwords, wordnet, lemmatizer, TEST_QUERIES_PATH, TEST_QRELS_PATH);
+            eval_run(store, stopwords, wordnet, lemmatizer, TEST_QUERIES_PATH, TEST_QRELS_PATH, 1);
         TEST_ASSERT(metrics.queries_evaluated == 0, "expected the query to be skipped (only a score=0 "
                                                       "row, nothing relevant), got %ld evaluated",
                     metrics.queries_evaluated);
@@ -173,8 +173,36 @@ int main(void) {
     }
 
     {
+        /* use_llm_expansion=0 -- query_formulation_terms_only() instead
+         * of query_formulation_formulate_query(), no model call at all.
+         * local_llm_client_init() is never called anywhere in this test
+         * binary (see this file's header comment), so this exercises the
+         * real no-LLM code path standalone, not by coincidence. */
+        PgStore *store = open_fresh_store();
+        TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+        long passages = seed_document(stopwords, wordnet, lemmatizer, "hypertension_doc",
+                                       "hypertension treatment options", 100, 0);
+        TEST_ASSERT(passages == 1, "expected setup ingest to succeed");
+
+        write_file(TEST_QUERIES_PATH, "q1\thypertension treatment\n");
+        write_file(TEST_QRELS_PATH, "query-id\tcorpus-id\tscore\nq1\thypertension_doc\t1\n");
+
         EvalMetrics metrics =
-            eval_run(NULL, stopwords, wordnet, lemmatizer, "build/does_not_exist_queries.tsv", TEST_QRELS_PATH);
+            eval_run(store, stopwords, wordnet, lemmatizer, TEST_QUERIES_PATH, TEST_QRELS_PATH, 0);
+        TEST_ASSERT(metrics.queries_evaluated == 1, "expected 1 query evaluated, got %ld",
+                    metrics.queries_evaluated);
+        TEST_ASSERT(metrics.mrr_at_10 == 1.0, "expected plain lemmatized terms alone to still find the "
+                                               "exact-match document (MRR@10 == 1.0), got %f",
+                    metrics.mrr_at_10);
+        TEST_ASSERT(metrics.recall_at_10 == 1.0, "expected Recall@10 == 1.0, got %f", metrics.recall_at_10);
+
+        pg_store_close(store);
+    }
+
+    {
+        EvalMetrics metrics =
+            eval_run(NULL, stopwords, wordnet, lemmatizer, "build/does_not_exist_queries.tsv", TEST_QRELS_PATH, 1);
         TEST_ASSERT(metrics.queries_evaluated == -1, "expected -1 for a missing queries file, got %ld",
                     metrics.queries_evaluated);
     }
@@ -182,7 +210,7 @@ int main(void) {
     {
         write_file(TEST_QUERIES_PATH, "q1\tsome question\n");
         EvalMetrics metrics = eval_run(NULL, stopwords, wordnet, lemmatizer, TEST_QUERIES_PATH,
-                                        "build/does_not_exist_qrels.tsv");
+                                        "build/does_not_exist_qrels.tsv", 1);
         TEST_ASSERT(metrics.queries_evaluated == -1, "expected -1 for a missing qrels file, got %ld",
                     metrics.queries_evaluated);
     }

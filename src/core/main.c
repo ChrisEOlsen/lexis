@@ -82,7 +82,10 @@ static void print_usage(const char *program_name) {
             "Usage:\n"
             "  %s bulk-ingest <tsv_path>                Build/rebuild the index from a TSV of \"<id><TAB><text>\" rows\n"
             "  %s query \"<question>\"                   Ask a question against the current index\n"
-            "  %s eval <queries_tsv> <qrels_tsv>        Score retrieval quality (MRR@10/Recall@K) against labeled queries\n"
+            "  %s eval <queries_tsv> <qrels_tsv> [--no-llm-expansion]\n"
+            "                                            Score retrieval quality (MRR@10/Recall@K) against labeled queries.\n"
+            "                                            --no-llm-expansion skips WordNet+LLM query expansion entirely,\n"
+            "                                            scoring plain lemmatized query terms instead (no model load).\n"
             "\n"
             "Must be run from the project root.\n",
             program_name, program_name, program_name);
@@ -370,7 +373,7 @@ cleanup:
     return exit_code;
 }
 
-static int run_eval(const char *queries_path, const char *qrels_path) {
+static int run_eval(const char *queries_path, const char *qrels_path, int use_llm_expansion) {
     StopwordSet *stopwords = stopword_set_load(LEXIS_STOPWORDS_PATH);
     WordNetTable *wordnet = wordnet_table_load(LEXIS_WORDNET_DIR);
     Lemmatizer *lemmatizer = lemmatizer_load(LEXIS_WORDNET_DIR);
@@ -396,11 +399,13 @@ static int run_eval(const char *queries_path, const char *qrels_path) {
     /* eval_run() only exercises query formulation (WordNet expansion +
      * local-model term selection), never generation_generate_answer() --
      * MRR@10/Recall@K don't depend on what the large model says about
-     * the results. Still needs the local model loaded exactly once here,
-     * up front, for the same reason main.c's other modes do: a fresh
-     * process-per-query would pay the ~9-19s model-load cost thousands
-     * of times over (see LIMITATIONS.md). */
-    if (local_llm_client_init(LEXIS_MODEL_PATH) != 0) {
+     * the results. With use_llm_expansion, still needs the local model
+     * loaded exactly once here, up front, for the same reason main.c's
+     * other modes do: a fresh process-per-query would pay the ~9-19s
+     * model-load cost thousands of times over (see LIMITATIONS.md).
+     * Without it, query_formulation_terms_only() never calls the model
+     * at all -- skip paying that load cost for nothing. */
+    if (use_llm_expansion && local_llm_client_init(LEXIS_MODEL_PATH) != 0) {
         fprintf(stderr, "lexis: failed to load local model from %s\n", LEXIS_MODEL_PATH);
         pg_store_close(store);
         stopword_set_free(stopwords);
@@ -411,7 +416,8 @@ static int run_eval(const char *queries_path, const char *qrels_path) {
 
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    EvalMetrics metrics = eval_run(store, stopwords, wordnet, lemmatizer, queries_path, qrels_path);
+    EvalMetrics metrics =
+        eval_run(store, stopwords, wordnet, lemmatizer, queries_path, qrels_path, use_llm_expansion);
     clock_gettime(CLOCK_MONOTONIC, &end);
 
     int exit_code = 0;
@@ -454,7 +460,15 @@ int main(int argc, char **argv) {
             print_usage(argv[0]);
             return 1;
         }
-        return run_eval(argv[2], argv[3]);
+        int use_llm_expansion = 1;
+        if (argc >= 5) {
+            if (strcmp(argv[4], "--no-llm-expansion") != 0) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            use_llm_expansion = 0;
+        }
+        return run_eval(argv[2], argv[3], use_llm_expansion);
     }
 
     print_usage(argv[0]);

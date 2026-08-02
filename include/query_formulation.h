@@ -89,4 +89,18 @@ TokenList *query_formulation_formulate_query(const char *query_text,
                                               const WordNetTable *wordnet,
                                               const Lemmatizer *lemmatizer);
 
+/* The local-only half of query_formulation_formulate_query() -- tokenize,
+ * stopword-filter, lemmatize, done. Skips WordNet candidate gathering's
+ * *purpose* entirely: no prompt is built, no local model call is made, no
+ * synonym/hypernym/hyponym expansion happens at all. Exists to answer a
+ * real question this project didn't have real numbers for -- how much is
+ * the LLM expansion-selection step (query_formulation_formulate_query())
+ * actually improving retrieval quality, versus just plain lemmatized
+ * query terms straight into bm25_search()? -- by making that comparison
+ * directly runnable (see eval.c's `use_llm_expansion` parameter). Same
+ * "empty TokenList (not NULL) if nothing survives stopword filtering, or
+ * NULL only on allocation failure" contract. */
+TokenList *query_formulation_terms_only(const char *query_text, const StopwordSet *stopwords,
+                                         const WordNetTable *wordnet, const Lemmatizer *lemmatizer);
+
 #endif /* LEXIS_QUERY_FORMULATION_H */

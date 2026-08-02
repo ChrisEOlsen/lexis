@@ -473,6 +473,102 @@ tables dropped, pid 226's backslash content intact, a real `lexis query`
 returning the same relevant top-5 results). Not yet run at full 8.84M-row
 scale.
 
+## Query-side slowness at full corpus scale: shared_buffers + CLUSTER
+
+Discovered while trying to run the full 6,980-query MS MARCO dev eval:
+even with zero LLM involvement (`--no-llm-expansion`, see eval.h), a
+50-query sample averaged ~17.9 sec/query -- a projected ~34.7 hours for
+the full set. This is `bm25.c`'s `bm25_accumulate_term_scores()` query
+(`SELECT passage_id, term_frequency, token_count FROM postings WHERE
+term_id = $1;`) being genuinely slow at 226M-row scale, not an LLM
+problem at all.
+
+Root-caused directly via `EXPLAIN (ANALYZE, BUFFERS)` against a real
+common term (`"use"`, term_id 1679349, document frequency 1,335,518 --
+appears in ~15% of the entire corpus):
+
+```
+Before: Bitmap Heap Scan, Heap Blocks: exact=800505, Buffers: shared hit=5124 read=800505
+        Execution Time: 13790.541 ms
+```
+
+Two compounding causes: `shared_buffers` was still Postgres's untouched
+128MB default (this project had only ever tuned `work_mem`, a
+per-connection setting -- `shared_buffers` requires a config file edit
+and a full restart, and had simply never come up before this
+investigation), against an 11GB `postings` table -- almost nothing could
+stay cached. Worse: 1,335,518 matching rows spread across 800,505 heap
+blocks is only ~1.67 rows/block, confirming physical row order (just
+insertion order from Phase 2/3) has zero correlation with term_id --
+fetching one term's postings meant ~800K effectively *random* page
+reads, the worst-case access pattern for any storage medium.
+
+**Fix, two parts:**
+1. `shared_buffers` raised from 128MB to 1GB in `postgresql.conf` (native
+   instance, `/opt/homebrew/var/postgresql@18/postgresql.conf`), applied
+   via `make pg-stop`/`make pg-start` (this setting requires a restart,
+   not just a reload). Sized against this machine's real 8GB ceiling and
+   the local LLM's ~5.7GB worst-case footprint when both are loaded
+   together, not the textbook "25% of RAM" a dedicated DB server would
+   use.
+2. `CLUSTER postings USING postings_pkey;` -- physically reorders the
+   whole table to match `(term_id, passage_id)` order, so one term's
+   rows become contiguous instead of scattered. A real, measured
+   operation on the actual 226,770,750-row table, not a projection: **6
+   minutes 47 seconds total**, verified live via Postgres's own
+   `pg_stat_progress_cluster` view (the expensive full-table scan/rewrite
+   -- all 226,770,750 tuples, all 1,444,407 blocks -- finished by minute
+   6:45; the final index-rebuild phase took only ~2 more seconds).
+   Followed by `ANALYZE postings;` (2.6s).
+
+**Real result, identical query, same term, after both fixes:**
+
+```
+After:  Bitmap Heap Scan, Heap Blocks: exact=8507, Buffers: shared hit=3 read=13628
+        Execution Time: 174.506 ms
+```
+
+**13,790.5ms -> 174.5ms -- a real, measured ~79x speedup**, ahead of the
+10-50x projected beforehand. Heap blocks needed dropped from 800,505 to
+8,507 (~157 rows/block now, vs. 1.67 before -- confirms the clustering
+worked as intended, not just correlated improvement). Correctness
+verified unchanged: identical passage/term/posting counts
+(8,842,136/3,492,916/226,770,750), `postings_pkey` still present with a
+`CLUSTER` marker confirming Postgres registered it, both FKs intact, and
+a real `lexis query` still returning correct results -- that same
+interactive query dropped from needing ~109s in an earlier full-pipeline
+test to **9.2s total** (model load + search + generation).
+
+Not yet made permanent/automatic: `CLUSTER` doesn't stay in effect as
+new rows are inserted (Postgres doesn't maintain physical order on
+future writes), so a future bulk-ingest run would need to re-cluster --
+this was a manual, one-time fix against the current data, not yet wired
+into `bulk_ingest_tsv()`'s pipeline. `shared_buffers = 1GB` is a
+permanent `postgresql.conf` change and persists across restarts as-is.
+
+### Full 6,980-query eval, naked BM25 (`--no-llm-expansion`), post-fix
+
+Real, complete run against the full MS MARCO dev query set, zero LLM
+calls, zero WordNet expansion -- plain lemmatized query terms straight
+into `bm25_search()`:
+
+```
+Queries evaluated: 6980 (skipped 0)
+MRR@10:      0.1869
+Recall@10:   0.3877
+Recall@100:  0.6618
+Total time:  25.0 minutes
+```
+
+25.0 minutes for all 6,980 queries, down from a ~34.7-hour projection
+before the `shared_buffers`/`CLUSTER` fixes -- consistent with the
+~79x single-query improvement measured directly above. MRR@10=0.1869
+lands in the range commonly cited for default-parameter BM25 baselines
+on MS MARCO passage dev (e.g. Anserini's default BM25, ~0.18-0.19) --
+this is a real, complete, directly comparable number, not a sample
+extrapolation. LLM-expansion path not yet re-run at full scale post-fix;
+see "Next optimizations" for the comparison this sets up.
+
 ## Next optimizations, roughly in priority order
 
 1. **Shared in-memory term cache across worker threads, refined from the

@@ -215,7 +215,7 @@ static void eval_cleanup(const char **relevant_ids, EvalQrel *qrels, long qrels_
 
 EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNetTable *wordnet,
                       const Lemmatizer *lemmatizer, const char *queries_tsv_path,
-                      const char *qrels_tsv_path) {
+                      const char *qrels_tsv_path, int use_llm_expansion) {
     EvalMetrics failure = {0.0, 0.0, 0.0, -1, 0};
 
     EvalQuery *queries = NULL;
@@ -232,6 +232,7 @@ EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNet
     }
 
     printf("eval_run: loaded %ld queries, %ld qrels rows\n", query_count, qrels_count);
+    fflush(stdout);
 
     /* Computed once and reused for every query in this run, not
      * recomputed per search -- bm25_corpus_stats() is a full-corpus
@@ -278,7 +279,9 @@ EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNet
             continue;
         }
 
-        TokenList *terms = query_formulation_formulate_query(query_text, stopwords, wordnet, lemmatizer);
+        TokenList *terms = use_llm_expansion
+                               ? query_formulation_formulate_query(query_text, stopwords, wordnet, lemmatizer)
+                               : query_formulation_terms_only(query_text, stopwords, wordnet, lemmatizer);
         if (terms == NULL) {
             fprintf(stderr, "eval_run: query formulation failed (allocation failure) on query %s\n",
                     query_id);
