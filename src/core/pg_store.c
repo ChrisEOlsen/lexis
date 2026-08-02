@@ -48,6 +48,128 @@
     "    PRIMARY KEY (term_id, passage_id)"                              \
     ");"
 
+static int exec_simple(PGconn *conn, const char *sql, const char *caller);
+
+/* Registry of corpora ("groups" in the app UI) -- lives permanently in
+ * the public schema, one row per group. Maps a user-facing display_name
+ * to the opaque, server-generated schema_name that actually holds that
+ * group's own passages/terms/postings (see pg_store_create_corpus()).
+ * schema_name is never built from user input -- see APP_SPEC.md's "Core
+ * concept: groups" for why. */
+#define LEXIS_CORPORA_REGISTRY_SQL                                      \
+    "CREATE TABLE IF NOT EXISTS public.corpora ("                       \
+    "    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"           \
+    "    display_name TEXT NOT NULL,"                                  \
+    "    schema_name TEXT NOT NULL UNIQUE,"                            \
+    "    created_at TIMESTAMPTZ NOT NULL DEFAULT now()"                \
+    ");"
+
+int pg_store_ensure_corpora_registry(PgStore *store) {
+    return exec_simple(store->conn, LEXIS_CORPORA_REGISTRY_SQL, "pg_store_ensure_corpora_registry");
+}
+
+int64_t pg_store_create_corpus(PgStore *store, const char *display_name, char **schema_name_out) {
+    if (display_name == NULL || display_name[0] == '\0' || schema_name_out == NULL) {
+        return -1;
+    }
+    if (pg_store_ensure_corpora_registry(store) != 0) {
+        return -1;
+    }
+    if (exec_simple(store->conn, "BEGIN;", "pg_store_create_corpus") != 0) {
+        return -1;
+    }
+
+    /* schema_name is computed from the row's own freshly-assigned id, so
+     * it's only known after the INSERT -- genuinely two round trips, not
+     * one. A single WITH-CTE combining the INSERT and an UPDATE...FROM
+     * referencing it looks appealing but is wrong: every part of one
+     * statement (CTEs and the main query alike) scans its target table
+     * against the snapshot taken at the *start* of the statement, so the
+     * UPDATE can't see the row its sibling CTE just inserted -- confirmed
+     * directly against a real database (UPDATE matched 0 rows) before
+     * settling on this instead. */
+    const char *insert_params[1] = {display_name};
+    PGresult *insert_res =
+        PQexecParams(store->conn, "INSERT INTO public.corpora (display_name, schema_name) VALUES ($1, '') RETURNING id;",
+                      1, NULL, insert_params, NULL, NULL, 0);
+    if (PQresultStatus(insert_res) != PGRES_TUPLES_OK || PQntuples(insert_res) != 1) {
+        fprintf(stderr, "pg_store_create_corpus: registry insert failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(insert_res);
+        exec_simple(store->conn, "ROLLBACK;", "pg_store_create_corpus");
+        return -1;
+    }
+    int64_t id = strtoll(PQgetvalue(insert_res, 0, 0), NULL, 10);
+    PQclear(insert_res);
+
+    char schema_name_buf[32];
+    snprintf(schema_name_buf, sizeof(schema_name_buf), "corpus_%lld", (long long)id);
+    char id_str[32];
+    snprintf(id_str, sizeof(id_str), "%lld", (long long)id);
+    const char *update_params[2] = {schema_name_buf, id_str};
+    PGresult *update_res = PQexecParams(store->conn, "UPDATE public.corpora SET schema_name = $1 WHERE id = $2;", 2,
+                                         NULL, update_params, NULL, NULL, 0);
+    if (PQresultStatus(update_res) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "pg_store_create_corpus: registry schema_name update failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(update_res);
+        exec_simple(store->conn, "ROLLBACK;", "pg_store_create_corpus");
+        return -1;
+    }
+    PQclear(update_res);
+
+    char *schema_name = strdup(schema_name_buf);
+    if (schema_name == NULL) {
+        exec_simple(store->conn, "ROLLBACK;", "pg_store_create_corpus");
+        return -1;
+    }
+
+    /* schema_name is always "corpus_<id>", a server-generated identifier
+     * with no user input in it (see the registry's doc comment above), so
+     * direct interpolation into DDL here is safe by construction -- there
+     * is no untrusted text anywhere in this string. */
+    char ddl[2048];
+    int written = snprintf(
+        ddl, sizeof(ddl),
+        "CREATE SCHEMA %s;"
+        "CREATE TABLE %s.passages ("
+        "    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+        "    document_name TEXT NOT NULL,"
+        "    chunk_id INTEGER NOT NULL,"
+        "    text TEXT NOT NULL,"
+        "    token_count INTEGER NOT NULL"
+        ");"
+        "CREATE TABLE %s.terms ("
+        "    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+        "    term TEXT NOT NULL UNIQUE"
+        ");"
+        "CREATE TABLE %s.postings ("
+        "    term_id BIGINT NOT NULL REFERENCES %s.terms(id),"
+        "    passage_id BIGINT NOT NULL REFERENCES %s.passages(id),"
+        "    term_frequency INTEGER NOT NULL,"
+        "    token_count INTEGER NOT NULL,"
+        "    PRIMARY KEY (term_id, passage_id)"
+        ");",
+        schema_name, schema_name, schema_name, schema_name, schema_name, schema_name);
+    if (written < 0 || (size_t)written >= sizeof(ddl)) {
+        fprintf(stderr, "pg_store_create_corpus: schema DDL didn't fit the buffer\n");
+        free(schema_name);
+        exec_simple(store->conn, "ROLLBACK;", "pg_store_create_corpus");
+        return -1;
+    }
+
+    if (exec_simple(store->conn, ddl, "pg_store_create_corpus") != 0) {
+        free(schema_name);
+        exec_simple(store->conn, "ROLLBACK;", "pg_store_create_corpus");
+        return -1;
+    }
+    if (exec_simple(store->conn, "COMMIT;", "pg_store_create_corpus") != 0) {
+        free(schema_name);
+        return -1;
+    }
+
+    *schema_name_out = schema_name;
+    return id;
+}
+
 PgStore *pg_store_open(const char *conninfo) {
     PgStore *store = malloc(sizeof(PgStore));
     if (store == NULL) {

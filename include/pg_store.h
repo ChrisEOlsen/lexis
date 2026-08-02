@@ -37,6 +37,38 @@ typedef struct {
  * connection failure or if schema creation fails. */
 PgStore *pg_store_open(const char *conninfo);
 
+/* -- Multi-corpus support (groups) -- see APP_SPEC.md's "Core concept:
+ * groups = one Postgres schema each" for the full design. Each corpus
+ * ("group" in the app UI) is its own Postgres schema, holding its own
+ * passages/terms/postings tables, isolated from every other corpus so
+ * the whole bulk-ingest machinery above stays safely reusable per group.
+ * The public.corpora table (created by pg_store_ensure_corpora_registry())
+ * is the one exception -- it lives permanently in the default `public`
+ * schema and tracks which corpora exist. -- */
+
+/* Creates public.corpora if it doesn't already exist. Idempotent (IF NOT
+ * EXISTS). Returns 0 on success, -1 on failure. Called automatically by
+ * pg_store_create_corpus(); exposed separately for callers (e.g. a future
+ * "list corpora") that only need to read the registry. */
+int pg_store_ensure_corpora_registry(PgStore *store);
+
+/* Creates a new corpus: a registry row in public.corpora plus a fresh
+ * Postgres schema (an opaque, server-generated name -- "corpus_<id>",
+ * never built from `display_name`, see APP_SPEC.md) holding its own
+ * passages/terms/postings tables, identical in shape to the ones
+ * pg_store_open() creates in `public`. Runs as one transaction, so a
+ * failure partway through (e.g. schema creation fails after the registry
+ * row is inserted) never leaves an orphaned registry entry pointing at a
+ * schema that doesn't exist.
+ *
+ * On success, returns the new corpus's id (> 0) and sets *schema_name_out
+ * to a newly malloc()'d string (caller must free()) holding its schema
+ * name -- needed by a future "open/use this corpus" call to set
+ * `search_path`. Returns -1 on failure (display_name NULL/empty,
+ * schema_name_out NULL, or any database error), *schema_name_out left
+ * untouched. */
+int64_t pg_store_create_corpus(PgStore *store, const char *display_name, char **schema_name_out);
+
 /* Closes the connection and frees the PgStore. Safe to call with
  * store == NULL. */
 void pg_store_close(PgStore *store);

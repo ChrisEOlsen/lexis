@@ -26,6 +26,116 @@ static PgStore *open_fresh_store(void) {
     return store;
 }
 
+/* Drops every schema a prior test run registered (in case a prior run
+ * crashed mid-test and left one behind -- CREATE SCHEMA would otherwise
+ * collide with it) and empties the registry itself, so every corpus test
+ * starts from a genuinely clean slate regardless of what earlier runs
+ * left behind. Tolerates public.corpora not existing yet (first-ever
+ * run) -- both queries just no-op in that case. */
+static void reset_corpora_registry(PgStore *store) {
+    PGresult *res = PQexec(store->conn, "SELECT schema_name FROM public.corpora;");
+    if (PQresultStatus(res) == PGRES_TUPLES_OK) {
+        for (int i = 0; i < PQntuples(res); i++) {
+            char drop_sql[256];
+            snprintf(drop_sql, sizeof(drop_sql), "DROP SCHEMA IF EXISTS %s CASCADE;", PQgetvalue(res, i, 0));
+            PGresult *drop_res = PQexec(store->conn, drop_sql);
+            PQclear(drop_res);
+        }
+    }
+    PQclear(res);
+    PGresult *truncate_res = PQexec(store->conn, "TRUNCATE public.corpora RESTART IDENTITY CASCADE;");
+    PQclear(truncate_res);
+}
+
+static int schema_has_lexis_tables(PgStore *store, const char *schema_name) {
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT count(*) FROM information_schema.tables "
+             "WHERE table_schema = '%s' AND table_name IN ('passages', 'terms', 'postings');",
+             schema_name);
+    PGresult *res = PQexec(store->conn, sql);
+    int count = 0;
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1) {
+        count = atoi(PQgetvalue(res, 0, 0));
+    }
+    PQclear(res);
+    return count == 3;
+}
+
+static void test_create_corpus_creates_schema_and_registry_row(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
+    reset_corpora_registry(store);
+
+    char *schema_name = NULL;
+    int64_t id = pg_store_create_corpus(store, "Test Group", &schema_name);
+    TEST_ASSERT(id > 0, "expected a positive corpus id, got %lld", (long long)id);
+    TEST_ASSERT(schema_name != NULL, "expected schema_name_out to be set on success");
+
+    char expected_schema[64];
+    snprintf(expected_schema, sizeof(expected_schema), "corpus_%lld", (long long)id);
+    TEST_ASSERT_STR_EQ(schema_name, expected_schema);
+    TEST_ASSERT(schema_has_lexis_tables(store, schema_name),
+                "expected passages/terms/postings to exist in the new schema");
+
+    char id_str[32];
+    snprintf(id_str, sizeof(id_str), "%lld", (long long)id);
+    const char *params[1] = {id_str};
+    PGresult *res = PQexecParams(store->conn, "SELECT display_name, schema_name FROM public.corpora WHERE id = $1;",
+                                  1, NULL, params, NULL, NULL, 0);
+    TEST_ASSERT(PQntuples(res) == 1, "expected exactly one registry row for the new corpus");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 0), "Test Group");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 1), schema_name);
+    PQclear(res);
+
+    free(schema_name);
+    pg_store_close(store);
+}
+
+static void test_create_corpus_isolates_tables_between_corpora(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+    reset_corpora_registry(store);
+
+    char *schema_a = NULL;
+    char *schema_b = NULL;
+    TEST_ASSERT(pg_store_create_corpus(store, "Group A", &schema_a) > 0, "expected corpus A to be created");
+    TEST_ASSERT(pg_store_create_corpus(store, "Group B", &schema_b) > 0, "expected corpus B to be created");
+
+    char insert_sql[256];
+    snprintf(insert_sql, sizeof(insert_sql),
+             "INSERT INTO %s.passages (document_name, chunk_id, text, token_count) "
+             "VALUES ('doc-a', 0, 'only in A', 3);",
+             schema_a);
+    PGresult *insert_res = PQexec(store->conn, insert_sql);
+    TEST_ASSERT(PQresultStatus(insert_res) == PGRES_COMMAND_OK, "expected insert into corpus A's own schema to succeed");
+    PQclear(insert_res);
+
+    char count_sql[128];
+    snprintf(count_sql, sizeof(count_sql), "SELECT count(*) FROM %s.passages;", schema_b);
+    PGresult *count_res = PQexec(store->conn, count_sql);
+    TEST_ASSERT(PQresultStatus(count_res) == PGRES_TUPLES_OK, "expected count query on corpus B to succeed");
+    TEST_ASSERT_STR_EQ(PQgetvalue(count_res, 0, 0), "0");
+    PQclear(count_res);
+
+    free(schema_a);
+    free(schema_b);
+    pg_store_close(store);
+}
+
+static void test_create_corpus_rejects_empty_display_name(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+    reset_corpora_registry(store);
+
+    char *schema_name = NULL;
+    int64_t id = pg_store_create_corpus(store, "", &schema_name);
+    TEST_ASSERT(id == -1, "expected an empty display_name to be rejected");
+    TEST_ASSERT(schema_name == NULL, "expected schema_name_out left untouched on failure");
+
+    pg_store_close(store);
+}
+
 static void test_open_creates_store(void) {
     PgStore *store = open_fresh_store();
     TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
@@ -642,6 +752,9 @@ static void test_finish_bulk_load_restores_constraints_and_durability_and_data_s
 }
 
 int main(void) {
+    test_create_corpus_creates_schema_and_registry_row();
+    test_create_corpus_isolates_tables_between_corpora();
+    test_create_corpus_rejects_empty_display_name();
     test_open_creates_store();
     test_insert_passage_returns_ids();
     test_get_or_create_term_dedups();
