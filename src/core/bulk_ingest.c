@@ -121,6 +121,15 @@ static int phase2_stage_chunk_terms(PgStore *store, const TokenList *terms, int6
 static long phase2_process_document(PgStore *store, const StopwordSet *stopwords,
                                      const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
                                      const char *text, const char *pid, size_t chunk_size, size_t overlap) {
+    /* Once per source document, not once per chunk -- the original,
+     * un-chunked text, so a future rebuild-on-append can re-chunk every
+     * document (old and new) consistently instead of only ever having
+     * access to already-fragmented passage text. See
+     * pg_store_insert_document(). */
+    if (pg_store_insert_document(store, pid, text) != 0) {
+        return -1;
+    }
+
     TokenList *words = ingest_split_words(text);
     if (words == NULL) {
         return -1;

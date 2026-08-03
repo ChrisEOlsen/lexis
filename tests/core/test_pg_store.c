@@ -20,8 +20,13 @@ static PgStore *open_fresh_store(void) {
     if (store == NULL) {
         return NULL;
     }
-    /* Dependency order: postings references both other tables. */
-    PGresult *res = PQexec(store->conn, "TRUNCATE postings, terms, passages RESTART IDENTITY CASCADE;");
+    /* Dependency order: postings references both other tables. documents
+     * has no FK relationship to any of them (see pg_store.c's schema
+     * comment -- it's an independent original-text record, not part of
+     * the passages/terms/postings graph), but still needs truncating so
+     * fixed document_names reused across test runs don't collide with
+     * documents.document_name's PRIMARY KEY. */
+    PGresult *res = PQexec(store->conn, "TRUNCATE postings, terms, passages, documents RESTART IDENTITY CASCADE;");
     PQclear(res);
     return store;
 }
@@ -262,6 +267,44 @@ static void test_delete_corpus_fails_for_nonexistent_id(void) {
     reset_corpora_registry(store);
 
     TEST_ASSERT(pg_store_delete_corpus(store, 999999) == -1, "expected deleting a nonexistent id to fail");
+
+    pg_store_close(store);
+}
+
+static void test_insert_document_round_trip(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+    TEST_ASSERT(pg_store_insert_document(store, "doc1.txt", "the original, un-chunked text") == 0,
+                "expected pg_store_insert_document to succeed");
+
+    const char *params[1] = {"doc1.txt"};
+    PGresult *res =
+        PQexecParams(store->conn, "SELECT text FROM documents WHERE document_name = $1;", 1, NULL, params, NULL, NULL, 0);
+    TEST_ASSERT(PQntuples(res) == 1, "expected exactly one documents row for doc1.txt");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 0), "the original, un-chunked text");
+    PQclear(res);
+
+    pg_store_close(store);
+}
+
+static void test_insert_document_on_conflict_does_nothing(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+    TEST_ASSERT(pg_store_insert_document(store, "doc1.txt", "first version") == 0,
+                "expected the first insert to succeed");
+    /* Matches a Phase 2 batch retry re-processing the same document (see
+     * bulk_ingest.c) -- must not error, and must not overwrite. */
+    TEST_ASSERT(pg_store_insert_document(store, "doc1.txt", "second version") == 0,
+                "expected a repeat insert of the same document_name to succeed (ON CONFLICT DO NOTHING)");
+
+    const char *params[1] = {"doc1.txt"};
+    PGresult *res =
+        PQexecParams(store->conn, "SELECT text FROM documents WHERE document_name = $1;", 1, NULL, params, NULL, NULL, 0);
+    TEST_ASSERT(PQntuples(res) == 1, "expected still exactly one row, not a second one");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 0), "first version");
+    PQclear(res);
 
     pg_store_close(store);
 }
@@ -891,6 +934,8 @@ int main(void) {
     test_list_corpora_returns_created_corpora_in_order();
     test_delete_corpus_drops_schema_and_registry_row();
     test_delete_corpus_fails_for_nonexistent_id();
+    test_insert_document_round_trip();
+    test_insert_document_on_conflict_does_nothing();
     test_open_creates_store();
     test_insert_passage_returns_ids();
     test_get_or_create_term_dedups();

@@ -28,7 +28,21 @@
  * cost of repeating a 4-byte int across every posting for a given
  * passage (acceptable; see LIMITATIONS.md's existing postings-storage
  * tradeoff discussion). */
+/* documents holds each source document's ORIGINAL, un-chunked text --
+ * passages only ever stores post-chunking fragments (see
+ * ingest_chunk_words()), and Phase 1's documents_raw is transient,
+ * dropped at the end of every bulk_ingest_tsv() run. Without a permanent
+ * copy of the original text, "rebuild this group with a few more
+ * documents added" would have no way to re-chunk a document's existing
+ * content consistently -- see APP_SPEC.md's rebuild-on-append design and
+ * pg_store_insert_document(). One row per source document, not per
+ * chunk -- document_name is the same natural key passages.document_name
+ * already groups chunks by. */
 #define LEXIS_SCHEMA_SQL                                                 \
+    "CREATE TABLE IF NOT EXISTS documents ("                            \
+    "    document_name TEXT PRIMARY KEY,"                                \
+    "    text TEXT NOT NULL"                                             \
+    ");"                                                                 \
     "CREATE TABLE IF NOT EXISTS passages ("                              \
     "    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"            \
     "    document_name TEXT NOT NULL,"                                   \
@@ -130,6 +144,10 @@ int64_t pg_store_create_corpus(PgStore *store, const char *display_name, char **
     int written = snprintf(
         ddl, sizeof(ddl),
         "CREATE SCHEMA %s;"
+        "CREATE TABLE %s.documents ("
+        "    document_name TEXT PRIMARY KEY,"
+        "    text TEXT NOT NULL"
+        ");"
         "CREATE TABLE %s.passages ("
         "    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
         "    document_name TEXT NOT NULL,"
@@ -148,7 +166,7 @@ int64_t pg_store_create_corpus(PgStore *store, const char *display_name, char **
         "    token_count INTEGER NOT NULL,"
         "    PRIMARY KEY (term_id, passage_id)"
         ");",
-        schema_name, schema_name, schema_name, schema_name, schema_name, schema_name);
+        schema_name, schema_name, schema_name, schema_name, schema_name, schema_name, schema_name);
     if (written < 0 || (size_t)written >= sizeof(ddl)) {
         fprintf(stderr, "pg_store_create_corpus: schema DDL didn't fit the buffer\n");
         free(schema_name);
@@ -340,6 +358,26 @@ int64_t pg_store_insert_passage(PgStore *store, const char *document_name, int c
     int64_t passage_id = atoll(PQgetvalue(res, 0, 0));
     PQclear(res);
     return passage_id;
+}
+
+int pg_store_insert_document(PgStore *store, const char *document_name, const char *text) {
+    const char *params[2] = {document_name, text};
+    /* ON CONFLICT DO NOTHING, not a hard uniqueness error: Phase 2's
+     * batch retries (see bulk_ingest.c's BULK_PHASE2_BATCH_RETRIES) can
+     * legitimately re-process the same documents_raw row -- a retried
+     * document_name landing here a second time with identical content is
+     * expected, not a bug. */
+    static const char *sql = "INSERT INTO documents (document_name, text) VALUES ($1, $2) "
+                              "ON CONFLICT (document_name) DO NOTHING;";
+
+    PGresult *res = PQexecParams(store->conn, sql, 2, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "pg_store_insert_document: insert failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        return -1;
+    }
+    PQclear(res);
+    return 0;
 }
 
 int64_t pg_store_get_or_create_term(PgStore *store, const char *term) {

@@ -96,6 +96,43 @@ static void test_bulk_ingest_ingests_every_row_exactly_once(void) {
     lemmatizer_free(lemmatizer);
 }
 
+static void test_bulk_ingest_captures_one_original_document_per_multi_chunk_row(void) {
+    PgStore *reset_store = open_fresh_store();
+    TEST_ASSERT(reset_store != NULL, "expected pg_store_open to succeed");
+    PGresult *truncate_documents = PQexec(reset_store->conn, "TRUNCATE documents;");
+    PQclear(truncate_documents);
+    pg_store_close(reset_store);
+
+    /* chunk_size 3 (words), no overlap, against an 9-word single-row
+     * document -- guaranteed to split into multiple passages/chunks, the
+     * exact case where "one documents row per source document, not per
+     * chunk" actually matters. */
+    write_tsv("400\tone two three four five six seven eight nine\n");
+
+    StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
+    WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
+    Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
+    TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
+
+    long total = bulk_ingest_tsv(TEST_CONNINFO, 0, stopwords, wordnet, lemmatizer, TEST_TSV_PATH, 3, 0, 1);
+    TEST_ASSERT(total == 3, "expected 3 passages (9 words / chunk_size 3), got %ld", total);
+
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+    const char *params[1] = {"400"};
+    PGresult *res =
+        PQexecParams(store->conn, "SELECT text FROM documents WHERE document_name = $1;", 1, NULL, params, NULL, NULL, 0);
+    TEST_ASSERT(PQntuples(res) == 1, "expected exactly one documents row despite 3 passages, got %d", PQntuples(res));
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 0), "one two three four five six seven eight nine");
+    PQclear(res);
+
+    pg_store_close(store);
+    stopword_set_free(stopwords);
+    wordnet_table_free(wordnet);
+    lemmatizer_free(lemmatizer);
+}
+
 static void test_bulk_ingest_missing_file_returns_negative_one(void) {
     StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
     WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
@@ -196,6 +233,7 @@ static void test_bulk_ingest_targets_specified_corpus(void) {
 
 int main(void) {
     test_bulk_ingest_ingests_every_row_exactly_once();
+    test_bulk_ingest_captures_one_original_document_per_multi_chunk_row();
     test_bulk_ingest_missing_file_returns_negative_one();
     test_bulk_ingest_fails_atomically_on_a_malformed_row();
     test_bulk_ingest_targets_specified_corpus();

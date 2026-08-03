@@ -128,6 +128,16 @@ void pg_store_close(PgStore *store);
 int64_t pg_store_insert_passage(PgStore *store, const char *document_name, int chunk_id,
                                  const char *text, int token_count);
 
+/* Records `document_name`'s original, un-chunked `text` in the documents
+ * table -- see pg_store.c's LEXIS_SCHEMA_SQL comment for why this exists
+ * separately from passages (which only ever holds post-chunking
+ * fragments) and documents_raw (which is transient, dropped at the end
+ * of every bulk_ingest_tsv() run). ON CONFLICT (document_name) DO
+ * NOTHING, not an error -- a Phase 2 batch retry re-processing the same
+ * document is expected, not a bug (see bulk_ingest.c). Returns 0 on
+ * success, -1 on failure. */
+int pg_store_insert_document(PgStore *store, const char *document_name, const char *text);
+
 /* Returns the id of `term` in the terms table, inserting it first if this
  * is the first time it's been seen (INSERT ... ON CONFLICT DO NOTHING,
  * plus a re-SELECT to fetch the id either way it landed -- see pg_store.c
