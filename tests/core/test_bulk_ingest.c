@@ -59,7 +59,7 @@ static void test_bulk_ingest_ingests_every_row_exactly_once(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    long total = bulk_ingest_tsv(TEST_CONNINFO, stopwords, wordnet, lemmatizer, TEST_TSV_PATH, 100, 0, 4);
+    long total = bulk_ingest_tsv(TEST_CONNINFO, 0, stopwords, wordnet, lemmatizer, TEST_TSV_PATH, 100, 0, 4);
     TEST_ASSERT(total == 6, "expected 6 total passages across all 6 rows, got %ld", total);
 
     PgStore *store = pg_store_open(TEST_CONNINFO);
@@ -102,7 +102,7 @@ static void test_bulk_ingest_missing_file_returns_negative_one(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    long total = bulk_ingest_tsv(TEST_CONNINFO, stopwords, wordnet, lemmatizer,
+    long total = bulk_ingest_tsv(TEST_CONNINFO, 0, stopwords, wordnet, lemmatizer,
                                   "build/does_not_exist.tsv", 100, 0, 4);
     TEST_ASSERT(total == -1, "expected -1 for a missing TSV file, got %ld", total);
 
@@ -134,9 +134,61 @@ static void test_bulk_ingest_fails_atomically_on_a_malformed_row(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    long total = bulk_ingest_tsv(TEST_CONNINFO, stopwords, wordnet, lemmatizer, TEST_TSV_PATH, 100, 0, 1);
+    long total = bulk_ingest_tsv(TEST_CONNINFO, 0, stopwords, wordnet, lemmatizer, TEST_TSV_PATH, 100, 0, 1);
     TEST_ASSERT(total == -1, "expected -1 -- a malformed row fails the whole COPY, got %ld", total);
 
+    stopword_set_free(stopwords);
+    wordnet_table_free(wordnet);
+    lemmatizer_free(lemmatizer);
+}
+
+static void test_bulk_ingest_targets_specified_corpus(void) {
+    PgStore *reset_store = open_fresh_store();
+    TEST_ASSERT(reset_store != NULL, "expected pg_store_open to succeed");
+
+    /* A prior run in this same database could have left rows in the
+     * legacy public schema (other tests in this file all target it) --
+     * truncate so "public stayed untouched" below is a real signal, not
+     * a leftover coincidence. */
+    PGresult *truncate_res = PQexec(reset_store->conn, "TRUNCATE postings, terms, passages RESTART IDENTITY CASCADE;");
+    PQclear(truncate_res);
+
+    char *schema_name = NULL;
+    int64_t corpus_id = pg_store_create_corpus(reset_store, "Bulk Ingest Test Corpus", &schema_name);
+    TEST_ASSERT(corpus_id > 0, "expected corpus creation to succeed");
+    pg_store_close(reset_store);
+
+    write_tsv("300\tisolated corpus text one\n"
+              "301\tisolated corpus text two\n");
+
+    StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
+    WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
+    Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
+    TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
+
+    long total = bulk_ingest_tsv(TEST_CONNINFO, corpus_id, stopwords, wordnet, lemmatizer, TEST_TSV_PATH, 100, 0, 4);
+    TEST_ASSERT(total == 2, "expected 2 passages ingested into the target corpus, got %ld", total);
+
+    PgStore *verify_store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(verify_store != NULL, "expected pg_store_open to succeed");
+
+    char count_sql[128];
+    snprintf(count_sql, sizeof(count_sql), "SELECT COUNT(*) FROM %s.passages;", schema_name);
+    PGresult *corpus_res = PQexec(verify_store->conn, count_sql);
+    TEST_ASSERT(PQresultStatus(corpus_res) == PGRES_TUPLES_OK, "expected corpus schema count query to succeed");
+    TEST_ASSERT_STR_EQ(PQgetvalue(corpus_res, 0, 0), "2");
+    PQclear(corpus_res);
+
+    /* The whole point of this test: the legacy public schema, which
+     * every OTHER bulk_ingest test in this file writes to, must stay
+     * completely untouched by a run that targeted a specific corpus. */
+    PGresult *public_res = PQexec(verify_store->conn, "SELECT COUNT(*) FROM public.passages;");
+    TEST_ASSERT(PQresultStatus(public_res) == PGRES_TUPLES_OK, "expected public schema count query to succeed");
+    TEST_ASSERT_STR_EQ(PQgetvalue(public_res, 0, 0), "0");
+    PQclear(public_res);
+
+    pg_store_close(verify_store);
+    free(schema_name);
     stopword_set_free(stopwords);
     wordnet_table_free(wordnet);
     lemmatizer_free(lemmatizer);
@@ -146,6 +198,7 @@ int main(void) {
     test_bulk_ingest_ingests_every_row_exactly_once();
     test_bulk_ingest_missing_file_returns_negative_one();
     test_bulk_ingest_fails_atomically_on_a_malformed_row();
+    test_bulk_ingest_targets_specified_corpus();
     remove(TEST_TSV_PATH);
     return test_summary();
 }

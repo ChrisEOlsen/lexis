@@ -122,7 +122,7 @@ static int run_bulk_ingest(const char *tsv_path) {
 
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    long passages = bulk_ingest_tsv(LEXIS_DB_CONNINFO, stopwords, wordnet, lemmatizer, tsv_path,
+    long passages = bulk_ingest_tsv(LEXIS_DB_CONNINFO, 0, stopwords, wordnet, lemmatizer, tsv_path,
                                      LEXIS_CHUNK_SIZE, LEXIS_CHUNK_OVERLAP, LEXIS_INGEST_THREADS);
     clock_gettime(CLOCK_MONOTONIC, &end);
 

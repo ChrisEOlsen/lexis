@@ -57,6 +57,7 @@ static long elapsed_ms(struct timespec start, struct timespec end) {
  * fields, which only this worker's own thread ever writes. */
 typedef struct {
     const char *conninfo;
+    int64_t corpus_id;
     int64_t *next_row;
     int64_t total_rows;
     pthread_mutex_t *range_mutex;
@@ -225,6 +226,12 @@ static void *phase2_worker_run(void *arg) {
         w->failed = 1;
         return NULL;
     }
+    if (w->corpus_id > 0 && pg_store_use_corpus(store, w->corpus_id) != 0) {
+        fprintf(stderr, "phase2_worker_run: failed to select corpus %lld\n", (long long)w->corpus_id);
+        pg_store_close(store);
+        w->failed = 1;
+        return NULL;
+    }
     /* Rebuildable index build, not live/irreplaceable data -- see
      * pg_store_disable_synchronous_commit()'s doc comment. */
     pg_store_disable_synchronous_commit(store);
@@ -268,7 +275,7 @@ static void *phase2_worker_run(void *arg) {
     return NULL;
 }
 
-long bulk_ingest_tsv(const char *conninfo, const StopwordSet *stopwords,
+long bulk_ingest_tsv(const char *conninfo, int64_t corpus_id, const StopwordSet *stopwords,
                       const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
                       const char *tsv_path, size_t chunk_size, size_t overlap,
                       int thread_count) {
@@ -278,6 +285,11 @@ long bulk_ingest_tsv(const char *conninfo, const StopwordSet *stopwords,
 
     PgStore *coordinator = pg_store_open(conninfo);
     if (coordinator == NULL) {
+        return -1;
+    }
+    if (corpus_id > 0 && pg_store_use_corpus(coordinator, corpus_id) != 0) {
+        fprintf(stderr, "bulk_ingest_tsv: failed to select corpus %lld\n", (long long)corpus_id);
+        pg_store_close(coordinator);
         return -1;
     }
 
@@ -324,6 +336,7 @@ long bulk_ingest_tsv(const char *conninfo, const StopwordSet *stopwords,
     for (int i = 0; i < thread_count; i++) {
         workers[i] = (Phase2Worker){
             .conninfo = conninfo,
+            .corpus_id = corpus_id,
             .next_row = &next_row,
             .total_rows = total_rows,
             .range_mutex = &range_mutex,

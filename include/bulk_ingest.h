@@ -32,6 +32,7 @@
 #define LEXIS_BULK_INGEST_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "lemmatizer.h"
 #include "stopwords.h"
@@ -44,6 +45,15 @@
  * double-quote characters) across `thread_count` Phase 2 worker threads,
  * each with its own connection (via `conninfo`) to the same database.
  * thread_count < 1 is treated as 1.
+ *
+ * If `corpus_id` > 0, every connection this function opens (the
+ * coordinator's and each Phase 2 worker's -- there is no single shared
+ * connection here for a corpus selection made elsewhere to carry over
+ * from) calls pg_store_use_corpus(corpus_id) immediately after connecting,
+ * so the whole run targets that corpus's schema. `corpus_id` <= 0 skips
+ * this entirely, leaving every connection on whatever schema is already
+ * the default (`public`) -- the pre-multi-corpus behavior, unchanged, for
+ * any caller that doesn't care about corpora.
  *
  * Because Phase 1 loads the entire file via a single COPY, a single
  * malformed row (e.g. missing the tab/wrong column count) fails the
@@ -62,7 +72,7 @@
  * if the file can't be COPYed in, any worker's connection fails to open
  * (a full run needs every requested thread actually working), or
  * Phase 3's finalize fails. */
-long bulk_ingest_tsv(const char *conninfo, const StopwordSet *stopwords,
+long bulk_ingest_tsv(const char *conninfo, int64_t corpus_id, const StopwordSet *stopwords,
                       const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
                       const char *tsv_path, size_t chunk_size, size_t overlap,
                       int thread_count);
