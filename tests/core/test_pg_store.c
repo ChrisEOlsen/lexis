@@ -271,6 +271,140 @@ static void test_delete_corpus_fails_for_nonexistent_id(void) {
     pg_store_close(store);
 }
 
+static void test_create_bare_schema_creates_tables_without_registry_row(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+    reset_corpora_registry(store);
+
+    PGresult *drop_res = PQexec(store->conn, "DROP SCHEMA IF EXISTS corpus_bare_test CASCADE;");
+    PQclear(drop_res);
+
+    TEST_ASSERT(pg_store_create_bare_schema(store, "corpus_bare_test") == 0,
+                "expected pg_store_create_bare_schema to succeed");
+    TEST_ASSERT(schema_has_lexis_tables(store, "corpus_bare_test"),
+                "expected documents/passages/terms/postings to exist in the bare schema");
+
+    size_t count = 999;
+    PgStoreCorpus *corpora = pg_store_list_corpora(store, &count);
+    TEST_ASSERT(count == 0, "expected a bare schema to create no registry row, got %zu", count);
+    pg_store_corpora_free(corpora, count);
+
+    PGresult *cleanup_res = PQexec(store->conn, "DROP SCHEMA corpus_bare_test CASCADE;");
+    PQclear(cleanup_res);
+    pg_store_close(store);
+}
+
+static void test_swap_corpus_schema_replaces_data_and_preserves_registry_identity(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+    reset_corpora_registry(store);
+
+    char *original_schema = NULL;
+    int64_t corpus_id = pg_store_create_corpus(store, "Swap Test Group", &original_schema);
+    TEST_ASSERT(corpus_id > 0, "expected corpus creation to succeed");
+
+    TEST_ASSERT(pg_store_use_corpus(store, corpus_id) == 0, "expected use_corpus to succeed");
+    TEST_ASSERT(pg_store_insert_document(store, "old-doc", "old content") == 0, "expected old document insert to succeed");
+
+    PGresult *drop_res = PQexec(store->conn, "DROP SCHEMA IF EXISTS corpus_swap_new CASCADE;");
+    PQclear(drop_res);
+    TEST_ASSERT(pg_store_create_bare_schema(store, "corpus_swap_new") == 0, "expected bare schema creation to succeed");
+    TEST_ASSERT(pg_store_use_schema(store, "corpus_swap_new") == 0, "expected use_schema to succeed");
+    TEST_ASSERT(pg_store_insert_document(store, "new-doc", "new content") == 0, "expected new document insert to succeed");
+
+    TEST_ASSERT(pg_store_swap_corpus_schema(store, corpus_id, "corpus_swap_new") == 0,
+                "expected pg_store_swap_corpus_schema to succeed");
+
+    /* The registry's schema_name for this corpus_id must be completely
+     * unchanged -- the swap replaces what's PHYSICALLY behind that name,
+     * not the name itself. */
+    size_t count = 0;
+    PgStoreCorpus *corpora = pg_store_list_corpora(store, &count);
+    TEST_ASSERT(count == 1, "expected exactly one corpus in the registry, got %zu", count);
+    TEST_ASSERT(corpora[0].id == corpus_id, "expected the same corpus id after swap");
+    pg_store_corpora_free(corpora, count);
+
+    TEST_ASSERT(pg_store_use_corpus(store, corpus_id) == 0, "expected use_corpus to still succeed after swap");
+    size_t doc_count = 0;
+    PgStoreDocument *docs = pg_store_get_all_documents(store, &doc_count);
+    TEST_ASSERT(doc_count == 1, "expected exactly one document after swap (the new one), got %zu", doc_count);
+    TEST_ASSERT_STR_EQ(docs[0].document_name, "new-doc");
+    TEST_ASSERT_STR_EQ(docs[0].text, "new content");
+    pg_store_documents_free(docs, doc_count);
+
+    /* corpus_swap_new was renamed away as part of the swap -- it
+     * shouldn't exist under that name anymore. */
+    TEST_ASSERT(!schema_has_lexis_tables(store, "corpus_swap_new"),
+                "expected corpus_swap_new to no longer exist under that name");
+
+    free(original_schema);
+    pg_store_close(store);
+}
+
+static void test_swap_corpus_schema_fails_for_nonexistent_corpus(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+    reset_corpora_registry(store);
+
+    PGresult *drop_res = PQexec(store->conn, "DROP SCHEMA IF EXISTS corpus_swap_orphan CASCADE;");
+    PQclear(drop_res);
+    TEST_ASSERT(pg_store_create_bare_schema(store, "corpus_swap_orphan") == 0, "expected bare schema creation to succeed");
+
+    TEST_ASSERT(pg_store_swap_corpus_schema(store, 999999, "corpus_swap_orphan") == -1,
+                "expected swap onto a nonexistent corpus id to fail");
+
+    PGresult *cleanup_res = PQexec(store->conn, "DROP SCHEMA corpus_swap_orphan CASCADE;");
+    PQclear(cleanup_res);
+    pg_store_close(store);
+}
+
+static void test_get_all_documents_returns_empty_when_none(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+    reset_corpora_registry(store);
+
+    char *schema_name = NULL;
+    int64_t corpus_id = pg_store_create_corpus(store, "Empty Docs Group", &schema_name);
+    TEST_ASSERT(corpus_id > 0, "expected corpus creation to succeed");
+    TEST_ASSERT(pg_store_use_corpus(store, corpus_id) == 0, "expected use_corpus to succeed");
+
+    size_t count = 999;
+    PgStoreDocument *docs = pg_store_get_all_documents(store, &count);
+    TEST_ASSERT(docs != NULL, "expected an empty (non-NULL) array, not a failure");
+    TEST_ASSERT(count == 0, "expected 0 documents in a fresh corpus, got %zu", count);
+
+    pg_store_documents_free(docs, count);
+    free(schema_name);
+    pg_store_close(store);
+}
+
+static void test_get_all_documents_returns_everything_in_current_schema(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+    reset_corpora_registry(store);
+
+    char *schema_name = NULL;
+    int64_t corpus_id = pg_store_create_corpus(store, "Docs Group", &schema_name);
+    TEST_ASSERT(corpus_id > 0, "expected corpus creation to succeed");
+    TEST_ASSERT(pg_store_use_corpus(store, corpus_id) == 0, "expected use_corpus to succeed");
+
+    TEST_ASSERT(pg_store_insert_document(store, "alpha", "alpha text") == 0, "expected insert to succeed");
+    TEST_ASSERT(pg_store_insert_document(store, "beta", "beta text") == 0, "expected insert to succeed");
+
+    size_t count = 0;
+    PgStoreDocument *docs = pg_store_get_all_documents(store, &count);
+    TEST_ASSERT(docs != NULL, "expected pg_store_get_all_documents to succeed");
+    TEST_ASSERT(count == 2, "expected 2 documents, got %zu", count);
+    TEST_ASSERT_STR_EQ(docs[0].document_name, "alpha");
+    TEST_ASSERT_STR_EQ(docs[0].text, "alpha text");
+    TEST_ASSERT_STR_EQ(docs[1].document_name, "beta");
+    TEST_ASSERT_STR_EQ(docs[1].text, "beta text");
+
+    pg_store_documents_free(docs, count);
+    free(schema_name);
+    pg_store_close(store);
+}
+
 static void test_insert_document_round_trip(void) {
     PgStore *store = open_fresh_store();
     TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
@@ -857,18 +991,33 @@ static void test_finalize_terms_and_postings_resolves_and_dedups(void) {
     pg_store_close(store);
 }
 
+/* Scoped to the public schema specifically -- this file's tests now
+ * create tables of the same name (postings, terms, ...) in many
+ * different corpus schemas, so an unqualified "relname = $1" match
+ * against pg_class can hit more than one row and silently break the
+ * PQntuples(res) == 1 check below. Every caller of this helper operates
+ * via open_fresh_store() (public, unconditionally), so this is the
+ * correct scope, not just a narrower one. */
 static int table_persistence_is_unlogged(PgStore *store, const char *table_name) {
     const char *params[1] = {table_name};
-    PGresult *res = PQexecParams(store->conn, "SELECT relpersistence FROM pg_class WHERE relname = $1;", 1,
-                                  NULL, params, NULL, NULL, 0);
+    PGresult *res = PQexecParams(store->conn,
+                                  "SELECT relpersistence FROM pg_class c "
+                                  "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                                  "WHERE n.nspname = 'public' AND c.relname = $1;",
+                                  1, NULL, params, NULL, NULL, 0);
     int is_unlogged = (PQntuples(res) == 1 && strcmp(PQgetvalue(res, 0, 0), "u") == 0);
     PQclear(res);
     return is_unlogged;
 }
 
 static int postings_has_pk_and_fks(PgStore *store) {
+    /* Explicitly public.postings, not a bare 'postings'::regclass search-
+     * path lookup -- same reasoning as table_persistence_is_unlogged()
+     * above; this happened to still resolve correctly via search_path,
+     * but only by coincidence (no schema named after the connecting role
+     * exists), not by construction. */
     PGresult *res = PQexec(store->conn,
-                            "SELECT count(*) FROM pg_constraint WHERE conrelid = 'postings'::regclass "
+                            "SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.postings'::regclass "
                             "AND contype IN ('p', 'f');");
     int count = atoi(PQgetvalue(res, 0, 0));
     PQclear(res);
@@ -934,6 +1083,11 @@ int main(void) {
     test_list_corpora_returns_created_corpora_in_order();
     test_delete_corpus_drops_schema_and_registry_row();
     test_delete_corpus_fails_for_nonexistent_id();
+    test_create_bare_schema_creates_tables_without_registry_row();
+    test_swap_corpus_schema_replaces_data_and_preserves_registry_identity();
+    test_swap_corpus_schema_fails_for_nonexistent_corpus();
+    test_get_all_documents_returns_empty_when_none();
+    test_get_all_documents_returns_everything_in_current_schema();
     test_insert_document_round_trip();
     test_insert_document_on_conflict_does_nothing();
     test_open_creates_store();

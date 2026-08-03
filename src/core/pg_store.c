@@ -82,6 +82,48 @@ int pg_store_ensure_corpora_registry(PgStore *store) {
     return exec_simple(store->conn, LEXIS_CORPORA_REGISTRY_SQL, "pg_store_ensure_corpora_registry");
 }
 
+/* Issues "CREATE SCHEMA <name>" plus its documents/passages/terms/
+ * postings tables -- the DDL pg_store_create_corpus() needs, and also
+ * what rebuild-on-append's temporary schema needs (see
+ * pg_store_create_bare_schema()), extracted so both share one copy of
+ * it. schema_name must be a trusted, server-generated identifier, safe
+ * to interpolate directly -- same constraint as everywhere else this
+ * pattern appears in this file. Returns 0 on success, -1 on failure. */
+static int create_lexis_tables_in_schema(PGconn *conn, const char *schema_name) {
+    char ddl[2048];
+    int written = snprintf(
+        ddl, sizeof(ddl),
+        "CREATE SCHEMA %s;"
+        "CREATE TABLE %s.documents ("
+        "    document_name TEXT PRIMARY KEY,"
+        "    text TEXT NOT NULL"
+        ");"
+        "CREATE TABLE %s.passages ("
+        "    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+        "    document_name TEXT NOT NULL,"
+        "    chunk_id INTEGER NOT NULL,"
+        "    text TEXT NOT NULL,"
+        "    token_count INTEGER NOT NULL"
+        ");"
+        "CREATE TABLE %s.terms ("
+        "    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+        "    term TEXT NOT NULL UNIQUE"
+        ");"
+        "CREATE TABLE %s.postings ("
+        "    term_id BIGINT NOT NULL REFERENCES %s.terms(id),"
+        "    passage_id BIGINT NOT NULL REFERENCES %s.passages(id),"
+        "    term_frequency INTEGER NOT NULL,"
+        "    token_count INTEGER NOT NULL,"
+        "    PRIMARY KEY (term_id, passage_id)"
+        ");",
+        schema_name, schema_name, schema_name, schema_name, schema_name, schema_name, schema_name);
+    if (written < 0 || (size_t)written >= sizeof(ddl)) {
+        fprintf(stderr, "create_lexis_tables_in_schema: schema DDL didn't fit the buffer\n");
+        return -1;
+    }
+    return exec_simple(conn, ddl, "create_lexis_tables_in_schema");
+}
+
 int64_t pg_store_create_corpus(PgStore *store, const char *display_name, char **schema_name_out) {
     if (display_name == NULL || display_name[0] == '\0' || schema_name_out == NULL) {
         return -1;
@@ -136,45 +178,7 @@ int64_t pg_store_create_corpus(PgStore *store, const char *display_name, char **
         return -1;
     }
 
-    /* schema_name is always "corpus_<id>", a server-generated identifier
-     * with no user input in it (see the registry's doc comment above), so
-     * direct interpolation into DDL here is safe by construction -- there
-     * is no untrusted text anywhere in this string. */
-    char ddl[2048];
-    int written = snprintf(
-        ddl, sizeof(ddl),
-        "CREATE SCHEMA %s;"
-        "CREATE TABLE %s.documents ("
-        "    document_name TEXT PRIMARY KEY,"
-        "    text TEXT NOT NULL"
-        ");"
-        "CREATE TABLE %s.passages ("
-        "    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
-        "    document_name TEXT NOT NULL,"
-        "    chunk_id INTEGER NOT NULL,"
-        "    text TEXT NOT NULL,"
-        "    token_count INTEGER NOT NULL"
-        ");"
-        "CREATE TABLE %s.terms ("
-        "    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
-        "    term TEXT NOT NULL UNIQUE"
-        ");"
-        "CREATE TABLE %s.postings ("
-        "    term_id BIGINT NOT NULL REFERENCES %s.terms(id),"
-        "    passage_id BIGINT NOT NULL REFERENCES %s.passages(id),"
-        "    term_frequency INTEGER NOT NULL,"
-        "    token_count INTEGER NOT NULL,"
-        "    PRIMARY KEY (term_id, passage_id)"
-        ");",
-        schema_name, schema_name, schema_name, schema_name, schema_name, schema_name, schema_name);
-    if (written < 0 || (size_t)written >= sizeof(ddl)) {
-        fprintf(stderr, "pg_store_create_corpus: schema DDL didn't fit the buffer\n");
-        free(schema_name);
-        exec_simple(store->conn, "ROLLBACK;", "pg_store_create_corpus");
-        return -1;
-    }
-
-    if (exec_simple(store->conn, ddl, "pg_store_create_corpus") != 0) {
+    if (create_lexis_tables_in_schema(store->conn, schema_name) != 0) {
         free(schema_name);
         exec_simple(store->conn, "ROLLBACK;", "pg_store_create_corpus");
         return -1;
@@ -188,29 +192,46 @@ int64_t pg_store_create_corpus(PgStore *store, const char *display_name, char **
     return id;
 }
 
-int pg_store_use_corpus(PgStore *store, int64_t corpus_id) {
+/* Shared by every operation that needs to go from a corpus_id to its
+ * schema_name (pg_store_use_corpus(), pg_store_delete_corpus(), and the
+ * schema-swap primitives below) -- one query, not three copies of it.
+ * Returns a newly malloc()'d string the caller must free(), or NULL if
+ * corpus_id doesn't exist or on a database/allocation error. */
+static char *lookup_corpus_schema_name(PGconn *conn, int64_t corpus_id) {
     char id_str[32];
     snprintf(id_str, sizeof(id_str), "%lld", (long long)corpus_id);
     const char *params[1] = {id_str};
     PGresult *res =
-        PQexecParams(store->conn, "SELECT schema_name FROM public.corpora WHERE id = $1;", 1, NULL, params, NULL, NULL, 0);
+        PQexecParams(conn, "SELECT schema_name FROM public.corpora WHERE id = $1;", 1, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1) {
-        fprintf(stderr, "pg_store_use_corpus: no corpus with id %lld\n", (long long)corpus_id);
         PQclear(res);
-        return -1;
+        return NULL;
     }
-
-    /* schema_name came back out of our own registry, itself always
-     * "corpus_<id>" (see pg_store_create_corpus()) -- never built from
-     * external input, so safe to interpolate directly the same way
-     * pg_store_create_corpus()'s DDL is. */
-    char schema_name[64];
-    snprintf(schema_name, sizeof(schema_name), "%s", PQgetvalue(res, 0, 0));
+    char *schema_name = strdup(PQgetvalue(res, 0, 0));
     PQclear(res);
+    return schema_name;
+}
 
+int pg_store_use_schema(PgStore *store, const char *schema_name) {
+    /* schema_name must be a trusted, server-generated identifier (e.g.
+     * "corpus_<id>" out of the registry, or "corpus_<id>_rebuild" from
+     * the rebuild-on-append primitives below) -- interpolated directly
+     * into a SET command, exactly like pg_store_create_corpus()'s DDL.
+     * Never call this with a string built from user input. */
     char sql[128];
     snprintf(sql, sizeof(sql), "SET search_path TO %s, public;", schema_name);
-    return exec_simple(store->conn, sql, "pg_store_use_corpus");
+    return exec_simple(store->conn, sql, "pg_store_use_schema");
+}
+
+int pg_store_use_corpus(PgStore *store, int64_t corpus_id) {
+    char *schema_name = lookup_corpus_schema_name(store->conn, corpus_id);
+    if (schema_name == NULL) {
+        fprintf(stderr, "pg_store_use_corpus: no corpus with id %lld\n", (long long)corpus_id);
+        return -1;
+    }
+    int result = pg_store_use_schema(store, schema_name);
+    free(schema_name);
+    return result;
 }
 
 PgStoreCorpus *pg_store_list_corpora(PgStore *store, size_t *count_out) {
@@ -266,17 +287,12 @@ int pg_store_delete_corpus(PgStore *store, int64_t corpus_id) {
         return -1;
     }
 
-    PGresult *res =
-        PQexecParams(store->conn, "SELECT schema_name FROM public.corpora WHERE id = $1;", 1, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1) {
+    char *schema_name = lookup_corpus_schema_name(store->conn, corpus_id);
+    if (schema_name == NULL) {
         fprintf(stderr, "pg_store_delete_corpus: no corpus with id %lld\n", (long long)corpus_id);
-        PQclear(res);
         exec_simple(store->conn, "ROLLBACK;", "pg_store_delete_corpus");
         return -1;
     }
-    char schema_name[64];
-    snprintf(schema_name, sizeof(schema_name), "%s", PQgetvalue(res, 0, 0));
-    PQclear(res);
 
     /* schema_name is our own registry's opaque, server-generated value
      * (see pg_store_create_corpus()) -- safe to interpolate directly,
@@ -284,9 +300,11 @@ int pg_store_delete_corpus(PgStore *store, int64_t corpus_id) {
     char drop_sql[128];
     snprintf(drop_sql, sizeof(drop_sql), "DROP SCHEMA %s CASCADE;", schema_name);
     if (exec_simple(store->conn, drop_sql, "pg_store_delete_corpus") != 0) {
+        free(schema_name);
         exec_simple(store->conn, "ROLLBACK;", "pg_store_delete_corpus");
         return -1;
     }
+    free(schema_name);
 
     PGresult *delete_res =
         PQexecParams(store->conn, "DELETE FROM public.corpora WHERE id = $1;", 1, NULL, params, NULL, NULL, 0);
@@ -299,6 +317,86 @@ int pg_store_delete_corpus(PgStore *store, int64_t corpus_id) {
     PQclear(delete_res);
 
     return exec_simple(store->conn, "COMMIT;", "pg_store_delete_corpus");
+}
+
+int pg_store_create_bare_schema(PgStore *store, const char *schema_name) {
+    return create_lexis_tables_in_schema(store->conn, schema_name);
+}
+
+int pg_store_swap_corpus_schema(PgStore *store, int64_t corpus_id, const char *new_schema_name) {
+    char *old_schema_name = lookup_corpus_schema_name(store->conn, corpus_id);
+    if (old_schema_name == NULL) {
+        fprintf(stderr, "pg_store_swap_corpus_schema: no corpus with id %lld\n", (long long)corpus_id);
+        return -1;
+    }
+
+    if (exec_simple(store->conn, "BEGIN;", "pg_store_swap_corpus_schema") != 0) {
+        free(old_schema_name);
+        return -1;
+    }
+
+    /* Both DDL statements, in one transaction -- either both take effect
+     * (clean swap) or neither does (old_schema_name, and therefore the
+     * corpus's live data, is completely untouched). new_schema_name and
+     * old_schema_name are both trusted, server-generated identifiers --
+     * see pg_store_use_schema()'s doc comment for the same constraint. */
+    char sql[256];
+    int written = snprintf(sql, sizeof(sql), "DROP SCHEMA %s CASCADE; ALTER SCHEMA %s RENAME TO %s;", old_schema_name,
+                            new_schema_name, old_schema_name);
+    if (written < 0 || (size_t)written >= sizeof(sql)) {
+        fprintf(stderr, "pg_store_swap_corpus_schema: swap DDL didn't fit the buffer\n");
+        free(old_schema_name);
+        exec_simple(store->conn, "ROLLBACK;", "pg_store_swap_corpus_schema");
+        return -1;
+    }
+    free(old_schema_name);
+
+    if (exec_simple(store->conn, sql, "pg_store_swap_corpus_schema") != 0) {
+        exec_simple(store->conn, "ROLLBACK;", "pg_store_swap_corpus_schema");
+        return -1;
+    }
+    return exec_simple(store->conn, "COMMIT;", "pg_store_swap_corpus_schema");
+}
+
+PgStoreDocument *pg_store_get_all_documents(PgStore *store, size_t *count_out) {
+    PGresult *res = PQexec(store->conn, "SELECT document_name, text FROM documents ORDER BY document_name;");
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        fprintf(stderr, "pg_store_get_all_documents: select failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        return NULL;
+    }
+
+    int rows = PQntuples(res);
+    PgStoreDocument *docs = malloc(sizeof(PgStoreDocument) * (size_t)(rows > 0 ? rows : 1));
+    if (docs == NULL) {
+        PQclear(res);
+        return NULL;
+    }
+
+    for (int r = 0; r < rows; r++) {
+        docs[r].document_name = strdup(PQgetvalue(res, r, 0));
+        docs[r].text = strdup(PQgetvalue(res, r, 1));
+        if (docs[r].document_name == NULL || docs[r].text == NULL) {
+            PQclear(res);
+            pg_store_documents_free(docs, (size_t)r + 1);
+            return NULL;
+        }
+    }
+    PQclear(res);
+
+    *count_out = (size_t)rows;
+    return docs;
+}
+
+void pg_store_documents_free(PgStoreDocument *docs, size_t count) {
+    if (docs == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        free(docs[i].document_name);
+        free(docs[i].text);
+    }
+    free(docs);
 }
 
 PgStore *pg_store_open(const char *conninfo) {

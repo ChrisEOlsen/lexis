@@ -82,6 +82,17 @@ int64_t pg_store_create_corpus(PgStore *store, const char *display_name, char **
  * corpus_id doesn't exist in the registry or the SET fails. */
 int pg_store_use_corpus(PgStore *store, int64_t corpus_id);
 
+/* Lower-level primitive pg_store_use_corpus() is built on: sets
+ * search_path directly from a schema_name, with no registry lookup.
+ * Needed by callers that must target a schema with no corpus_id of its
+ * own -- e.g. rebuild-on-append's temporary "corpus_<id>_rebuild" schema
+ * while it's being built, before it's swapped in (see
+ * pg_store_swap_corpus_schema()). schema_name must be a trusted,
+ * server-generated identifier, never built from user input -- same
+ * constraint as pg_store_create_corpus()'s DDL. Returns 0 on success, -1
+ * on failure. */
+int pg_store_use_schema(PgStore *store, const char *schema_name);
+
 /* One corpus as read back from the registry -- display_name is an owned
  * copy, freed via pg_store_corpora_free(). schema_name is deliberately
  * not exposed here; callers only ever need id (to pass to
@@ -118,6 +129,58 @@ void pg_store_corpora_free(PgStoreCorpus *corpora, size_t count);
  * success, -1 if corpus_id doesn't exist or any step fails (in which
  * case nothing is deleted -- the whole operation rolls back). */
 int pg_store_delete_corpus(PgStore *store, int64_t corpus_id);
+
+/* -- Rebuild-on-append primitives -- see APP_SPEC.md's "Adding documents
+ * to an existing group" for the full design: a group is rebuilt (not
+ * incrementally appended to) by combining its existing documents with
+ * new ones and re-running the fast bulk pipeline into a fresh schema,
+ * which is then swapped in for the corpus's real one. These are the
+ * pieces that make the swap possible; the orchestration itself
+ * (reading existing documents, writing a combined CSV, calling
+ * bulk_ingest_tsv(), then swapping) lives in bulk_ingest.c. -- */
+
+/* Creates a schema plus its documents/passages/terms/postings tables
+ * under an explicit `schema_name`, with NO public.corpora registry row --
+ * unlike pg_store_create_corpus(), this schema isn't a corpus of its own,
+ * it's a scratch space a rebuild ingests into before being swapped in for
+ * an existing corpus (see pg_store_swap_corpus_schema()). schema_name
+ * must be a trusted, server-generated identifier -- same constraint as
+ * pg_store_use_schema(). Returns 0 on success, -1 on failure (including
+ * if schema_name already exists). */
+int pg_store_create_bare_schema(PgStore *store, const char *schema_name);
+
+/* Atomically replaces corpus_id's underlying schema with
+ * new_schema_name's: drops the corpus's current schema (and everything
+ * in it) and renames new_schema_name to take its place, as one
+ * transaction -- either both happen (clean swap, corpus_id's
+ * schema_name in the registry never changes, only what's physically
+ * behind it) or neither does, so a failure here never leaves the
+ * corpus's existing data lost or partially replaced. Does not create or
+ * clean up new_schema_name itself -- the caller builds it first (see
+ * pg_store_create_bare_schema()) and is responsible for dropping it if
+ * this fails or is never called. Returns 0 on success, -1 if corpus_id
+ * doesn't exist or either DDL statement fails. */
+int pg_store_swap_corpus_schema(PgStore *store, int64_t corpus_id, const char *new_schema_name);
+
+/* One document as read back from the documents table -- both fields are
+ * owned copies, freed via pg_store_documents_free(). */
+typedef struct {
+    char *document_name;
+    char *text;
+} PgStoreDocument;
+
+/* Reads back every row in the currently-selected schema's documents
+ * table (see pg_store_use_corpus()/pg_store_use_schema()) -- "pull a
+ * group's existing documents back out" for a rebuild, ordered by
+ * document_name. Sets *count_out to the number of documents found.
+ * Returns a newly allocated array the caller must free via
+ * pg_store_documents_free(), or NULL (with *count_out unset) on a
+ * database or allocation error. */
+PgStoreDocument *pg_store_get_all_documents(PgStore *store, size_t *count_out);
+
+/* Frees an array returned by pg_store_get_all_documents(), including each
+ * entry's owned document_name/text. Safe to call with docs == NULL. */
+void pg_store_documents_free(PgStoreDocument *docs, size_t count);
 
 /* Closes the connection and frees the PgStore. Safe to call with
  * store == NULL. */
