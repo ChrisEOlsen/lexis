@@ -69,6 +69,19 @@ int pg_store_ensure_corpora_registry(PgStore *store);
  * untouched. */
 int64_t pg_store_create_corpus(PgStore *store, const char *display_name, char **schema_name_out);
 
+/* Scopes every subsequent query on `store`'s connection to `corpus_id`'s
+ * schema by setting `search_path` (looked up from public.corpora, so the
+ * caller only ever deals in ids/display names, never the opaque schema
+ * name itself). This is what makes every existing, unqualified query in
+ * this module and bm25.c/bulk_ingest.c actually operate on one chosen
+ * group -- none of them need to change to become corpus-aware.
+ *
+ * Stays in effect for this connection until the next pg_store_use_corpus()
+ * call or pg_store_close(); there is no "switch back to no corpus"
+ * beyond selecting a different corpus_id. Returns 0 on success, -1 if
+ * corpus_id doesn't exist in the registry or the SET fails. */
+int pg_store_use_corpus(PgStore *store, int64_t corpus_id);
+
 /* Closes the connection and frees the PgStore. Safe to call with
  * store == NULL. */
 void pg_store_close(PgStore *store);

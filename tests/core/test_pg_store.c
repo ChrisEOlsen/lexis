@@ -136,6 +136,61 @@ static void test_create_corpus_rejects_empty_display_name(void) {
     pg_store_close(store);
 }
 
+static void test_use_corpus_scopes_queries_to_chosen_corpus(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+    reset_corpora_registry(store);
+
+    char *schema_a = NULL;
+    char *schema_b = NULL;
+    int64_t corpus_a = pg_store_create_corpus(store, "Group A", &schema_a);
+    int64_t corpus_b = pg_store_create_corpus(store, "Group B", &schema_b);
+    TEST_ASSERT(corpus_a > 0 && corpus_b > 0, "expected both corpora to be created");
+
+    /* Real, unmodified pg_store_insert_passage()/pg_store_get_passage()
+     * calls -- the whole point of search_path scoping is that these need
+     * zero corpus-awareness of their own to land in the right schema. */
+    TEST_ASSERT(pg_store_use_corpus(store, corpus_a) == 0, "expected use_corpus(A) to succeed");
+    int64_t id_in_a = pg_store_insert_passage(store, "doc-a", 0, "text in A", 3);
+    TEST_ASSERT(id_in_a == 1, "expected the first passage in a fresh corpus to get id 1, got %lld",
+                (long long)id_in_a);
+
+    TEST_ASSERT(pg_store_use_corpus(store, corpus_b) == 0, "expected use_corpus(B) to succeed");
+    int64_t id_in_b = pg_store_insert_passage(store, "doc-b", 0, "text in B", 3);
+    TEST_ASSERT(id_in_b == 1,
+                "expected corpus B to have its own independent id sequence (also starting at 1), got %lld",
+                (long long)id_in_b);
+
+    /* id 1 exists in both schemas now, with different content -- proves
+     * they're genuinely separate tables, not a shared one filtered by
+     * search_path (search_path picks which table "passages" even means,
+     * it isn't a WHERE-clause-style filter). */
+    PgStorePassage *passage_in_b = pg_store_get_passage(store, 1);
+    TEST_ASSERT(passage_in_b != NULL, "expected id 1 to exist while scoped to corpus B");
+    TEST_ASSERT_STR_EQ(passage_in_b->text, "text in B");
+    pg_store_passage_free(passage_in_b);
+
+    TEST_ASSERT(pg_store_use_corpus(store, corpus_a) == 0, "expected switching back to corpus A to succeed");
+    PgStorePassage *passage_in_a = pg_store_get_passage(store, 1);
+    TEST_ASSERT(passage_in_a != NULL, "expected id 1 to exist while scoped to corpus A");
+    TEST_ASSERT_STR_EQ(passage_in_a->text, "text in A");
+    pg_store_passage_free(passage_in_a);
+
+    free(schema_a);
+    free(schema_b);
+    pg_store_close(store);
+}
+
+static void test_use_corpus_fails_for_nonexistent_id(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+    reset_corpora_registry(store);
+
+    TEST_ASSERT(pg_store_use_corpus(store, 999999) == -1, "expected use_corpus on a nonexistent id to fail");
+
+    pg_store_close(store);
+}
+
 static void test_open_creates_store(void) {
     PgStore *store = open_fresh_store();
     TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
@@ -755,6 +810,8 @@ int main(void) {
     test_create_corpus_creates_schema_and_registry_row();
     test_create_corpus_isolates_tables_between_corpora();
     test_create_corpus_rejects_empty_display_name();
+    test_use_corpus_scopes_queries_to_chosen_corpus();
+    test_use_corpus_fails_for_nonexistent_id();
     test_open_creates_store();
     test_insert_passage_returns_ids();
     test_get_or_create_term_dedups();

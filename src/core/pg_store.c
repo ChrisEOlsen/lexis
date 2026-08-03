@@ -170,6 +170,31 @@ int64_t pg_store_create_corpus(PgStore *store, const char *display_name, char **
     return id;
 }
 
+int pg_store_use_corpus(PgStore *store, int64_t corpus_id) {
+    char id_str[32];
+    snprintf(id_str, sizeof(id_str), "%lld", (long long)corpus_id);
+    const char *params[1] = {id_str};
+    PGresult *res =
+        PQexecParams(store->conn, "SELECT schema_name FROM public.corpora WHERE id = $1;", 1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1) {
+        fprintf(stderr, "pg_store_use_corpus: no corpus with id %lld\n", (long long)corpus_id);
+        PQclear(res);
+        return -1;
+    }
+
+    /* schema_name came back out of our own registry, itself always
+     * "corpus_<id>" (see pg_store_create_corpus()) -- never built from
+     * external input, so safe to interpolate directly the same way
+     * pg_store_create_corpus()'s DDL is. */
+    char schema_name[64];
+    snprintf(schema_name, sizeof(schema_name), "%s", PQgetvalue(res, 0, 0));
+    PQclear(res);
+
+    char sql[128];
+    snprintf(sql, sizeof(sql), "SET search_path TO %s, public;", schema_name);
+    return exec_simple(store->conn, sql, "pg_store_use_corpus");
+}
+
 PgStore *pg_store_open(const char *conninfo) {
     PgStore *store = malloc(sizeof(PgStore));
     if (store == NULL) {
