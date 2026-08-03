@@ -67,6 +67,12 @@ public:
     // corpusId doesn't exist or the deletion fails.
     bool deleteCorpus(qint64 corpusId);
 
+    // Lists every document's name in whichever corpus useCorpus() last
+    // scoped this connection to -- reads through that same scoped
+    // connection, doesn't take a corpus id of its own. Returns false on
+    // failure (*out left empty, not partially filled).
+    bool listDocumentNames(QVector<QString> *out);
+
 private:
     // Pulls the real Postgres error text via PQerrorMessage(m_store->conn)
     // -- PgStore's conn field is public specifically so callers can do

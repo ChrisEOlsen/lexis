@@ -17,6 +17,13 @@
 cmake_minimum_required(VERSION 3.21)
 project(lexis_app LANGUAGES C CXX)
 
+# Feeds ../app/.clangd, which points clangd at this build directory's
+# compile_commands.json for every file under app/ -- gives clangd real,
+# per-file C++/Qt-aware flags for this subtree instead of falling back
+# to the repo root's compile_flags.txt (written for the C core: -std=c11
+# and no Qt include paths, both wrong for these files).
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
@@ -93,6 +100,10 @@ qt_add_executable(lexis_app
     src/LexisEngine.cpp
     src/GroupSidebar.h
     src/GroupSidebar.cpp
+    src/GroupContentView.h
+    src/GroupContentView.cpp
+    src/IngestWorker.h
+    src/IngestWorker.cpp
 )
 target_include_directories(lexis_app PRIVATE ${PG_INCLUDE_DIR})
 target_link_libraries(lexis_app PRIVATE lexis_core Qt6::Widgets)

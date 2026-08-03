@@ -29,3 +29,4 @@ venv/
 
 # OS/editor cruft
 .DS_Store
+/.cache/

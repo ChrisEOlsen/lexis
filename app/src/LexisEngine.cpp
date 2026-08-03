@@ -95,3 +95,25 @@ bool LexisEngine::deleteCorpus(qint64 corpusId) {
     }
     return true;
 }
+
+bool LexisEngine::listDocumentNames(QVector<QString> *out) {
+    out->clear();
+    if (!isConnected()) {
+        m_lastError = QStringLiteral("Not connected to the database.");
+        return false;
+    }
+
+    size_t count = 0;
+    PgStoreDocument *docs = pg_store_get_all_documents(m_store, &count);
+    if (docs == nullptr) {
+        captureError("Failed to list documents.");
+        return false;
+    }
+
+    out->reserve(static_cast<int>(count));
+    for (size_t i = 0; i < count; i++) {
+        out->append(QString::fromUtf8(docs[i].document_name));
+    }
+    pg_store_documents_free(docs, count);
+    return true;
+}
