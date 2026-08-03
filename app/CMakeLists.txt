@@ -89,7 +89,12 @@ qt_add_executable(lexis_app
     src/main.cpp
     src/MainWindow.h
     src/MainWindow.cpp
+    src/LexisEngine.h
+    src/LexisEngine.cpp
+    src/GroupSidebar.h
+    src/GroupSidebar.cpp
 )
+target_include_directories(lexis_app PRIVATE ${PG_INCLUDE_DIR})
 target_link_libraries(lexis_app PRIVATE lexis_core Qt6::Widgets)
 
 # Needed to actually run the built binary straight out of the build
