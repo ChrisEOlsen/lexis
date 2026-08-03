@@ -46,14 +46,22 @@
  * each with its own connection (via `conninfo`) to the same database.
  * thread_count < 1 is treated as 1.
  *
- * If `corpus_id` > 0, every connection this function opens (the
- * coordinator's and each Phase 2 worker's -- there is no single shared
- * connection here for a corpus selection made elsewhere to carry over
- * from) calls pg_store_use_corpus(corpus_id) immediately after connecting,
- * so the whole run targets that corpus's schema. `corpus_id` <= 0 skips
- * this entirely, leaving every connection on whatever schema is already
- * the default (`public`) -- the pre-multi-corpus behavior, unchanged, for
- * any caller that doesn't care about corpora.
+ * If `schema_name` is non-NULL and non-empty, every connection this
+ * function opens (the coordinator's and each Phase 2 worker's -- there is
+ * no single shared connection here for a schema selection made elsewhere
+ * to carry over from) calls pg_store_use_schema(schema_name) immediately
+ * after connecting, so the whole run targets that schema. NULL/empty
+ * skips this entirely, leaving every connection on whatever schema is
+ * already the default (`public`) -- the pre-multi-corpus behavior,
+ * unchanged, for any caller that doesn't care about corpora.
+ *
+ * Takes a schema_name directly rather than a corpus_id because
+ * bulk_ingest_rebuild_corpus()'s temporary rebuild schema has no
+ * public.corpora registry row of its own to look one up from -- callers
+ * that DO have a corpus_id (i.e. everyone except that one) should look up
+ * its schema_name via pg_store_create_corpus()/pg_store_list_corpora()
+ * first. schema_name must be a trusted, server-generated identifier --
+ * same constraint as pg_store_use_schema(), which this ultimately calls.
  *
  * Because Phase 1 loads the entire file via a single COPY, a single
  * malformed row (e.g. missing the tab/wrong column count) fails the
@@ -72,9 +80,43 @@
  * if the file can't be COPYed in, any worker's connection fails to open
  * (a full run needs every requested thread actually working), or
  * Phase 3's finalize fails. */
-long bulk_ingest_tsv(const char *conninfo, int64_t corpus_id, const StopwordSet *stopwords,
+long bulk_ingest_tsv(const char *conninfo, const char *schema_name, const StopwordSet *stopwords,
                       const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
                       const char *tsv_path, size_t chunk_size, size_t overlap,
                       int thread_count);
+
+/* Rebuild-on-append: adds `new_document_names[i]`/`new_document_texts[i]`
+ * (parallel arrays, length new_document_count) to `corpus_id`'s existing
+ * documents and re-ingests the combined set from scratch, using the same
+ * fast bulk pipeline above -- see APP_SPEC.md's "Adding documents to an
+ * existing group" for the full design and why this replaces the whole
+ * corpus rather than inserting into it live (in short: the deferred-
+ * constraint/UNLOGGED machinery bulk_ingest_tsv() depends on for its
+ * speed would otherwise have to run against a corpus's already-live
+ * data, risking it for the duration of every append).
+ *
+ * A document whose name matches an existing one replaces it (the natural
+ * reading of "re-add this file"). Every existing document not replaced
+ * is carried forward unchanged, re-chunked from its original text (see
+ * pg_store_insert_document()) exactly as if the whole combined set were
+ * being ingested fresh -- chunk_size/overlap apply uniformly, so a
+ * document's chunk boundaries stay consistent with the rest of the
+ * corpus even after N rebuilds.
+ *
+ * Never mutates the corpus's existing schema in place: the combined
+ * document set is ingested into a fresh scratch schema first, and only
+ * swapped in for the corpus (pg_store_swap_corpus_schema()) once that
+ * ingest fully succeeds. A failure at any point -- CSV materialization,
+ * the ingest itself, the swap -- leaves the corpus's existing data
+ * completely untouched and cleans up the scratch schema; the corpus is
+ * never left half-rebuilt.
+ *
+ * Returns the total number of passages in the rebuilt corpus (>= 0) on
+ * success, or -1 on failure (corpus_id doesn't exist, the combined CSV
+ * couldn't be written, the ingest failed, or the swap failed). */
+long bulk_ingest_rebuild_corpus(const char *conninfo, int64_t corpus_id, const char *const *new_document_names,
+                                 const char *const *new_document_texts, size_t new_document_count,
+                                 const StopwordSet *stopwords, const WordNetTable *wordnet,
+                                 const Lemmatizer *lemmatizer, size_t chunk_size, size_t overlap, int thread_count);
 
 #endif /* LEXIS_BULK_INGEST_H */

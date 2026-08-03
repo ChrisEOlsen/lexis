@@ -59,7 +59,7 @@ static void test_bulk_ingest_ingests_every_row_exactly_once(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    long total = bulk_ingest_tsv(TEST_CONNINFO, 0, stopwords, wordnet, lemmatizer, TEST_TSV_PATH, 100, 0, 4);
+    long total = bulk_ingest_tsv(TEST_CONNINFO, NULL, stopwords, wordnet, lemmatizer, TEST_TSV_PATH, 100, 0, 4);
     TEST_ASSERT(total == 6, "expected 6 total passages across all 6 rows, got %ld", total);
 
     PgStore *store = pg_store_open(TEST_CONNINFO);
@@ -114,7 +114,7 @@ static void test_bulk_ingest_captures_one_original_document_per_multi_chunk_row(
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    long total = bulk_ingest_tsv(TEST_CONNINFO, 0, stopwords, wordnet, lemmatizer, TEST_TSV_PATH, 3, 0, 1);
+    long total = bulk_ingest_tsv(TEST_CONNINFO, NULL, stopwords, wordnet, lemmatizer, TEST_TSV_PATH, 3, 0, 1);
     TEST_ASSERT(total == 3, "expected 3 passages (9 words / chunk_size 3), got %ld", total);
 
     PgStore *store = pg_store_open(TEST_CONNINFO);
@@ -139,7 +139,7 @@ static void test_bulk_ingest_missing_file_returns_negative_one(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    long total = bulk_ingest_tsv(TEST_CONNINFO, 0, stopwords, wordnet, lemmatizer,
+    long total = bulk_ingest_tsv(TEST_CONNINFO, NULL, stopwords, wordnet, lemmatizer,
                                   "build/does_not_exist.tsv", 100, 0, 4);
     TEST_ASSERT(total == -1, "expected -1 for a missing TSV file, got %ld", total);
 
@@ -171,7 +171,7 @@ static void test_bulk_ingest_fails_atomically_on_a_malformed_row(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    long total = bulk_ingest_tsv(TEST_CONNINFO, 0, stopwords, wordnet, lemmatizer, TEST_TSV_PATH, 100, 0, 1);
+    long total = bulk_ingest_tsv(TEST_CONNINFO, NULL, stopwords, wordnet, lemmatizer, TEST_TSV_PATH, 100, 0, 1);
     TEST_ASSERT(total == -1, "expected -1 -- a malformed row fails the whole COPY, got %ld", total);
 
     stopword_set_free(stopwords);
@@ -203,7 +203,7 @@ static void test_bulk_ingest_targets_specified_corpus(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    long total = bulk_ingest_tsv(TEST_CONNINFO, corpus_id, stopwords, wordnet, lemmatizer, TEST_TSV_PATH, 100, 0, 4);
+    long total = bulk_ingest_tsv(TEST_CONNINFO, schema_name, stopwords, wordnet, lemmatizer, TEST_TSV_PATH, 100, 0, 4);
     TEST_ASSERT(total == 2, "expected 2 passages ingested into the target corpus, got %ld", total);
 
     PgStore *verify_store = pg_store_open(TEST_CONNINFO);
@@ -231,12 +231,154 @@ static void test_bulk_ingest_targets_specified_corpus(void) {
     lemmatizer_free(lemmatizer);
 }
 
+static void test_bulk_ingest_rebuild_corpus_adds_new_documents_and_preserves_existing(void) {
+    PgStore *setup_store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(setup_store != NULL, "expected pg_store_open to succeed");
+
+    char *schema_name = NULL;
+    int64_t corpus_id = pg_store_create_corpus(setup_store, "Rebuild Test Group", &schema_name);
+    TEST_ASSERT(corpus_id > 0, "expected corpus creation to succeed");
+    pg_store_close(setup_store);
+
+    write_tsv("500\tfirst document text\n501\tsecond document text\n");
+
+    StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
+    WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
+    Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
+    TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
+
+    long initial_total = bulk_ingest_tsv(TEST_CONNINFO, schema_name, stopwords, wordnet, lemmatizer, TEST_TSV_PATH,
+                                          100, 0, 1);
+    TEST_ASSERT(initial_total == 2, "expected 2 passages from the initial ingest, got %ld", initial_total);
+
+    const char *new_names[1] = {"502"};
+    const char *new_texts[1] = {"third document text"};
+    long rebuilt_total = bulk_ingest_rebuild_corpus(TEST_CONNINFO, corpus_id, new_names, new_texts, 1, stopwords,
+                                                     wordnet, lemmatizer, 100, 0, 1);
+    TEST_ASSERT(rebuilt_total == 3, "expected 3 passages after rebuild (2 existing + 1 new), got %ld", rebuilt_total);
+
+    PgStore *verify_store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(verify_store != NULL, "expected pg_store_open to succeed");
+
+    /* This corpus_id must still resolve in the registry after the
+     * rebuild, to the exact same id -- the swap replaces what's
+     * physically behind the schema name, never the registry identity
+     * itself (see pg_store_swap_corpus_schema()). Other tests in this
+     * file create their own corpora and never reset the registry between
+     * tests (unlike test_pg_store.c), so this checks for the specific
+     * corpus this test created, not the registry's total count. */
+    size_t corpus_count = 0;
+    PgStoreCorpus *corpora = pg_store_list_corpora(verify_store, &corpus_count);
+    int found = 0;
+    for (size_t i = 0; i < corpus_count; i++) {
+        if (corpora[i].id == corpus_id) {
+            found = 1;
+            break;
+        }
+    }
+    TEST_ASSERT(found, "expected corpus_id %lld to still be in the registry after rebuild", (long long)corpus_id);
+    pg_store_corpora_free(corpora, corpus_count);
+
+    TEST_ASSERT(pg_store_use_corpus(verify_store, corpus_id) == 0, "expected use_corpus to succeed after rebuild");
+
+    size_t doc_count = 0;
+    PgStoreDocument *docs = pg_store_get_all_documents(verify_store, &doc_count);
+    TEST_ASSERT(doc_count == 3, "expected 3 documents after rebuild, got %zu", doc_count);
+    TEST_ASSERT_STR_EQ(docs[0].document_name, "500");
+    TEST_ASSERT_STR_EQ(docs[1].document_name, "501");
+    TEST_ASSERT_STR_EQ(docs[2].document_name, "502");
+    TEST_ASSERT_STR_EQ(docs[2].text, "third document text");
+    pg_store_documents_free(docs, doc_count);
+
+    PGresult *passage_res = PQexec(verify_store->conn, "SELECT COUNT(*) FROM passages WHERE document_name = '502';");
+    TEST_ASSERT(PQresultStatus(passage_res) == PGRES_TUPLES_OK, "expected passage count query to succeed");
+    TEST_ASSERT_STR_EQ(PQgetvalue(passage_res, 0, 0), "1");
+    PQclear(passage_res);
+
+    pg_store_close(verify_store);
+    free(schema_name);
+    stopword_set_free(stopwords);
+    wordnet_table_free(wordnet);
+    lemmatizer_free(lemmatizer);
+}
+
+static void test_bulk_ingest_rebuild_corpus_new_document_replaces_existing_same_name(void) {
+    PgStore *setup_store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(setup_store != NULL, "expected pg_store_open to succeed");
+
+    char *schema_name = NULL;
+    int64_t corpus_id = pg_store_create_corpus(setup_store, "Replace Test Group", &schema_name);
+    TEST_ASSERT(corpus_id > 0, "expected corpus creation to succeed");
+    pg_store_close(setup_store);
+
+    write_tsv("600\told content\n");
+
+    StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
+    WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
+    Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
+    TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
+
+    long initial_total =
+        bulk_ingest_tsv(TEST_CONNINFO, schema_name, stopwords, wordnet, lemmatizer, TEST_TSV_PATH, 100, 0, 1);
+    TEST_ASSERT(initial_total == 1, "expected 1 passage from the initial ingest, got %ld", initial_total);
+
+    const char *new_names[1] = {"600"};
+    const char *new_texts[1] = {"new content"};
+    long rebuilt_total = bulk_ingest_rebuild_corpus(TEST_CONNINFO, corpus_id, new_names, new_texts, 1, stopwords,
+                                                     wordnet, lemmatizer, 100, 0, 1);
+    TEST_ASSERT(rebuilt_total == 1, "expected still exactly 1 passage (replaced, not added), got %ld", rebuilt_total);
+
+    PgStore *verify_store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(verify_store != NULL, "expected pg_store_open to succeed");
+    TEST_ASSERT(pg_store_use_corpus(verify_store, corpus_id) == 0, "expected use_corpus to succeed after rebuild");
+
+    size_t doc_count = 0;
+    PgStoreDocument *docs = pg_store_get_all_documents(verify_store, &doc_count);
+    TEST_ASSERT(doc_count == 1, "expected exactly 1 document (replaced, not duplicated), got %zu", doc_count);
+    TEST_ASSERT_STR_EQ(docs[0].document_name, "600");
+    TEST_ASSERT_STR_EQ(docs[0].text, "new content");
+    pg_store_documents_free(docs, doc_count);
+
+    const char *params[1] = {"600"};
+    PGresult *passage_res = PQexecParams(verify_store->conn, "SELECT text FROM passages WHERE document_name = $1;", 1,
+                                          NULL, params, NULL, NULL, 0);
+    TEST_ASSERT(PQntuples(passage_res) == 1, "expected exactly 1 passage for document 600");
+    TEST_ASSERT_STR_EQ(PQgetvalue(passage_res, 0, 0), "new content");
+    PQclear(passage_res);
+
+    pg_store_close(verify_store);
+    free(schema_name);
+    stopword_set_free(stopwords);
+    wordnet_table_free(wordnet);
+    lemmatizer_free(lemmatizer);
+}
+
+static void test_bulk_ingest_rebuild_corpus_fails_for_nonexistent_corpus(void) {
+    StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
+    WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
+    Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
+    TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
+
+    const char *new_names[1] = {"700"};
+    const char *new_texts[1] = {"some text"};
+    long total = bulk_ingest_rebuild_corpus(TEST_CONNINFO, 999999, new_names, new_texts, 1, stopwords, wordnet,
+                                             lemmatizer, 100, 0, 1);
+    TEST_ASSERT(total == -1, "expected rebuild on a nonexistent corpus id to fail");
+
+    stopword_set_free(stopwords);
+    wordnet_table_free(wordnet);
+    lemmatizer_free(lemmatizer);
+}
+
 int main(void) {
     test_bulk_ingest_ingests_every_row_exactly_once();
     test_bulk_ingest_captures_one_original_document_per_multi_chunk_row();
     test_bulk_ingest_missing_file_returns_negative_one();
     test_bulk_ingest_fails_atomically_on_a_malformed_row();
     test_bulk_ingest_targets_specified_corpus();
+    test_bulk_ingest_rebuild_corpus_adds_new_documents_and_preserves_existing();
+    test_bulk_ingest_rebuild_corpus_new_document_replaces_existing_same_name();
+    test_bulk_ingest_rebuild_corpus_fails_for_nonexistent_corpus();
     remove(TEST_TSV_PATH);
     return test_summary();
 }

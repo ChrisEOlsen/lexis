@@ -48,7 +48,7 @@ static long seed_document(const StopwordSet *stopwords, const WordNetTable *word
     char line[4096];
     snprintf(line, sizeof(line), "%s\t%s\n", pid, text);
     write_file(TEST_SEED_TSV_PATH, line);
-    return bulk_ingest_tsv(TEST_CONNINFO, 0, stopwords, wordnet, lemmatizer, TEST_SEED_TSV_PATH, chunk_size,
+    return bulk_ingest_tsv(TEST_CONNINFO, NULL, stopwords, wordnet, lemmatizer, TEST_SEED_TSV_PATH, chunk_size,
                             overlap, 1);
 }
 

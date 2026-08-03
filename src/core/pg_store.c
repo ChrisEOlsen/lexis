@@ -323,6 +323,12 @@ int pg_store_create_bare_schema(PgStore *store, const char *schema_name) {
     return create_lexis_tables_in_schema(store->conn, schema_name);
 }
 
+int pg_store_drop_bare_schema(PgStore *store, const char *schema_name) {
+    char sql[128];
+    snprintf(sql, sizeof(sql), "DROP SCHEMA IF EXISTS %s CASCADE;", schema_name);
+    return exec_simple(store->conn, sql, "pg_store_drop_bare_schema");
+}
+
 int pg_store_swap_corpus_schema(PgStore *store, int64_t corpus_id, const char *new_schema_name) {
     char *old_schema_name = lookup_corpus_schema_name(store->conn, corpus_id);
     if (old_schema_name == NULL) {

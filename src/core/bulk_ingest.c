@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 /* Same helper as main.c's -- duplicated rather than shared across a
  * translation-unit boundary for four lines of code. */
@@ -57,7 +58,7 @@ static long elapsed_ms(struct timespec start, struct timespec end) {
  * fields, which only this worker's own thread ever writes. */
 typedef struct {
     const char *conninfo;
-    int64_t corpus_id;
+    const char *schema_name;
     int64_t *next_row;
     int64_t total_rows;
     pthread_mutex_t *range_mutex;
@@ -235,8 +236,8 @@ static void *phase2_worker_run(void *arg) {
         w->failed = 1;
         return NULL;
     }
-    if (w->corpus_id > 0 && pg_store_use_corpus(store, w->corpus_id) != 0) {
-        fprintf(stderr, "phase2_worker_run: failed to select corpus %lld\n", (long long)w->corpus_id);
+    if (w->schema_name != NULL && w->schema_name[0] != '\0' && pg_store_use_schema(store, w->schema_name) != 0) {
+        fprintf(stderr, "phase2_worker_run: failed to select schema %s\n", w->schema_name);
         pg_store_close(store);
         w->failed = 1;
         return NULL;
@@ -284,7 +285,7 @@ static void *phase2_worker_run(void *arg) {
     return NULL;
 }
 
-long bulk_ingest_tsv(const char *conninfo, int64_t corpus_id, const StopwordSet *stopwords,
+long bulk_ingest_tsv(const char *conninfo, const char *schema_name, const StopwordSet *stopwords,
                       const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
                       const char *tsv_path, size_t chunk_size, size_t overlap,
                       int thread_count) {
@@ -296,8 +297,8 @@ long bulk_ingest_tsv(const char *conninfo, int64_t corpus_id, const StopwordSet 
     if (coordinator == NULL) {
         return -1;
     }
-    if (corpus_id > 0 && pg_store_use_corpus(coordinator, corpus_id) != 0) {
-        fprintf(stderr, "bulk_ingest_tsv: failed to select corpus %lld\n", (long long)corpus_id);
+    if (schema_name != NULL && schema_name[0] != '\0' && pg_store_use_schema(coordinator, schema_name) != 0) {
+        fprintf(stderr, "bulk_ingest_tsv: failed to select schema %s\n", schema_name);
         pg_store_close(coordinator);
         return -1;
     }
@@ -345,7 +346,7 @@ long bulk_ingest_tsv(const char *conninfo, int64_t corpus_id, const StopwordSet 
     for (int i = 0; i < thread_count; i++) {
         workers[i] = (Phase2Worker){
             .conninfo = conninfo,
-            .corpus_id = corpus_id,
+            .schema_name = schema_name,
             .next_row = &next_row,
             .total_rows = total_rows,
             .range_mutex = &range_mutex,
@@ -442,5 +443,184 @@ long bulk_ingest_tsv(const char *conninfo, int64_t corpus_id, const StopwordSet 
            elapsed_ms(prepare_start, prepare_end), elapsed_ms(phase3_start, phase3_end),
            elapsed_ms(restore_start, restore_end), (long long)total_rows, postings_written);
 
+    return total_passages;
+}
+
+/* Writes one RFC4180 CSV field -- always quoted (never conditionally, so
+ * there's no "does this field need it" branch to get wrong), with
+ * embedded double-quotes doubled per the standard escaping rule. Matches
+ * exactly what pg_store_copy_documents_raw()'s COPY ... (FORMAT csv,
+ * DELIMITER E'\t') expects on the other end. Returns 0 on success, -1 on
+ * a write error. */
+static int write_rebuild_csv_field(FILE *fp, const char *field) {
+    if (fputc('"', fp) == EOF) {
+        return -1;
+    }
+    for (const char *p = field; *p != '\0'; p++) {
+        if (*p == '"' && fputc('"', fp) == EOF) {
+            return -1;
+        }
+        if (fputc((unsigned char)*p, fp) == EOF) {
+            return -1;
+        }
+    }
+    return fputc('"', fp) == EOF ? -1 : 0;
+}
+
+static int write_rebuild_csv_row(FILE *fp, const char *document_name, const char *text) {
+    if (write_rebuild_csv_field(fp, document_name) != 0 || fputc('\t', fp) == EOF ||
+        write_rebuild_csv_field(fp, text) != 0 || fputc('\n', fp) == EOF) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Writes `existing` (a corpus's current documents) combined with
+ * new_names[0..new_count)/new_texts[0..new_count) to a fresh temp file,
+ * as the CSV bulk_ingest_tsv() expects -- the "combine old + new
+ * documents" step of rebuild-on-append. A new document whose name
+ * matches an existing one replaces it entirely (the existing copy is
+ * skipped) rather than both ending up in the file, which the
+ * documents table's document_name PRIMARY KEY would otherwise reject
+ * on the rebuilt side anyway. O(existing_count * new_count) name
+ * comparisons -- fine at this app's target scale (thousands of
+ * documents, not millions, see APP_SPEC.md).
+ *
+ * Returns a newly malloc()'d path the caller must remove() and free(),
+ * or NULL on any failure (the temp file, if created, is removed before
+ * returning). */
+static char *materialize_combined_documents_csv(const PgStoreDocument *existing, size_t existing_count,
+                                                  const char *const *new_names, const char *const *new_texts,
+                                                  size_t new_count) {
+    char path_template[] = "/tmp/lexis_rebuild_XXXXXX";
+    int fd = mkstemp(path_template);
+    if (fd == -1) {
+        fprintf(stderr, "materialize_combined_documents_csv: mkstemp failed\n");
+        return NULL;
+    }
+    FILE *fp = fdopen(fd, "wb");
+    if (fp == NULL) {
+        fprintf(stderr, "materialize_combined_documents_csv: fdopen failed\n");
+        close(fd);
+        remove(path_template);
+        return NULL;
+    }
+
+    for (size_t i = 0; i < existing_count; i++) {
+        int replaced = 0;
+        for (size_t j = 0; j < new_count; j++) {
+            if (strcmp(existing[i].document_name, new_names[j]) == 0) {
+                replaced = 1;
+                break;
+            }
+        }
+        if (replaced) {
+            continue;
+        }
+        if (write_rebuild_csv_row(fp, existing[i].document_name, existing[i].text) != 0) {
+            fclose(fp);
+            remove(path_template);
+            return NULL;
+        }
+    }
+    for (size_t j = 0; j < new_count; j++) {
+        if (write_rebuild_csv_row(fp, new_names[j], new_texts[j]) != 0) {
+            fclose(fp);
+            remove(path_template);
+            return NULL;
+        }
+    }
+
+    if (fclose(fp) != 0) {
+        remove(path_template);
+        return NULL;
+    }
+
+    char *path = strdup(path_template);
+    if (path == NULL) {
+        remove(path_template);
+        return NULL;
+    }
+    return path;
+}
+
+long bulk_ingest_rebuild_corpus(const char *conninfo, int64_t corpus_id, const char *const *new_document_names,
+                                 const char *const *new_document_texts, size_t new_document_count,
+                                 const StopwordSet *stopwords, const WordNetTable *wordnet,
+                                 const Lemmatizer *lemmatizer, size_t chunk_size, size_t overlap, int thread_count) {
+    PgStore *coordinator = pg_store_open(conninfo);
+    if (coordinator == NULL) {
+        return -1;
+    }
+    if (pg_store_use_corpus(coordinator, corpus_id) != 0) {
+        fprintf(stderr, "bulk_ingest_rebuild_corpus: failed to select corpus %lld\n", (long long)corpus_id);
+        pg_store_close(coordinator);
+        return -1;
+    }
+
+    size_t existing_count = 0;
+    PgStoreDocument *existing = pg_store_get_all_documents(coordinator, &existing_count);
+    if (existing == NULL) {
+        fprintf(stderr, "bulk_ingest_rebuild_corpus: failed to read corpus %lld's existing documents\n",
+                (long long)corpus_id);
+        pg_store_close(coordinator);
+        return -1;
+    }
+
+    char *csv_path = materialize_combined_documents_csv(existing, existing_count, new_document_names,
+                                                          new_document_texts, new_document_count);
+    pg_store_documents_free(existing, existing_count);
+    if (csv_path == NULL) {
+        fprintf(stderr, "bulk_ingest_rebuild_corpus: failed to write the combined document CSV\n");
+        pg_store_close(coordinator);
+        return -1;
+    }
+
+    char temp_schema[64];
+    snprintf(temp_schema, sizeof(temp_schema), "corpus_%lld_rebuild", (long long)corpus_id);
+
+    /* Defensive drop before create: a previous rebuild attempt that
+     * crashed between here and the swap below would leave this schema
+     * name occupied, and CREATE SCHEMA has no IF NOT EXISTS -- clearing
+     * it first matches this pipeline's existing "rebuildable, not
+     * crash-safe mid-run" philosophy rather than failing on the
+     * collision. */
+    if (pg_store_drop_bare_schema(coordinator, temp_schema) != 0 ||
+        pg_store_create_bare_schema(coordinator, temp_schema) != 0) {
+        fprintf(stderr, "bulk_ingest_rebuild_corpus: failed to prepare rebuild schema %s\n", temp_schema);
+        remove(csv_path);
+        free(csv_path);
+        pg_store_close(coordinator);
+        return -1;
+    }
+
+    /* The actual ingest runs through the exact same fast pipeline as any
+     * fresh corpus -- targeting temp_schema, not corpus_id's real schema,
+     * so corpus_id's live data is never touched by this step no matter
+     * what happens here. */
+    long total_passages = bulk_ingest_tsv(conninfo, temp_schema, stopwords, wordnet, lemmatizer, csv_path, chunk_size,
+                                           overlap, thread_count);
+    remove(csv_path);
+    free(csv_path);
+
+    if (total_passages < 0) {
+        fprintf(stderr,
+                "bulk_ingest_rebuild_corpus: ingest into the rebuild schema failed, corpus %lld left untouched\n",
+                (long long)corpus_id);
+        pg_store_drop_bare_schema(coordinator, temp_schema);
+        pg_store_close(coordinator);
+        return -1;
+    }
+
+    if (pg_store_swap_corpus_schema(coordinator, corpus_id, temp_schema) != 0) {
+        fprintf(stderr,
+                "bulk_ingest_rebuild_corpus: schema swap failed -- corpus %lld left untouched, rebuild "
+                "schema %s left in place for inspection rather than silently discarded\n",
+                (long long)corpus_id, temp_schema);
+        pg_store_close(coordinator);
+        return -1;
+    }
+
+    pg_store_close(coordinator);
     return total_passages;
 }

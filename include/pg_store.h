@@ -149,6 +149,15 @@ int pg_store_delete_corpus(PgStore *store, int64_t corpus_id);
  * if schema_name already exists). */
 int pg_store_create_bare_schema(PgStore *store, const char *schema_name);
 
+/* Drops schema_name (IF EXISTS -- not an error if it isn't there) and
+ * everything in it. Companion to pg_store_create_bare_schema(): cleans
+ * up a rebuild's scratch schema on failure, and defensively clears a
+ * leftover from a rebuild that crashed on a *previous* attempt before
+ * creating a fresh one under the same name. schema_name must be a
+ * trusted, server-generated identifier -- same constraint as
+ * pg_store_use_schema(). Returns 0 on success, -1 on failure. */
+int pg_store_drop_bare_schema(PgStore *store, const char *schema_name);
+
 /* Atomically replaces corpus_id's underlying schema with
  * new_schema_name's: drops the corpus's current schema (and everything
  * in it) and renames new_schema_name to take its place, as one
