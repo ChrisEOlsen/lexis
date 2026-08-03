@@ -4,6 +4,7 @@
 *.out
 /build/
 /lexis
+/app/build/
 
 # Generated index (rebuilt from data/corpus via ingest)
 /data/index/*
