@@ -191,6 +191,81 @@ static void test_use_corpus_fails_for_nonexistent_id(void) {
     pg_store_close(store);
 }
 
+static void test_list_corpora_returns_empty_when_none(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+    reset_corpora_registry(store);
+
+    size_t count = 999;
+    PgStoreCorpus *corpora = pg_store_list_corpora(store, &count);
+    TEST_ASSERT(corpora != NULL, "expected an empty (non-NULL) array, not a failure");
+    TEST_ASSERT(count == 0, "expected 0 corpora on a fresh registry, got %zu", count);
+
+    pg_store_corpora_free(corpora, count);
+    pg_store_close(store);
+}
+
+static void test_list_corpora_returns_created_corpora_in_order(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+    reset_corpora_registry(store);
+
+    char *schema_a = NULL;
+    char *schema_b = NULL;
+    int64_t corpus_a = pg_store_create_corpus(store, "Group A", &schema_a);
+    int64_t corpus_b = pg_store_create_corpus(store, "Group B", &schema_b);
+    TEST_ASSERT(corpus_a > 0 && corpus_b > 0, "expected both corpora to be created");
+
+    size_t count = 0;
+    PgStoreCorpus *corpora = pg_store_list_corpora(store, &count);
+    TEST_ASSERT(corpora != NULL, "expected pg_store_list_corpora to succeed");
+    TEST_ASSERT(count == 2, "expected 2 corpora, got %zu", count);
+    TEST_ASSERT(corpora[0].id == corpus_a, "expected corpus A first (creation order)");
+    TEST_ASSERT_STR_EQ(corpora[0].display_name, "Group A");
+    TEST_ASSERT(corpora[1].id == corpus_b, "expected corpus B second (creation order)");
+    TEST_ASSERT_STR_EQ(corpora[1].display_name, "Group B");
+
+    pg_store_corpora_free(corpora, count);
+    free(schema_a);
+    free(schema_b);
+    pg_store_close(store);
+}
+
+static void test_delete_corpus_drops_schema_and_registry_row(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+    reset_corpora_registry(store);
+
+    char *schema_name = NULL;
+    int64_t corpus_id = pg_store_create_corpus(store, "Doomed Group", &schema_name);
+    TEST_ASSERT(corpus_id > 0, "expected corpus creation to succeed");
+    TEST_ASSERT(schema_has_lexis_tables(store, schema_name), "expected the schema to exist before deletion");
+
+    TEST_ASSERT(pg_store_delete_corpus(store, corpus_id) == 0, "expected pg_store_delete_corpus to succeed");
+
+    TEST_ASSERT(!schema_has_lexis_tables(store, schema_name), "expected the schema to be gone after deletion");
+
+    size_t count = 999;
+    PgStoreCorpus *corpora = pg_store_list_corpora(store, &count);
+    TEST_ASSERT(count == 0, "expected the deleted corpus to be gone from the registry, got %zu remaining", count);
+    pg_store_corpora_free(corpora, count);
+
+    TEST_ASSERT(pg_store_use_corpus(store, corpus_id) == -1, "expected use_corpus on a deleted id to fail");
+
+    free(schema_name);
+    pg_store_close(store);
+}
+
+static void test_delete_corpus_fails_for_nonexistent_id(void) {
+    PgStore *store = pg_store_open(TEST_CONNINFO);
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+    reset_corpora_registry(store);
+
+    TEST_ASSERT(pg_store_delete_corpus(store, 999999) == -1, "expected deleting a nonexistent id to fail");
+
+    pg_store_close(store);
+}
+
 static void test_open_creates_store(void) {
     PgStore *store = open_fresh_store();
     TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
@@ -812,6 +887,10 @@ int main(void) {
     test_create_corpus_rejects_empty_display_name();
     test_use_corpus_scopes_queries_to_chosen_corpus();
     test_use_corpus_fails_for_nonexistent_id();
+    test_list_corpora_returns_empty_when_none();
+    test_list_corpora_returns_created_corpora_in_order();
+    test_delete_corpus_drops_schema_and_registry_row();
+    test_delete_corpus_fails_for_nonexistent_id();
     test_open_creates_store();
     test_insert_passage_returns_ids();
     test_get_or_create_term_dedups();

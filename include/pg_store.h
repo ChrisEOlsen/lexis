@@ -82,6 +82,43 @@ int64_t pg_store_create_corpus(PgStore *store, const char *display_name, char **
  * corpus_id doesn't exist in the registry or the SET fails. */
 int pg_store_use_corpus(PgStore *store, int64_t corpus_id);
 
+/* One corpus as read back from the registry -- display_name is an owned
+ * copy, freed via pg_store_corpora_free(). schema_name is deliberately
+ * not exposed here; callers only ever need id (to pass to
+ * pg_store_use_corpus()/pg_store_delete_corpus()) and display_name (to
+ * show the user). */
+typedef struct {
+    int64_t id;
+    char *display_name;
+} PgStoreCorpus;
+
+/* Lists every registered corpus, oldest first (ORDER BY id). Creates the
+ * registry first if it doesn't exist yet (see
+ * pg_store_ensure_corpora_registry()), so this returns an empty array,
+ * not an error, on a database where no corpus has ever been created.
+ * Sets *count_out to the number of corpora found. Returns a newly
+ * allocated array the caller must free via pg_store_corpora_free(), or
+ * NULL (with *count_out unset) on a database or allocation error. */
+PgStoreCorpus *pg_store_list_corpora(PgStore *store, size_t *count_out);
+
+/* Frees an array returned by pg_store_list_corpora(), including each
+ * entry's owned display_name. Safe to call with corpora == NULL. */
+void pg_store_corpora_free(PgStoreCorpus *corpora, size_t count);
+
+/* Permanently deletes a corpus: drops its schema (DROP SCHEMA ... CASCADE
+ * -- removes passages/terms/postings and every row in them, atomically
+ * and near-instantly, see APP_SPEC.md on why this beats a row-by-row
+ * DELETE) and removes its row from public.corpora, as one transaction.
+ * Does not check whether `corpus_id` is the connection's currently
+ * active corpus (via pg_store_use_corpus()) -- deleting the active
+ * corpus leaves search_path pointing at a schema that no longer exists;
+ * the caller is responsible for not doing that, or for calling
+ * pg_store_use_corpus() again with a different corpus afterward before
+ * issuing any further passages/terms/postings query. Returns 0 on
+ * success, -1 if corpus_id doesn't exist or any step fails (in which
+ * case nothing is deleted -- the whole operation rolls back). */
+int pg_store_delete_corpus(PgStore *store, int64_t corpus_id);
+
 /* Closes the connection and frees the PgStore. Safe to call with
  * store == NULL. */
 void pg_store_close(PgStore *store);

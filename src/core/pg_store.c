@@ -195,6 +195,94 @@ int pg_store_use_corpus(PgStore *store, int64_t corpus_id) {
     return exec_simple(store->conn, sql, "pg_store_use_corpus");
 }
 
+PgStoreCorpus *pg_store_list_corpora(PgStore *store, size_t *count_out) {
+    if (pg_store_ensure_corpora_registry(store) != 0) {
+        return NULL;
+    }
+
+    PGresult *res = PQexec(store->conn, "SELECT id, display_name FROM public.corpora ORDER BY id;");
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        fprintf(stderr, "pg_store_list_corpora: select failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        return NULL;
+    }
+
+    int rows = PQntuples(res);
+    PgStoreCorpus *corpora = malloc(sizeof(PgStoreCorpus) * (size_t)(rows > 0 ? rows : 1));
+    if (corpora == NULL) {
+        PQclear(res);
+        return NULL;
+    }
+
+    for (int r = 0; r < rows; r++) {
+        corpora[r].id = strtoll(PQgetvalue(res, r, 0), NULL, 10);
+        corpora[r].display_name = strdup(PQgetvalue(res, r, 1));
+        if (corpora[r].display_name == NULL) {
+            PQclear(res);
+            pg_store_corpora_free(corpora, (size_t)r + 1);
+            return NULL;
+        }
+    }
+    PQclear(res);
+
+    *count_out = (size_t)rows;
+    return corpora;
+}
+
+void pg_store_corpora_free(PgStoreCorpus *corpora, size_t count) {
+    if (corpora == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        free(corpora[i].display_name);
+    }
+    free(corpora);
+}
+
+int pg_store_delete_corpus(PgStore *store, int64_t corpus_id) {
+    char id_str[32];
+    snprintf(id_str, sizeof(id_str), "%lld", (long long)corpus_id);
+    const char *params[1] = {id_str};
+
+    if (exec_simple(store->conn, "BEGIN;", "pg_store_delete_corpus") != 0) {
+        return -1;
+    }
+
+    PGresult *res =
+        PQexecParams(store->conn, "SELECT schema_name FROM public.corpora WHERE id = $1;", 1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1) {
+        fprintf(stderr, "pg_store_delete_corpus: no corpus with id %lld\n", (long long)corpus_id);
+        PQclear(res);
+        exec_simple(store->conn, "ROLLBACK;", "pg_store_delete_corpus");
+        return -1;
+    }
+    char schema_name[64];
+    snprintf(schema_name, sizeof(schema_name), "%s", PQgetvalue(res, 0, 0));
+    PQclear(res);
+
+    /* schema_name is our own registry's opaque, server-generated value
+     * (see pg_store_create_corpus()) -- safe to interpolate directly,
+     * same as everywhere else this pattern appears in this file. */
+    char drop_sql[128];
+    snprintf(drop_sql, sizeof(drop_sql), "DROP SCHEMA %s CASCADE;", schema_name);
+    if (exec_simple(store->conn, drop_sql, "pg_store_delete_corpus") != 0) {
+        exec_simple(store->conn, "ROLLBACK;", "pg_store_delete_corpus");
+        return -1;
+    }
+
+    PGresult *delete_res =
+        PQexecParams(store->conn, "DELETE FROM public.corpora WHERE id = $1;", 1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(delete_res) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "pg_store_delete_corpus: registry row delete failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(delete_res);
+        exec_simple(store->conn, "ROLLBACK;", "pg_store_delete_corpus");
+        return -1;
+    }
+    PQclear(delete_res);
+
+    return exec_simple(store->conn, "COMMIT;", "pg_store_delete_corpus");
+}
+
 PgStore *pg_store_open(const char *conninfo) {
     PgStore *store = malloc(sizeof(PgStore));
     if (store == NULL) {
