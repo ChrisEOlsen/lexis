@@ -39,6 +39,19 @@ set(CMAKE_PREFIX_PATH "/opt/homebrew/opt/qtbase" ${CMAKE_PREFIX_PATH})
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
 qt_standard_project_setup()
 
+# Format-extraction adapters (see ../APP_SPEC.md's "Document ingestion"
+# section): poppler-cpp for PDF, pugixml + libzip for an in-house DOCX
+# extractor, tesseract (+ leptonica, its image-loading dependency) for
+# OCR. All four ship real pkg-config files, unlike postgresql@18/
+# llama.cpp/ggml above -- PkgConfig::<name> IMPORTED targets carry their
+# own include/link flags, no manual path-guessing needed for these.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(POPPLER_CPP REQUIRED IMPORTED_TARGET poppler-cpp)
+pkg_check_modules(PUGIXML REQUIRED IMPORTED_TARGET pugixml)
+pkg_check_modules(TESSERACT REQUIRED IMPORTED_TARGET tesseract)
+pkg_check_modules(LEPTONICA REQUIRED IMPORTED_TARGET lept)
+pkg_check_modules(LIBZIP REQUIRED IMPORTED_TARGET libzip)
+
 set(LEXIS_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 # Mirrors the top-level Makefile's CORE_SRCS exactly -- see this file's
@@ -85,6 +98,13 @@ execute_process(COMMAND ${PG_CONFIG} --libdir OUTPUT_VARIABLE PG_LIB_DIR OUTPUT_
 set(LLAMA_CPP_DIR /opt/homebrew/Cellar/llama.cpp/10180)
 set(GGML_DIR /opt/homebrew/Cellar/ggml/0.18.0)
 
+# tesseract's language data (tessdata) lives under its own Cellar
+# version path, not a stable /opt/homebrew/share/ location -- resolved
+# via `brew --prefix` rather than hardcoding the version number, same
+# reasoning as PG_CONFIG's resolution above.
+execute_process(COMMAND brew --prefix tesseract OUTPUT_VARIABLE TESSERACT_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE)
+set(LEXIS_TESSDATA_PREFIX "${TESSERACT_PREFIX}/share/tessdata")
+
 target_include_directories(lexis_core PRIVATE
     ${PG_INCLUDE_DIR}
     ${LLAMA_CPP_DIR}/include
@@ -105,9 +125,17 @@ qt_add_executable(lexis_app
     src/GroupContentView.cpp
     src/IngestWorker.h
     src/IngestWorker.cpp
+    src/DocxExtractor.h
+    src/DocxExtractor.cpp
+    src/PdfExtractor.h
+    src/PdfExtractor.cpp
+    src/OcrExtractor.h
+    src/OcrExtractor.cpp
 )
 target_include_directories(lexis_app PRIVATE ${PG_INCLUDE_DIR})
-target_link_libraries(lexis_app PRIVATE lexis_core Qt6::Widgets)
+target_compile_definitions(lexis_app PRIVATE LEXIS_TESSDATA_PREFIX="${LEXIS_TESSDATA_PREFIX}")
+target_link_libraries(lexis_app PRIVATE lexis_core Qt6::Widgets
+    PkgConfig::POPPLER_CPP PkgConfig::PUGIXML PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBZIP)
 
 # Needed to actually run the built binary straight out of the build
 # directory during development (no install step) -- lexis_core's link

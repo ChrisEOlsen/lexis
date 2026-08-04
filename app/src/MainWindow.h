@@ -32,7 +32,8 @@ public:
 private slots:
     void onGroupSelected(qint64 corpusId);
     void onFilesDropped(QStringList localPaths);
-    void onIngestFinished(bool ok, qint64 totalPassages);
+    void onIngestFinished(bool ok, qint64 totalPassages, QStringList skipped, QStringList malformed,
+                           QStringList noTextFound);
 
 private:
     std::unique_ptr<LexisEngine> m_engine;

@@ -1,7 +1,14 @@
-// Runs bulk_ingest_rebuild_corpus() on a background thread -- that call
-// is blocking and potentially slow (a real rebuild re-ingests a whole
-// group's documents, see ../../APP_SPEC.md), so it can't run on the UI
-// thread without freezing it. Opens its own database connections
+// Runs the full "extract each dropped file's text, then
+// bulk_ingest_rebuild_corpus()" sequence on a background thread. Both
+// halves belong here, not just the database rebuild -- format
+// extraction (especially OCR, which is inherently slow, see
+// OcrExtractor.h) is just as capable of freezing the UI as the database
+// call is, so neither can run on the UI thread. Dispatches each dropped
+// file to csv_parse_file()/extractDocxText()/extractPdfText()/
+// extractTextFromImage() by extension -- see ../../APP_SPEC.md's
+// "Document ingestion" section for the per-format contract.
+//
+// bulk_ingest_rebuild_corpus() opens its own database connections
 // internally (see bulk_ingest.c) -- doesn't touch LexisEngine's
 // connection at all, so there's no cross-thread PgStore/PGconn sharing
 // to worry about.
@@ -15,10 +22,9 @@
 #ifndef LEXIS_APP_INGESTWORKER_H
 #define LEXIS_APP_INGESTWORKER_H
 
-#include <QPair>
 #include <QString>
+#include <QStringList>
 #include <QThread>
-#include <QVector>
 
 extern "C" {
 #include "lemmatizer.h"
@@ -30,16 +36,18 @@ class IngestWorker : public QThread {
     Q_OBJECT
 
 public:
-    IngestWorker(QString conninfo, qint64 corpusId, QVector<QPair<QString, QString>> newDocuments,
-                 const StopwordSet *stopwords, const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
-                 QObject *parent = nullptr);
+    IngestWorker(QString conninfo, qint64 corpusId, QStringList filePaths, const StopwordSet *stopwords,
+                 const WordNetTable *wordnet, const Lemmatizer *lemmatizer, QObject *parent = nullptr);
 
 signals:
     // Named ingestFinished, not finished -- QThread already has its own
     // finished() signal (no args, emitted when run() returns); reusing
     // that name here would shadow it. totalPassages is meaningless when
-    // ok is false.
-    void ingestFinished(bool ok, qint64 totalPassages);
+    // ok is false. skipped/malformed/noTextFound categorize every input
+    // file that didn't turn into a document -- see run()'s own comment
+    // for what lands in which list.
+    void ingestFinished(bool ok, qint64 totalPassages, QStringList skipped, QStringList malformed,
+                         QStringList noTextFound);
 
 protected:
     void run() override;
@@ -47,7 +55,7 @@ protected:
 private:
     QString m_conninfo;
     qint64 m_corpusId;
-    QVector<QPair<QString, QString>> m_newDocuments;
+    QStringList m_filePaths;
     const StopwordSet *m_stopwords;
     const WordNetTable *m_wordnet;
     const Lemmatizer *m_lemmatizer;

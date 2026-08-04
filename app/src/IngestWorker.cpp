@@ -1,17 +1,106 @@
 #include "IngestWorker.h"
+#include "DocxExtractor.h"
+#include "OcrExtractor.h"
+#include "PdfExtractor.h"
 
 extern "C" {
 #include "bulk_ingest.h"
+#include "csv_parse.h"
 }
 
-IngestWorker::IngestWorker(QString conninfo, qint64 corpusId, QVector<QPair<QString, QString>> newDocuments,
-                            const StopwordSet *stopwords, const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
-                            QObject *parent)
-    : QThread(parent), m_conninfo(std::move(conninfo)), m_corpusId(corpusId),
-      m_newDocuments(std::move(newDocuments)), m_stopwords(stopwords), m_wordnet(wordnet), m_lemmatizer(lemmatizer) {
+#include <QFile>
+#include <QFileInfo>
+#include <QTextStream>
+
+IngestWorker::IngestWorker(QString conninfo, qint64 corpusId, QStringList filePaths, const StopwordSet *stopwords,
+                            const WordNetTable *wordnet, const Lemmatizer *lemmatizer, QObject *parent)
+    : QThread(parent), m_conninfo(std::move(conninfo)), m_corpusId(corpusId), m_filePaths(std::move(filePaths)),
+      m_stopwords(stopwords), m_wordnet(wordnet), m_lemmatizer(lemmatizer) {
 }
 
 void IngestWorker::run() {
+    QVector<QPair<QString, QString>> newDocuments;
+    QStringList skipped;
+    QStringList malformed;
+    QStringList noTextFound;
+
+    for (const QString &path : m_filePaths) {
+        QFileInfo info(path);
+        QString suffix = info.suffix().toLower();
+
+        if (suffix == QStringLiteral("txt")) {
+            QFile file(path);
+            if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                skipped.append(info.fileName());
+                continue;
+            }
+            QTextStream stream(&file);
+            newDocuments.append(qMakePair(info.fileName(), stream.readAll()));
+        } else if (suffix == QStringLiteral("csv")) {
+            // One CSV file can produce many documents -- one per data
+            // row (see APP_SPEC.md's "CSV" section: v1's default
+            // document mapping is one row = one document, every column
+            // concatenated). csv_parse_file() fails the WHOLE file on
+            // any malformed row rather than a partial parse.
+            TokenList *rows = csv_parse_file(path.toUtf8().constData());
+            if (rows == nullptr) {
+                malformed.append(info.fileName());
+                continue;
+            }
+            for (size_t i = 0; i < rows->count; i++) {
+                QString rowName = QStringLiteral("%1#row%2").arg(info.fileName()).arg(i + 1);
+                newDocuments.append(qMakePair(rowName, QString::fromUtf8(rows->terms[i])));
+            }
+            token_list_free(rows);
+        } else if (suffix == QStringLiteral("docx")) {
+            QString error;
+            QString text = extractDocxText(path, &error);
+            if (text.isEmpty()) {
+                malformed.append(info.fileName());
+                continue;
+            }
+            newDocuments.append(qMakePair(info.fileName(), text));
+        } else if (suffix == QStringLiteral("pdf")) {
+            QString error;
+            QString text = extractPdfText(path, &error);
+            if (!error.isEmpty()) {
+                malformed.append(info.fileName());
+                continue;
+            }
+            if (text.isEmpty()) {
+                // No text layer at all -- almost certainly a scanned
+                // PDF. Rendering pages and OCRing them isn't
+                // implemented yet (see APP_SPEC.md's "Images and
+                // scanned PDFs" section) -- reported distinctly so it
+                // isn't confused with a genuine parse failure.
+                noTextFound.append(info.fileName());
+                continue;
+            }
+            newDocuments.append(qMakePair(info.fileName(), text));
+        } else if (suffix == QStringLiteral("png") || suffix == QStringLiteral("jpg") ||
+                   suffix == QStringLiteral("jpeg") || suffix == QStringLiteral("tiff") ||
+                   suffix == QStringLiteral("tif") || suffix == QStringLiteral("bmp")) {
+            QString error;
+            QString text = extractTextFromImage(path, &error);
+            if (!error.isEmpty()) {
+                malformed.append(info.fileName());
+                continue;
+            }
+            if (text.isEmpty()) {
+                noTextFound.append(info.fileName());
+                continue;
+            }
+            newDocuments.append(qMakePair(info.fileName(), text));
+        } else {
+            skipped.append(info.fileName());
+        }
+    }
+
+    if (newDocuments.isEmpty()) {
+        emit ingestFinished(true, 0, skipped, malformed, noTextFound);
+        return;
+    }
+
     // Mirrors main.c's LEXIS_CHUNK_SIZE/LEXIS_CHUNK_OVERLAP/
     // LEXIS_INGEST_THREADS exactly -- no config UI for these yet, and
     // matching the CLI's own ingest behavior matters more right now
@@ -25,9 +114,9 @@ void IngestWorker::run() {
     // into for the duration of this call.
     QVector<QByteArray> nameBytes;
     QVector<QByteArray> textBytes;
-    nameBytes.reserve(m_newDocuments.size());
-    textBytes.reserve(m_newDocuments.size());
-    for (const auto &doc : m_newDocuments) {
+    nameBytes.reserve(newDocuments.size());
+    textBytes.reserve(newDocuments.size());
+    for (const auto &doc : newDocuments) {
         nameBytes.append(doc.first.toUtf8());
         textBytes.append(doc.second.toUtf8());
     }
@@ -45,5 +134,5 @@ void IngestWorker::run() {
                                              texts.constData(), static_cast<size_t>(names.size()), m_stopwords,
                                              m_wordnet, m_lemmatizer, kChunkSize, kChunkOverlap, kThreadCount);
 
-    emit ingestFinished(total >= 0, total >= 0 ? static_cast<qint64>(total) : 0);
+    emit ingestFinished(total >= 0, total >= 0 ? static_cast<qint64>(total) : 0, skipped, malformed, noTextFound);
 }

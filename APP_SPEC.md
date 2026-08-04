@@ -3,9 +3,12 @@
 Design for turning LEXIS from a single-corpus CLI tool into a Qt/C++
 desktop application supporting multiple independent document collections
 ("groups") and multi-format ingestion (PDF, DOCX, images/scans, CSV, TXT).
-This is a target-state design document, not a record of what's built --
-see `CURRENT_STATE.md` for what actually exists today (single-corpus,
-TSV-only, CLI-only). Nothing described here has been implemented yet.
+This started as a target-state design document; the multi-corpus backend,
+the Qt app itself, and all four format-extraction adapters described
+below are now built and verified (see git history on the
+`qt-ui-multicorpus` branch) -- what remains unbuilt is called out
+explicitly in "Open items". `CURRENT_STATE.md` still describes only the
+CLI/backend, not the Qt app.
 
 Context/license: LEXIS is a non-commercial, open-source project aimed at
 privacy-conscious users (local-only search and generation, no external API
@@ -138,10 +141,10 @@ unchanged. All new format-support work is a thin adapter layer upstream of
 | Format | Approach |
 |---|---|
 | TXT | `ingest_read_file()` -- already exists, no new work. |
-| CSV | New in-house, strict RFC 4180 parser. |
-| DOCX | New in-house extractor (ZIP + XML). |
-| PDF (text layer) | Qt's `QtPdf` module. |
-| PDF (scanned) / images | Tesseract OCR. |
+| CSV | In-house, strict RFC 4180 parser (`src/core/csv_parse.c`). |
+| DOCX | In-house extractor (`app/src/DocxExtractor.cpp`, pugixml + libzip). |
+| PDF (text layer) | `poppler-cpp` (`app/src/PdfExtractor.cpp`) -- see below for why not `QtPdf`. |
+| PDF (scanned) / images | Tesseract OCR (`app/src/OcrExtractor.cpp`) -- image files done, scanned-PDF page-render fallback not yet wired up. |
 
 **CSV.** Real corporate CSV exports routinely contain quoted fields with
 embedded commas, newlines, or escaped quotes -- the naive delimiter-split
@@ -159,70 +162,108 @@ rest as structured metadata is a real future enhancement, deferred --
 the current `passages` schema has no place to put structured per-column
 metadata even if it were extracted.
 
-**DOCX.** A DOCX file is a ZIP archive containing `word/document.xml`,
-whose `<w:t>` elements hold the actual text runs. New in-house extractor:
-a permissively-licensed zip-read library plus a permissively-licensed XML
-parser, pulling text runs out of that one file. Considered and rejected:
-DocWire SDK (the current name for what was pitched as "DocToText") --
-technically capable (nearly 100 formats, active project), but GPL-2.0-only
-or paid-commercial licensed, and confirmed to require a heavy build
-(vcpkg, C++20, an autotools bootstrap chain for its own third-party
-dependencies, wrapping other libraries like `wv2` internally for legacy
-Word parsing). Disproportionate build weight and contributor friction for
-a narrow "DOCX to plain text" need, even with GPL itself no longer a
-blocker for this project.
+**DOCX.** A DOCX file is a ZIP archive containing `word/document.xml`
+(plus optional `word/header*.xml`/`word/footer*.xml`/`word/footnotes.xml`/
+`word/endnotes.xml`), whose `<w:t>` elements hold the actual text runs.
+In-house extractor built on `pugixml` (XML parsing, MIT) and `libzip`
+(zip reading, BSD) -- both real Homebrew formulas, no exotic build chain.
+Walks `<w:p>` paragraphs and their `<w:t>` descendants via XPath matched
+on `local-name()` (namespace-prefix-independent), joining paragraphs with
+`\n`. `<w:delText>` (tracked-changes deletions) is a different element
+name than `<w:t>` and is excluded automatically as a consequence, not via
+special-case logic; `<w:ins>` (tracked-changes insertions) wraps ordinary
+`<w:t>` content and is included, correctly, the same way. Headers/
+footers/footnotes/endnotes are discovered by enumerating the archive's
+entries (a document can have zero to several header/footer variants), not
+guessed by filename. Verified against a fixture exercising exactly these
+cases (multi-run paragraphs, a tracked deletion that must be excluded, a
+tracked insertion that must survive, a table, a header part).
 
-**PDF, text layer.** Qt's own `QtPdf` module: `QPdfDocument::getAllText(page)`
-looped over every page, concatenated. Confirmed real, current API (Qt
-6.8 docs). Chosen over `poppler-cpp` (more mature, purpose-built for
-extraction, but a separate dependency with its own build chain --
-freetype, fontconfig, etc.) specifically because `QtPdf` ships as part of
-Qt: no additional dependency for contributors to build or for the app to
-bundle, beyond what the UI already requires. License note: `QtPdf` itself
-is LGPLv3/GPLv2/Qt-Commercial (PDFium underneath, bundled inside it, is
-BSD) -- this is the same licensing question already live for using Qt at
-all in this app, not a new, separate encumbrance the way a GPL PDF library
-would have been on top of a permissively-licensed UI toolkit. Open item:
-confirm which Qt license track (open-source LGPL/GPL vs. paid commercial)
-the app is building against -- LGPL specifically expects dynamic linking
-so users can relink a different Qt build, a real constraint on how the
-app gets packaged.
+Considered and rejected: DocWire SDK -- technically capable (nearly 100
+formats, active project, genuine OCR via a real `ocr_parser` pipeline
+stage), but licensed AGPL-3.0-only or paid-commercial (corrected here --
+earlier research in this project's history mis-recorded it as plain
+GPL-2.0), and its vcpkg port has no feature flag to scope the build down:
+installing it at all means building its *entire* dependency graph from
+source -- boost, tesseract, pdfium (+ freetype/icu/libjpeg-turbo/
+openjpeg), libxml2, minizip, lexbor, and `libpff`/`mailio` (PST/OST email
+parsing, a format this app has no use for) -- a multi-hour, multi-
+gigabyte commitment for three formats' worth of need. Also considered:
+DuckX (MIT, real, 505 stars) -- built on the same two libraries
+(`pugixml` + a small zip library) this project ended up using directly,
+but oriented toward editing/creating DOCX files rather than read-only
+bulk extraction, with unconfirmed header/footer/table support -- adopting
+it wouldn't have saved the work of getting those right.
 
-**Images and scanned PDFs.** Tesseract OCR (Apache 2.0, proper C++ API,
-`tesseract::TessBaseAPI`). Scanned-PDF detection: run the text-layer
-extraction first; if the extracted text length is implausibly short
-relative to the PDF's page count, treat it as scanned rather than
-text-bearing, render its pages to images (`QtPdf` can do this too), and
-OCR those images instead. Flagged explicitly, not treated as solvable by
-better engineering: OCR is inherently slower per page than any text-layer
-extraction path, by a wide margin. No library choice removes that cost --
-only parallelism (see below) and Tesseract's own engine-mode speed/
-accuracy trade-off are real levers. A corpus with a meaningful fraction of
-scanned documents will take noticeably longer to ingest than an
-all-text-layer corpus of the same size, and that's expected, not a bug.
+**PDF, text layer.** `poppler-cpp` (`poppler::document::load_from_file()`,
+`page::text(rectf(), poppler::page::physical_layout)` for reading-order-
+correct extraction on multi-column pages), a real Homebrew formula
+(`brew install poppler`), no exotic build chain.
 
-## Performance: extraction as a parallel stage
+Originally planned as Qt's own `QtPdf` module instead (ships with Qt, API
+confirmed real via Qt 6.8 docs: `QPdfDocument::getAllText(page)`) --
+reversed after discovering `QtPdf`'s source lives inside the
+`qtwebengine` repository and building it requires `gn` + `ninja`
+(Chromium's own build tools, not CMake) plus Node.js, to build PDFium
+from source. Not in Homebrew's `qt` formula at all (checked directly --
+absent even from the 38-dependency umbrella package), almost certainly
+because of exactly this build weight. This undermined the entire reason
+`QtPdf` was chosen (ships with Qt, zero extra build cost) -- in practice
+it would have meant a build chain comparable to or worse than DocWire's
+vcpkg requirement, the same class of problem being avoided elsewhere in
+this document. `poppler-cpp` was the original alternative, passed over
+initially only to avoid a GPL dependency -- moot once GPL was confirmed
+not a blocker for this non-commercial, open-source project.
+
+**Images and scanned PDFs.** Tesseract OCR (Apache 2.0, real Homebrew
+formula, proper C++ API -- `tesseract::TessBaseAPI::Init()`/`SetImage(Pix*)`/
+`GetUTF8Text()`, image loading via its own Leptonica dependency's
+`pixRead()`). Verified against a real rendered PNG with known text.
+Plain image files (PNG/JPEG/TIFF/BMP) are wired up end-to-end, dropped
+straight into a group like any other format.
+
+Scanned-PDF detection is designed but **not yet implemented**: run the
+text-layer extraction first (`extractPdfText()`); if it comes back empty,
+that's almost certainly a scanned PDF (no text layer at all) rather than
+a genuinely blank document -- currently reported to the user as "no text
+found" rather than falling back to rendering pages and OCRing them. The
+render step would use `poppler-cpp`'s own `page_renderer` (already a
+project dependency, no new library needed) to rasterize each page, then
+feed that straight into the same `extractTextFromImage()` path plain
+images already use.
+
+Flagged explicitly, not treated as solvable by better engineering: OCR is
+inherently slower per page than any text-layer extraction path, by a wide
+margin. No library choice removes that cost -- only parallelism (see
+below) and Tesseract's own engine-mode speed/accuracy trade-off are real
+levers. A corpus with a meaningful fraction of scanned documents will
+take noticeably longer to ingest than an all-text-layer corpus of the
+same size, and that's expected, not a bug.
+
+## Performance: extraction off the UI thread, not yet parallelized
 
 Target scale is thousands of documents (personal/corporate collections),
 not MS MARCO's millions -- this shapes the rebuild-on-append and
 non-segmented decisions above, and shapes this too.
 
-Format extraction (PDF/DOCX/CSV parsing, OCR) is CPU-bound, per-file, and
-independent of every other file -- the same shape `bulk_ingest.c`'s
-existing Phase 2 worker pool already exploits for chunking/tokenizing
-`documents_raw` rows. Extraction should be implemented as a new step at
-the front of that same worker-pool model (each worker: detect the file's
-format, extract to plain text, then run the existing chunk/tokenize/stage
-logic on the result) rather than as a separate pipeline stage with its
-own synchronization -- reuses the concurrency model already built and
-measured instead of inventing a second one.
+**As built**, format extraction (CSV/DOCX/PDF/OCR) runs serially, one
+dropped file at a time, inside `IngestWorker`'s single background
+`QThread` -- entirely off the UI thread (critical: OCR specifically is
+slow enough that running it inline in the drop handler, before the
+worker even starts, would freeze the UI exactly the way the worker
+exists to prevent for the database rebuild itself), but not parallelized
+across files the way `bulk_ingest.c`'s Phase 2 worker pool parallelizes
+chunking/tokenizing once extraction hands it plain text. Once every
+dropped file's text is in hand, `bulk_ingest_rebuild_corpus()` takes over
+and inherits all of that pipeline's existing multi-threaded throughput,
+unchanged.
 
-Everything downstream of "plain text in hand" -- chunking, term staging,
-the deferred-constraint bulk load, `CLUSTER` -- is the existing pipeline,
-unchanged, and inherits all throughput work already measured in
-`SPEED.md`. Rebuild-on-append uses this same pipeline for both a group's
-first ingest and every subsequent append; there is no second, slower
-ingestion code path to maintain.
+**Not yet done:** parallelizing extraction itself across multiple worker
+threads (one thread per dropped file, up to some concurrency cap) the way
+originally envisioned here. Worth adding if real usage shows a multi-file
+drop (especially a batch of scans) taking noticeably longer serially than
+it would in parallel; not required for a working v1 at this app's target
+scale.
 
 ## Explicitly out of scope for this spec
 
@@ -233,23 +274,34 @@ ingestion code path to maintain.
 
 ## Open items
 
-- Specific permissive zip-read and XML parser libraries for the in-house
-  DOCX extractor -- the approach is settled (in-house over DocWire), the
-  exact libraries to build it from are not.
+- Scanned-PDF OCR fallback -- see "Images and scanned PDFs" above.
+  Currently a scanned PDF is reported to the user as "no text found",
+  not automatically rendered and OCR'd.
+- Extraction parallelism across multiple dropped files -- see
+  "Performance" above. Currently serial within one background thread.
 - UI/UX specifics beyond "drag files into a group, switch active group" --
   left to implementation judgment; the bar is a professional, polished,
   high-end desktop application, not a functional-but-rough one.
 
 ## Resolved
 
+- **DOCX: in-house extractor (`pugixml` + `libzip`), not DocWire.**
+  DocWire was the first option considered (explicitly proposed, not
+  overlooked) -- rejected on build-footprint grounds (its vcpkg port
+  builds its entire ~100-format dependency graph regardless of which
+  formats are actually needed) independent of licensing. See "DOCX"
+  above for the full reasoning, including DuckX (a real alternative
+  considered and also passed over).
+- **PDF: `poppler-cpp`, not `QtPdf`.** Reversed after discovering
+  `QtPdf` requires Chromium's own `gn`/`ninja`/Node.js build chain for
+  PDFium, not a normal CMake build, and isn't in Homebrew at all -- see
+  "PDF, text layer" above for the full story.
+- **OCR: Tesseract**, as originally planned -- the one piece of this
+  whole format-adapter question that never needed reconsidering; real
+  Homebrew formula, no exotic build chain, and no lighter alternative
+  exists for OCR specifically (confirmed by research, not assumed --
+  OCR isn't a "small library" problem the way DOCX/CSV parsing are).
 - **Qt license track: open-source** (LGPLv3/GPLv2), matching the
-  project's own open-source, non-commercial nature. `QtPdf` inherits this
-  automatically -- see "PDF, text layer" above.
-- **DOCX library: in-house extractor, not DocWire.** DocToText/DocWire was
-  the first option considered (explicitly proposed, not overlooked) --
-  rejected after checking its actual license (GPL-2.0-only or paid
-  commercial) and build requirements (vcpkg, C++20, an autotools
-  bootstrap chain, wraps other libraries like `wv2` internally) in favor
-  of a small in-house zip+XML extractor, on build-footprint grounds
-  independent of the license question. See "DOCX" above for the full
-  reasoning.
+  project's own open-source, non-commercial nature. Moot for `QtPdf`
+  specifically now that PDF uses `poppler-cpp` instead, but still the
+  live license track for Qt itself.
