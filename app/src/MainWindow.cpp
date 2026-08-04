@@ -4,6 +4,10 @@
 #include "IngestWorker.h"
 #include "LexisEngine.h"
 
+extern "C" {
+#include "csv_parse.h"
+}
+
 #include <QFile>
 #include <QFileInfo>
 #include <QMessageBox>
@@ -101,26 +105,51 @@ void MainWindow::onFilesDropped(QStringList localPaths) {
 
     QVector<QPair<QString, QString>> newDocuments;
     QStringList skipped;
+    QStringList malformed;
     for (const QString &path : localPaths) {
         QFileInfo info(path);
-        if (info.suffix().compare(QStringLiteral("txt"), Qt::CaseInsensitive) != 0) {
+        QString suffix = info.suffix().toLower();
+
+        if (suffix == QStringLiteral("txt")) {
+            QFile file(path);
+            if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                skipped.append(info.fileName());
+                continue;
+            }
+            QTextStream stream(&file);
+            newDocuments.append(qMakePair(info.fileName(), stream.readAll()));
+        } else if (suffix == QStringLiteral("csv")) {
+            // One CSV file can produce many documents -- one per data
+            // row (see APP_SPEC.md's "CSV" section: v1's default
+            // document mapping is one row = one document, every column
+            // concatenated). csv_parse_file() fails the WHOLE file on
+            // any malformed row rather than a partial parse, so a NULL
+            // result here means the file is reported as malformed, not
+            // silently skipped or partially ingested.
+            TokenList *rows = csv_parse_file(path.toUtf8().constData());
+            if (rows == nullptr) {
+                malformed.append(info.fileName());
+                continue;
+            }
+            for (size_t i = 0; i < rows->count; i++) {
+                QString rowName = tr("%1#row%2").arg(info.fileName()).arg(i + 1);
+                newDocuments.append(qMakePair(rowName, QString::fromUtf8(rows->terms[i])));
+            }
+            token_list_free(rows);
+        } else {
             skipped.append(info.fileName());
-            continue;
         }
-        QFile file(path);
-        if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            skipped.append(info.fileName());
-            continue;
-        }
-        QTextStream stream(&file);
-        newDocuments.append(qMakePair(info.fileName(), stream.readAll()));
     }
 
+    QStringList problems;
     if (!skipped.isEmpty()) {
-        QMessageBox::information(this, tr("LEXIS"),
-                                  tr("Only .txt files are supported right now -- other formats are coming. "
-                                     "Skipped: %1")
-                                      .arg(skipped.join(QStringLiteral(", "))));
+        problems.append(tr("Not supported yet: %1").arg(skipped.join(QStringLiteral(", "))));
+    }
+    if (!malformed.isEmpty()) {
+        problems.append(tr("Invalid CSV, not ingested: %1").arg(malformed.join(QStringLiteral(", "))));
+    }
+    if (!problems.isEmpty()) {
+        QMessageBox::information(this, tr("LEXIS"), problems.join(QStringLiteral("\n\n")));
     }
     if (newDocuments.isEmpty()) {
         return;
