@@ -30,13 +30,24 @@ set(CMAKE_C_STANDARD 11)
 
 # Same hardcoded-Homebrew-keg-path tradeoff the top-level Makefile
 # already makes for postgresql@18/llama.cpp/ggml (see its own PG_CONFIG/
-# LLAMA_CPP_DIR/GGML_DIR comments) -- qtbase is a Homebrew keg-only
-# formula (not brew-linked into a stable path), so it needs to be named
-# explicitly for find_package() to locate it. Machine-specific, not
-# meant to be portable as-is, matching every other path in this project.
-set(CMAKE_PREFIX_PATH "/opt/homebrew/opt/qtbase" ${CMAKE_PREFIX_PATH})
+# LLAMA_CPP_DIR/GGML_DIR comments) -- qtbase and qtdeclarative (Qt
+# Quick/QML -- a separate Homebrew keg from qtbase) are both keg-only
+# formulas (not brew-linked into a stable path), so both need to be
+# named explicitly for find_package() to locate them. Machine-specific,
+# not meant to be portable as-is, matching every other path in this
+# project.
+set(CMAKE_PREFIX_PATH "/opt/homebrew/opt/qtbase" "/opt/homebrew/opt/qtdeclarative" ${CMAKE_PREFIX_PATH})
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets)
+# find_package(Qt6 COMPONENTS ...) resolves every component relative to
+# wherever it found Qt6Config.cmake itself (qtbase's prefix) rather than
+# searching all of CMAKE_PREFIX_PATH per component -- confirmed directly
+# (it failed even with qtdeclarative's prefix already on the path
+# above). Pointing these two *_DIR variables at qtdeclarative's own
+# package config directories directly is what actually works.
+set(Qt6Quick_DIR "/opt/homebrew/opt/qtdeclarative/lib/cmake/Qt6Quick")
+set(Qt6QuickControls2_DIR "/opt/homebrew/opt/qtdeclarative/lib/cmake/Qt6QuickControls2")
+
+find_package(Qt6 REQUIRED COMPONENTS Quick QuickControls2)
 qt_standard_project_setup()
 
 # Format-extraction adapters (see ../APP_SPEC.md's "Document ingestion"
@@ -113,28 +124,48 @@ target_include_directories(lexis_core PRIVATE
 target_link_directories(lexis_core PUBLIC ${PG_LIB_DIR} ${LLAMA_CPP_DIR}/lib ${GGML_DIR}/lib)
 target_link_libraries(lexis_core PUBLIC pq llama ggml ggml-base pthread)
 
-qt_add_executable(lexis_app
-    src/main.cpp
-    src/MainWindow.h
-    src/MainWindow.cpp
-    src/LexisEngine.h
-    src/LexisEngine.cpp
-    src/GroupSidebar.h
-    src/GroupSidebar.cpp
-    src/GroupContentView.h
-    src/GroupContentView.cpp
-    src/IngestWorker.h
-    src/IngestWorker.cpp
-    src/DocxExtractor.h
-    src/DocxExtractor.cpp
-    src/PdfExtractor.h
-    src/PdfExtractor.cpp
-    src/OcrExtractor.h
-    src/OcrExtractor.cpp
+qt_add_executable(lexis_app src/main.cpp)
+
+# QML module: registers AppController/CorpusListModel/DocumentListModel
+# (QML_ELEMENT-tagged) for `import Lexis` and compiles qml/*.qml into
+# the binary (qt_add_qml_module handles the resource embedding -- no
+# separate .qrc file needed). LexisEngine/IngestWorker/the extractors
+# are plain C++ backend logic with no QML_ELEMENT of their own (nothing
+# in QML ever names them directly), so they're listed as ordinary
+# SOURCES here rather than needing their own registration.
+qt_add_qml_module(lexis_app
+    URI Lexis
+    VERSION 1.0
+    QML_FILES
+        qml/Main.qml
+        qml/GroupSidebar.qml
+        qml/GroupContentView.qml
+    SOURCES
+        src/AppController.h
+        src/AppController.cpp
+        src/CorpusListModel.h
+        src/CorpusListModel.cpp
+        src/DocumentListModel.h
+        src/DocumentListModel.cpp
+        src/LexisEngine.h
+        src/LexisEngine.cpp
+        src/IngestWorker.h
+        src/IngestWorker.cpp
+        src/DocxExtractor.h
+        src/DocxExtractor.cpp
+        src/PdfExtractor.h
+        src/PdfExtractor.cpp
+        src/OcrExtractor.h
+        src/OcrExtractor.cpp
 )
-target_include_directories(lexis_app PRIVATE ${PG_INCLUDE_DIR})
+# qt_add_qml_module()'s generated type-registration file includes its
+# QML_ELEMENT headers via angle brackets (<AppController.h>, guarded by
+# __has_include) rather than relative to their own source location --
+# needs src/ on the include path or those includes silently no-op and
+# the generated file fails to compile with "undeclared identifier".
+target_include_directories(lexis_app PRIVATE ${PG_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(lexis_app PRIVATE LEXIS_TESSDATA_PREFIX="${LEXIS_TESSDATA_PREFIX}")
-target_link_libraries(lexis_app PRIVATE lexis_core Qt6::Widgets
+target_link_libraries(lexis_app PRIVATE lexis_core Qt6::Quick Qt6::QuickControls2
     PkgConfig::POPPLER_CPP PkgConfig::PUGIXML PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBZIP)
 
 # Needed to actually run the built binary straight out of the build

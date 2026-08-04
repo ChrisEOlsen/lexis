@@ -1,12 +1,15 @@
-#include "MainWindow.h"
-
-#include <QApplication>
+#include <QCoreApplication>
+#include <QGuiApplication>
+#include <QQmlApplicationEngine>
 
 int main(int argc, char *argv[]) {
-    QApplication app(argc, argv);
+    QGuiApplication app(argc, argv);
 
-    MainWindow window;
-    window.show();
+    QQmlApplicationEngine engine;
+    QObject::connect(
+        &engine, &QQmlApplicationEngine::objectCreationFailed, &app,
+        []() { QCoreApplication::exit(EXIT_FAILURE); }, Qt::QueuedConnection);
+    engine.loadFromModule("Lexis", "Main");
 
     return app.exec();
 }
