@@ -147,10 +147,16 @@ qt_add_qml_module(lexis_app
         src/CorpusListModel.cpp
         src/DocumentListModel.h
         src/DocumentListModel.cpp
+        src/ChatMessageListModel.h
+        src/ChatMessageListModel.cpp
         src/LexisEngine.h
         src/LexisEngine.cpp
         src/IngestWorker.h
         src/IngestWorker.cpp
+        src/ModelLoader.h
+        src/ModelLoader.cpp
+        src/QueryWorker.h
+        src/QueryWorker.cpp
         src/DocxExtractor.h
         src/DocxExtractor.cpp
         src/PdfExtractor.h

@@ -1,14 +1,18 @@
 // The one object QML talks to for everything backend-related: groups,
-// documents, ingestion. Wraps LexisEngine (the actual pg_store C-API
-// adapter) plus the two list models QML binds its ListViews to. Exposed
-// as a QML singleton -- QML creates and owns the single instance
-// automatically the first time it's referenced after `import Lexis`, no
-// manual registration needed in main.cpp.
+// documents, ingestion, and chat. Wraps LexisEngine (the actual
+// pg_store C-API adapter) plus the three list models QML binds its
+// ListViews to. Exposed as a QML singleton -- QML creates and owns the
+// single instance automatically the first time it's referenced after
+// `import Lexis`, no manual registration needed in main.cpp.
 //
 // Owns the language data (stopwords/wordnet/lemmatizer) every ingest
-// needs, loaded once for the app's whole lifetime and shared read-only
-// across every IngestWorker -- see IngestWorker.h's own comment on why
-// that's safe.
+// AND every chat query needs, loaded once for the app's whole lifetime
+// and shared read-only across every IngestWorker/QueryWorker -- see
+// IngestWorker.h's own comment on why that's safe. Also owns the local
+// model's lifetime: kicks off a background ModelLoader in the
+// constructor (see ModelLoader.h for why proactively, not deferred to
+// first chat use) and calls local_llm_client_cleanup() in the
+// destructor, after waiting for any in-flight loader/query.
 
 #ifndef LEXIS_APP_APPCONTROLLER_H
 #define LEXIS_APP_APPCONTROLLER_H
@@ -17,6 +21,7 @@
 #include <QQmlEngine>
 #include <QString>
 #include <QStringList>
+#include <QVariantList>
 
 #include <memory>
 
@@ -29,11 +34,14 @@ extern "C" {
 // Full definitions, not forward declarations -- Q_PROPERTY's pointer
 // types need the complete class visible for Qt's meta-type
 // registration (MOC-generated code fails a static_assert otherwise).
+#include "ChatMessageListModel.h"
 #include "CorpusListModel.h"
 #include "DocumentListModel.h"
 
 class LexisEngine;
 class IngestWorker;
+class ModelLoader;
+class QueryWorker;
 
 class AppController : public QObject {
     Q_OBJECT
@@ -47,6 +55,9 @@ class AppController : public QObject {
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusTextChanged)
     Q_PROPERTY(CorpusListModel *corpusModel READ corpusModel CONSTANT)
     Q_PROPERTY(DocumentListModel *documentModel READ documentModel CONSTANT)
+    Q_PROPERTY(ChatMessageListModel *chatModel READ chatModel CONSTANT)
+    Q_PROPERTY(bool modelReady READ isModelReady NOTIFY modelReadyChanged)
+    Q_PROPERTY(bool chatBusy READ isChatBusy NOTIFY chatBusyChanged)
 
 public:
     explicit AppController(QObject *parent = nullptr);
@@ -59,6 +70,9 @@ public:
     QString statusText() const;
     CorpusListModel *corpusModel() const;
     DocumentListModel *documentModel() const;
+    ChatMessageListModel *chatModel() const;
+    bool isModelReady() const;
+    bool isChatBusy() const;
 
     Q_INVOKABLE bool createGroup(const QString &displayName);
     Q_INVOKABLE bool deleteGroup(qint64 corpusId);
@@ -71,10 +85,19 @@ public:
     // (spaces, non-ASCII filenames) correctly.
     Q_INVOKABLE void ingestFiles(const QStringList &fileUrls);
 
+    // Requires a group to be selected and the model to be ready
+    // (modelReady) -- a no-op otherwise (mirrors ingestFiles()'s own
+    // guard pattern). Appends the question to chatModel immediately (so
+    // it shows up right away, not after the round trip completes), then
+    // the answer once QueryWorker finishes.
+    Q_INVOKABLE void sendChatMessage(const QString &question);
+
 signals:
     void activeCorpusIdChanged();
     void busyChanged();
     void statusTextChanged();
+    void modelReadyChanged();
+    void chatBusyChanged();
     // Reused for both real errors and informational results (e.g. "N
     // passages added") -- QML shows both the same way, as a dismissible
     // message dialog; splitting into two signals would just double the
@@ -84,6 +107,8 @@ signals:
 private slots:
     void onIngestFinished(bool ok, qint64 totalPassages, QStringList skipped, QStringList malformed,
                            QStringList noTextFound);
+    void onModelLoadFinished(bool ok);
+    void onQueryFinished(bool ok, QString answer, QVariantList sources);
 
 private:
     void refreshCorpusModel();
@@ -92,12 +117,17 @@ private:
     std::unique_ptr<LexisEngine> m_engine;
     CorpusListModel *m_corpusModel;
     DocumentListModel *m_documentModel;
-    IngestWorker *m_activeWorker; // non-owning; deletes itself via QThread::finished -> deleteLater()
+    ChatMessageListModel *m_chatModel;
+    IngestWorker *m_activeWorker;    // non-owning; deletes itself via QThread::finished -> deleteLater()
+    ModelLoader *m_modelLoader;      // non-owning; deletes itself the same way, cleared once modelReady
+    QueryWorker *m_activeQueryWorker; // non-owning; same self-deletion pattern
 
     qint64 m_activeCorpusId;
     QString m_activeCorpusName;
     bool m_busy;
     QString m_statusText;
+    bool m_modelReady;
+    bool m_chatBusy;
 
     StopwordSet *m_stopwords;
     WordNetTable *m_wordnet;
