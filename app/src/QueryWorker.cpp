@@ -1,3 +1,16 @@
+// Deliberately calls query_formulation_terms_only() (plain tokenize/
+// stopword-filter/lemmatize, no LLM call) instead of the LLM-assisted
+// query_formulation_formulate_query() -- the latter is NOT dead code
+// (eval.c's --use-llm-expansion comparison mode still calls it, and it
+// stays available for a future reconsideration), it's just not what the
+// interactive chat panel uses. The full 6,980-query naked-BM25 eval run
+// (see SPEED.md) measured retrieval quality in line with published BM25
+// baselines even without the LLM-driven synonym/hypernym/hyponym
+// selection step, meaning that step was mostly just adding one whole
+// extra LLM call's worth of latency per question for a chat panel where
+// response time matters, not measurably improving what the user
+// actually gets back. Generation (the answer itself) still runs -- this
+// only cuts the *pre-search* LLM step, not the final answer.
 #include "QueryWorker.h"
 
 extern "C" {
@@ -37,11 +50,10 @@ void QueryWorker::run() {
     QByteArray questionUtf8 = m_question.toUtf8();
     const char *questionCstr = questionUtf8.constData();
 
-    // Query formulation: tokenize/stopword-filter/lemmatize, gather
-    // WordNet candidates, ask the local model which to include -- falls
-    // back to the plain lemmatized terms internally if that call fails,
-    // so this itself only fails on allocation failure.
-    TokenList *terms = query_formulation_formulate_query(questionCstr, m_stopwords, m_wordnet, m_lemmatizer);
+    // Query formulation: tokenize/stopword-filter/lemmatize, no LLM call
+    // -- see this file's top-of-file comment for why. Only fails on
+    // allocation failure.
+    TokenList *terms = query_formulation_terms_only(questionCstr, m_stopwords, m_wordnet, m_lemmatizer);
     if (terms == nullptr) {
         pg_store_close(store);
         emit queryFinished(false, QString(), QVariantList());

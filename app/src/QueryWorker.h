@@ -1,18 +1,16 @@
-// Runs one chat query on a background thread: query formulation (which
-// itself calls the local model once) -> BM25 search -> generation
-// (which calls the local model again) -> fetches each result passage's
-// document name/chunk id for source citations. Mirrors main.c's
-// run_query() pipeline exactly, using the simpler convenience wrappers
-// (query_formulation_formulate_query()/generation_generate_answer())
-// rather than run_query()'s manual step-by-step decomposition -- that
-// decomposition exists only to feed query_log.c's testing-mode
-// instrumentation, which this app doesn't use.
+// Runs one chat query on a background thread: query formulation
+// (plain tokenize/stopword-filter/lemmatize, no LLM call -- see
+// QueryWorker.cpp's own top-of-file comment for why the LLM-assisted
+// query_formulation_formulate_query() is deliberately NOT used here) ->
+// BM25 search -> generation (the one remaining LLM call, producing the
+// actual answer) -> fetches each result passage's document name/chunk
+// id for source citations.
 //
-// Both LLM calls are the slow part (see SPEED.md) -- this entire
-// pipeline must run off the UI thread, same discipline as IngestWorker.
-// Opens its own PgStore connection, scoped to `corpusId` via
-// pg_store_use_corpus() -- doesn't touch LexisEngine's connection, same
-// reasoning as IngestWorker's connections.
+// The generation LLM call is the slow part now (see SPEED.md) -- this
+// entire pipeline still runs off the UI thread, same discipline as
+// IngestWorker. Opens its own PgStore connection, scoped to `corpusId`
+// via pg_store_use_corpus() -- doesn't touch LexisEngine's connection,
+// same reasoning as IngestWorker's connections.
 //
 // Relies on the local model already being loaded (see ModelLoader) --
 // local_llm_client_init() sets up a single, global, process-wide
