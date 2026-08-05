@@ -117,3 +117,83 @@ bool LexisEngine::listDocumentNames(QVector<QString> *out) {
     pg_store_documents_free(docs, count);
     return true;
 }
+
+bool LexisEngine::createChatSession(qint64 corpusId, const QString &title, qint64 *idOut) {
+    if (!isConnected()) {
+        m_lastError = QStringLiteral("Not connected to the database.");
+        return false;
+    }
+    if (title.trimmed().isEmpty()) {
+        m_lastError = QStringLiteral("Chat session title cannot be empty.");
+        return false;
+    }
+
+    int64_t id = pg_store_create_chat_session(m_store, corpusId, title.toUtf8().constData());
+    if (id <= 0) {
+        captureError("Failed to create chat session.");
+        return false;
+    }
+
+    if (idOut != nullptr) {
+        *idOut = static_cast<qint64>(id);
+    }
+    return true;
+}
+
+bool LexisEngine::listChatSessions(qint64 corpusId, QVector<ChatSession> *out) {
+    out->clear();
+    if (!isConnected()) {
+        m_lastError = QStringLiteral("Not connected to the database.");
+        return false;
+    }
+
+    size_t count = 0;
+    PgStoreChatSession *sessions = pg_store_list_chat_sessions(m_store, corpusId, &count);
+    if (sessions == nullptr) {
+        captureError("Failed to list chat sessions.");
+        return false;
+    }
+
+    out->reserve(static_cast<int>(count));
+    for (size_t i = 0; i < count; i++) {
+        out->append(ChatSession{static_cast<qint64>(sessions[i].id), QString::fromUtf8(sessions[i].title)});
+    }
+    pg_store_chat_sessions_free(sessions, count);
+    return true;
+}
+
+bool LexisEngine::deleteChatSession(qint64 sessionId) {
+    if (!isConnected()) {
+        m_lastError = QStringLiteral("Not connected to the database.");
+        return false;
+    }
+    if (pg_store_delete_chat_session(m_store, sessionId) != 0) {
+        captureError("Failed to delete chat session.");
+        return false;
+    }
+    return true;
+}
+
+bool LexisEngine::getChatMessages(qint64 sessionId, QVector<ChatHistoryEntry> *out) {
+    out->clear();
+    if (!isConnected()) {
+        m_lastError = QStringLiteral("Not connected to the database.");
+        return false;
+    }
+
+    size_t count = 0;
+    PgStoreChatMessage *messages = pg_store_get_chat_messages(m_store, sessionId, &count);
+    if (messages == nullptr) {
+        captureError("Failed to load chat history.");
+        return false;
+    }
+
+    out->reserve(static_cast<int>(count));
+    for (size_t i = 0; i < count; i++) {
+        out->append(ChatHistoryEntry{
+            messages[i].is_user != 0, QString::fromUtf8(messages[i].text),
+            messages[i].sources_json != nullptr ? QString::fromUtf8(messages[i].sources_json) : QString()});
+    }
+    pg_store_chat_messages_free(messages, count);
+    return true;
+}

@@ -41,3 +41,9 @@ void ChatMessageListModel::addMessage(const QString &text, bool isUser, const QV
     m_messages.append({text, isUser, sources});
     endInsertRows();
 }
+
+void ChatMessageListModel::setMessages(const QVector<ChatMessage> &messages) {
+    beginResetModel();
+    m_messages = messages;
+    endResetModel();
+}

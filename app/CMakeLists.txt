@@ -150,6 +150,8 @@ qt_add_qml_module(lexis_app
         src/DocumentListModel.cpp
         src/ChatMessageListModel.h
         src/ChatMessageListModel.cpp
+        src/ChatSessionListModel.h
+        src/ChatSessionListModel.cpp
         src/LexisEngine.h
         src/LexisEngine.cpp
         src/IngestWorker.h

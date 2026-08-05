@@ -35,6 +35,7 @@ extern "C" {
 // types need the complete class visible for Qt's meta-type
 // registration (MOC-generated code fails a static_assert otherwise).
 #include "ChatMessageListModel.h"
+#include "ChatSessionListModel.h"
 #include "CorpusListModel.h"
 #include "DocumentListModel.h"
 
@@ -56,6 +57,9 @@ class AppController : public QObject {
     Q_PROPERTY(CorpusListModel *corpusModel READ corpusModel CONSTANT)
     Q_PROPERTY(DocumentListModel *documentModel READ documentModel CONSTANT)
     Q_PROPERTY(ChatMessageListModel *chatModel READ chatModel CONSTANT)
+    Q_PROPERTY(ChatSessionListModel *chatSessionModel READ chatSessionModel CONSTANT)
+    Q_PROPERTY(qint64 activeChatSessionId READ activeChatSessionId NOTIFY activeChatSessionIdChanged)
+    Q_PROPERTY(QString activeChatSessionTitle READ activeChatSessionTitle NOTIFY activeChatSessionIdChanged)
     Q_PROPERTY(bool modelReady READ isModelReady NOTIFY modelReadyChanged)
     Q_PROPERTY(bool chatBusy READ isChatBusy NOTIFY chatBusyChanged)
 
@@ -71,12 +75,33 @@ public:
     CorpusListModel *corpusModel() const;
     DocumentListModel *documentModel() const;
     ChatMessageListModel *chatModel() const;
+    ChatSessionListModel *chatSessionModel() const;
+    qint64 activeChatSessionId() const;
+    QString activeChatSessionTitle() const;
     bool isModelReady() const;
     bool isChatBusy() const;
 
     Q_INVOKABLE bool createGroup(const QString &displayName);
     Q_INVOKABLE bool deleteGroup(qint64 corpusId);
     Q_INVOKABLE void selectGroup(qint64 corpusId);
+
+    // Resets to a "pending new chat" state -- activeChatSessionId
+    // becomes -1 and chatModel is cleared, but no database row is
+    // created yet (see sendChatMessage()'s own comment on lazy session
+    // creation). A no-op-looking call with real effect: it's what backs
+    // the chat panel's "New Chat" button.
+    Q_INVOKABLE void startNewChat();
+
+    // Loads sessionId's full message history into chatModel. A no-op if
+    // sessionId doesn't exist (LexisEngine::getChatMessages() just
+    // returns an empty list).
+    Q_INVOKABLE void selectChatSession(qint64 sessionId);
+
+    // Permanently deletes a chat session and every message in it. If it
+    // was the active session, falls back to startNewChat()'s pending
+    // state rather than leaving chatModel showing a now-deleted
+    // conversation.
+    Q_INVOKABLE void deleteChatSession(qint64 sessionId);
 
     // fileUrls are raw file:// URL strings straight from QML's
     // DropArea.drop.urls -- converted to local paths here (via
@@ -94,6 +119,7 @@ public:
 
 signals:
     void activeCorpusIdChanged();
+    void activeChatSessionIdChanged();
     void busyChanged();
     void statusTextChanged();
     void modelReadyChanged();
@@ -114,16 +140,26 @@ private:
     void refreshCorpusModel();
     void refreshDocumentModel();
 
+    // Re-fetches every chat session for m_activeCorpusId and repopulates
+    // m_chatSessionModel -- doesn't touch activeChatSessionId or
+    // chatModel, so it's safe to call after any operation that only
+    // changes the *set* of sessions (delete, lazy-create) without
+    // disturbing whichever session is currently open.
+    void refreshChatSessionModel();
+
     std::unique_ptr<LexisEngine> m_engine;
     CorpusListModel *m_corpusModel;
     DocumentListModel *m_documentModel;
     ChatMessageListModel *m_chatModel;
+    ChatSessionListModel *m_chatSessionModel;
     IngestWorker *m_activeWorker;    // non-owning; deletes itself via QThread::finished -> deleteLater()
     ModelLoader *m_modelLoader;      // non-owning; deletes itself the same way, cleared once modelReady
     QueryWorker *m_activeQueryWorker; // non-owning; same self-deletion pattern
 
     qint64 m_activeCorpusId;
     QString m_activeCorpusName;
+    qint64 m_activeChatSessionId; // -1 = pending new chat, no session row created yet (see startNewChat())
+    QString m_activeChatSessionTitle;
     bool m_busy;
     QString m_statusText;
     bool m_modelReady;

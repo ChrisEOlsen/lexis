@@ -1,16 +1,16 @@
-// Deliberately calls query_formulation_terms_only() (plain tokenize/
-// stopword-filter/lemmatize, no LLM call) instead of the LLM-assisted
-// query_formulation_formulate_query() -- the latter is NOT dead code
-// (eval.c's --use-llm-expansion comparison mode still calls it, and it
-// stays available for a future reconsideration), it's just not what the
-// interactive chat panel uses. The full 6,980-query naked-BM25 eval run
-// (see SPEED.md) measured retrieval quality in line with published BM25
-// baselines even without the LLM-driven synonym/hypernym/hyponym
-// selection step, meaning that step was mostly just adding one whole
-// extra LLM call's worth of latency per question for a chat panel where
-// response time matters, not measurably improving what the user
-// actually gets back. Generation (the answer itself) still runs -- this
-// only cuts the *pre-search* LLM step, not the final answer.
+// Deliberately calls query_formulation_contextualize_question() (a plain
+// LLM call that resolves the question against conversation history into
+// a standalone search query, e.g. "what about that instead?" -> "what is
+// the minimum age for a Junior Operator Class MJ license?") rather than
+// the WordNet-driven query_formulation_formulate_query() -- the latter
+// is NOT dead code (eval.c's --use-llm-expansion comparison mode still
+// calls it), it's just solving a different problem (synonym expansion)
+// than what an interactive multi-turn chat needs (resolving follow-up
+// references). The full 6,980-query naked-BM25 eval run (see SPEED.md)
+// found the WordNet expansion step wasn't measurably improving retrieval
+// quality even with no conversation history in the picture at all --
+// that finding motivated cutting it from the chat pipeline in the first
+// place, and is unrelated to why contextualization is needed now.
 #include "QueryWorker.h"
 
 extern "C" {
@@ -20,19 +20,35 @@ extern "C" {
 #include "query_formulation.h"
 }
 
+#include <QJsonArray>
+#include <QJsonDocument>
+
 #include <cstdlib>
+#include <vector>
 
 namespace {
 // Mirrors main.c's LEXIS_TOP_K exactly -- no config UI for this yet,
 // and matching the CLI's own retrieval behavior matters more right now
 // than tuning it differently here.
 constexpr size_t kTopK = 5;
+
+// Empty string (not "[]") when there's nothing to cite -- matches
+// pg_store_append_chat_message()'s NULL-means-no-sources convention, so
+// a user message and a sourceless assistant answer are stored the same
+// way.
+QString sourcesToJson(const QVariantList &sources) {
+    if (sources.isEmpty()) {
+        return QString();
+    }
+    return QString::fromUtf8(QJsonDocument(QJsonArray::fromVariantList(sources)).toJson(QJsonDocument::Compact));
+}
 } // namespace
 
-QueryWorker::QueryWorker(QString conninfo, qint64 corpusId, QString question, const StopwordSet *stopwords,
-                          const WordNetTable *wordnet, const Lemmatizer *lemmatizer, QObject *parent)
-    : QThread(parent), m_conninfo(std::move(conninfo)), m_corpusId(corpusId), m_question(std::move(question)),
-      m_stopwords(stopwords), m_wordnet(wordnet), m_lemmatizer(lemmatizer) {
+QueryWorker::QueryWorker(QString conninfo, qint64 corpusId, qint64 sessionId, QString question,
+                          const StopwordSet *stopwords, const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
+                          QObject *parent)
+    : QThread(parent), m_conninfo(std::move(conninfo)), m_corpusId(corpusId), m_sessionId(sessionId),
+      m_question(std::move(question)), m_stopwords(stopwords), m_wordnet(wordnet), m_lemmatizer(lemmatizer) {
 }
 
 void QueryWorker::run() {
@@ -50,19 +66,55 @@ void QueryWorker::run() {
     QByteArray questionUtf8 = m_question.toUtf8();
     const char *questionCstr = questionUtf8.constData();
 
-    // Query formulation: tokenize/stopword-filter/lemmatize, no LLM call
-    // -- see this file's top-of-file comment for why. Only fails on
-    // allocation failure.
-    TokenList *terms = query_formulation_terms_only(questionCstr, m_stopwords, m_wordnet, m_lemmatizer);
+    // Load history BEFORE persisting the new question -- otherwise this
+    // fetch would see its own not-yet-answered question as the most
+    // recent "user" turn. A fetch failure degrades to "no history"
+    // rather than aborting the query -- conversational context is an
+    // enhancement here, not a precondition for answering at all.
+    size_t history_count = 0;
+    PgStoreChatMessage *history_rows = pg_store_get_chat_messages(store, m_sessionId, &history_count);
+    if (history_rows == nullptr) {
+        history_count = 0;
+    }
+
+    std::vector<LocalLlmTurn> turns(history_count);
+    for (size_t i = 0; i < history_count; i++) {
+        turns[i].role = history_rows[i].is_user ? "user" : "assistant";
+        turns[i].content = history_rows[i].text;
+    }
+
+    pg_store_append_chat_message(store, m_sessionId, 1, questionCstr, nullptr);
+
+    // Query reformulation: see this file's top-of-file comment for why
+    // this LLM step exists and how it differs from the WordNet-driven
+    // one. Only fails on allocation failure.
+    char *reformulated = query_formulation_contextualize_question(questionCstr, turns.data(), turns.size());
+    if (reformulated == nullptr) {
+        pg_store_chat_messages_free(history_rows, history_count);
+        pg_store_close(store);
+        emit queryFinished(false, QString(), QVariantList());
+        return;
+    }
+
+    // Tokenize/stopword-filter/lemmatize the *reformulated* text, not
+    // the raw question -- a follow-up like "what about that instead?"
+    // has almost nothing for BM25 to work with until reformulation has
+    // resolved it into something concrete.
+    TokenList *terms = query_formulation_terms_only(reformulated, m_stopwords, m_wordnet, m_lemmatizer);
+    free(reformulated);
     if (terms == nullptr) {
+        pg_store_chat_messages_free(history_rows, history_count);
         pg_store_close(store);
         emit queryFinished(false, QString(), QVariantList());
         return;
     }
     if (terms->count == 0) {
         token_list_free(terms);
+        QString answer = tr("I don't have enough to search for in that question -- could you rephrase it?");
+        pg_store_append_chat_message(store, m_sessionId, 0, answer.toUtf8().constData(), nullptr);
+        pg_store_chat_messages_free(history_rows, history_count);
         pg_store_close(store);
-        emit queryFinished(true, QString(), QVariantList()); // a real, valid "nothing to search for" outcome
+        emit queryFinished(true, answer, QVariantList());
         return;
     }
 
@@ -80,6 +132,7 @@ void QueryWorker::run() {
     token_list_free(terms);
 
     if (results == nullptr) {
+        pg_store_chat_messages_free(history_rows, history_count);
         pg_store_close(store);
         emit queryFinished(false, QString(), QVariantList());
         return;
@@ -87,8 +140,11 @@ void QueryWorker::run() {
 
     if (results->count == 0) {
         bm25_result_set_free(results);
+        QString answer = tr("No matching passages found in this group for that question.");
+        pg_store_append_chat_message(store, m_sessionId, 0, answer.toUtf8().constData(), nullptr);
+        pg_store_chat_messages_free(history_rows, history_count);
         pg_store_close(store);
-        emit queryFinished(true, QString(), QVariantList()); // valid outcome: no matching passages
+        emit queryFinished(true, answer, QVariantList());
         return;
     }
 
@@ -110,16 +166,26 @@ void QueryWorker::run() {
         pg_store_passage_free(passage);
     }
 
-    char *answer = generation_generate_answer(questionCstr, store, results);
+    // The *original* question, not the reformulated search query -- the
+    // reformulation only ever existed to help retrieval, not to replace
+    // what the user actually asked (see generation.h's own doc comment).
+    char *answer = generation_generate_answer_with_history(questionCstr, store, results, turns.data(), turns.size());
     bm25_result_set_free(results);
-    pg_store_close(store);
+    pg_store_chat_messages_free(history_rows, history_count);
 
     if (answer == nullptr) {
+        pg_store_close(store);
         emit queryFinished(false, QString(), QVariantList());
         return;
     }
 
     QString answerText = QString::fromUtf8(answer);
     free(answer);
+
+    QString sourcesJson = sourcesToJson(sources);
+    pg_store_append_chat_message(store, m_sessionId, 0, answerText.toUtf8().constData(),
+                                  sourcesJson.isEmpty() ? nullptr : sourcesJson.toUtf8().constData());
+    pg_store_close(store);
+
     emit queryFinished(true, answerText, sources);
 }

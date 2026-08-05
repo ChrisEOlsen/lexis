@@ -43,6 +43,12 @@ public:
 
     void addMessage(const QString &text, bool isUser, const QVariantList &sources = QVariantList());
 
+    // Replaces the whole list at once (begin/endResetModel, not per-row
+    // inserts) -- for loading a chat session's full history on switch,
+    // where every row changes together and there's no "new message
+    // arriving" animation to preserve, unlike addMessage().
+    void setMessages(const QVector<ChatMessage> &messages);
+
 private:
     QVector<ChatMessage> m_messages;
 };

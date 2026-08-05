@@ -10,6 +10,8 @@ extern "C" {
 #include "local_llm_client.h"
 }
 
+#include <QJsonArray>
+#include <QJsonDocument>
 #include <QUrl>
 
 namespace {
@@ -26,9 +28,10 @@ const char *kModelPath = "data/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf";
 AppController::AppController(QObject *parent)
     : QObject(parent), m_engine(nullptr), m_corpusModel(new CorpusListModel(this)),
       m_documentModel(new DocumentListModel(this)), m_chatModel(new ChatMessageListModel(this)),
-      m_activeWorker(nullptr), m_modelLoader(nullptr), m_activeQueryWorker(nullptr), m_activeCorpusId(-1),
-      m_busy(false), m_statusText(tr("Select a group")), m_modelReady(false), m_chatBusy(false),
-      m_stopwords(nullptr), m_wordnet(nullptr), m_lemmatizer(nullptr) {
+      m_chatSessionModel(new ChatSessionListModel(this)), m_activeWorker(nullptr), m_modelLoader(nullptr),
+      m_activeQueryWorker(nullptr), m_activeCorpusId(-1), m_activeChatSessionId(-1),
+      m_activeChatSessionTitle(tr("New Chat")), m_busy(false), m_statusText(tr("Select a group")),
+      m_modelReady(false), m_chatBusy(false), m_stopwords(nullptr), m_wordnet(nullptr), m_lemmatizer(nullptr) {
     m_engine = std::make_unique<LexisEngine>(QString::fromUtf8(kConnInfo));
     if (!m_engine->isConnected()) {
         emit notify(tr("Could not connect to the database. Is Postgres running (make pg-start)?"));
@@ -109,6 +112,18 @@ ChatMessageListModel *AppController::chatModel() const {
     return m_chatModel;
 }
 
+ChatSessionListModel *AppController::chatSessionModel() const {
+    return m_chatSessionModel;
+}
+
+qint64 AppController::activeChatSessionId() const {
+    return m_activeChatSessionId;
+}
+
+QString AppController::activeChatSessionTitle() const {
+    return m_activeChatSessionTitle;
+}
+
 bool AppController::isModelReady() const {
     return m_modelReady;
 }
@@ -160,7 +175,63 @@ void AppController::selectGroup(qint64 corpusId) {
     }
 
     refreshDocumentModel();
+
+    // Pick up where the user left off: auto-select the most recent
+    // session for this group (LexisEngine::listChatSessions() returns
+    // newest first), or fall back to startNewChat()'s pending state if
+    // the group has no chat history yet.
+    QVector<ChatSession> sessions;
+    m_engine->listChatSessions(corpusId, &sessions);
+    m_chatSessionModel->setSessions(sessions);
+    if (!sessions.isEmpty()) {
+        selectChatSession(sessions.first().id);
+    } else {
+        startNewChat();
+    }
+
     emit activeCorpusIdChanged();
+}
+
+void AppController::startNewChat() {
+    m_activeChatSessionId = -1;
+    m_activeChatSessionTitle = tr("New Chat");
+    m_chatModel->setMessages({});
+    emit activeChatSessionIdChanged();
+}
+
+void AppController::selectChatSession(qint64 sessionId) {
+    m_activeChatSessionId = sessionId;
+    m_activeChatSessionTitle = m_chatSessionModel->titleForId(sessionId);
+
+    QVector<ChatHistoryEntry> history;
+    m_engine->getChatMessages(sessionId, &history);
+
+    QVector<ChatMessage> messages;
+    messages.reserve(history.size());
+    for (const ChatHistoryEntry &entry : history) {
+        QVariantList sources;
+        if (!entry.sourcesJson.isEmpty()) {
+            QJsonDocument doc = QJsonDocument::fromJson(entry.sourcesJson.toUtf8());
+            if (doc.isArray()) {
+                sources = doc.array().toVariantList();
+            }
+        }
+        messages.append(ChatMessage{entry.text, entry.isUser, sources});
+    }
+    m_chatModel->setMessages(messages);
+
+    emit activeChatSessionIdChanged();
+}
+
+void AppController::deleteChatSession(qint64 sessionId) {
+    if (!m_engine->deleteChatSession(sessionId)) {
+        emit notify(tr("Could not delete chat: %1").arg(m_engine->lastError()));
+        return;
+    }
+    if (sessionId == m_activeChatSessionId) {
+        startNewChat();
+    }
+    refreshChatSessionModel();
 }
 
 void AppController::ingestFiles(const QStringList &fileUrls) {
@@ -240,14 +311,35 @@ void AppController::sendChatMessage(const QString &question) {
         return;
     }
 
+    if (m_activeChatSessionId < 0) {
+        // First message of a new chat -- create its session row now,
+        // titled from the question itself (truncated; no LLM call just
+        // for titling, kept simple until proven insufficient). See
+        // startNewChat()'s own comment on why this doesn't happen any
+        // earlier than this.
+        QString title = question.trimmed();
+        constexpr int kMaxTitleLength = 60;
+        if (title.length() > kMaxTitleLength) {
+            title = title.left(kMaxTitleLength).trimmed() + QStringLiteral("...");
+        }
+        qint64 newSessionId = -1;
+        if (!m_engine->createChatSession(m_activeCorpusId, title, &newSessionId)) {
+            emit notify(tr("Could not start a new chat: %1").arg(m_engine->lastError()));
+            return;
+        }
+        m_activeChatSessionId = newSessionId;
+        m_activeChatSessionTitle = title;
+        emit activeChatSessionIdChanged();
+        refreshChatSessionModel();
+    }
+
     m_chatModel->addMessage(question, true);
 
     m_chatBusy = true;
     emit chatBusyChanged();
 
-    m_activeQueryWorker =
-        new QueryWorker(QString::fromUtf8(kConnInfo), m_activeCorpusId, question, m_stopwords, m_wordnet,
-                         m_lemmatizer, this);
+    m_activeQueryWorker = new QueryWorker(QString::fromUtf8(kConnInfo), m_activeCorpusId, m_activeChatSessionId,
+                                           question, m_stopwords, m_wordnet, m_lemmatizer, this);
     connect(m_activeQueryWorker, &QueryWorker::queryFinished, this, &AppController::onQueryFinished);
     connect(m_activeQueryWorker, &QThread::finished, m_activeQueryWorker, &QObject::deleteLater);
     m_activeQueryWorker->start();
@@ -271,10 +363,12 @@ void AppController::onQueryFinished(bool ok, QString answer, QVariantList source
         emit notify(tr("Could not answer that question -- see the console for details."));
         return;
     }
-    if (answer.isEmpty()) {
-        m_chatModel->addMessage(tr("No matching passages found in this group for that question."), false);
-        return;
-    }
+    // QueryWorker always sends a real, displayable answer on ok == true
+    // now -- "nothing to search for" and "no matching passages" are
+    // themselves the answer text (and already persisted to
+    // chat_messages by QueryWorker), not a sentinel this slot has to
+    // special-case into a synthesized message of its own; doing that
+    // here would desync what's shown live from what's actually stored.
     m_chatModel->addMessage(answer, false, sources);
 }
 
@@ -282,6 +376,13 @@ void AppController::refreshCorpusModel() {
     QVector<Corpus> corpora;
     if (m_engine->listCorpora(&corpora)) {
         m_corpusModel->setCorpora(corpora);
+    }
+}
+
+void AppController::refreshChatSessionModel() {
+    QVector<ChatSession> sessions;
+    if (m_engine->listChatSessions(m_activeCorpusId, &sessions)) {
+        m_chatSessionModel->setSessions(sessions);
     }
 }
 

@@ -15,6 +15,44 @@ ColumnLayout {
     enabled: AppController.activeCorpusId >= 0
     spacing: 8
 
+    RowLayout {
+        Layout.fillWidth: true
+        spacing: 8
+
+        ComboBox {
+            id: sessionCombo
+            Layout.fillWidth: true
+            model: AppController.chatSessionModel
+            textRole: "title"
+
+            // AppController.activeChatSessionId/activeChatSessionTitle
+            // are the source of truth (a session switch can be driven
+            // from here, from selectGroup()'s auto-select, or from
+            // startNewChat()'s pending -1 state with no row in this
+            // model at all yet) -- displayText follows that directly
+            // rather than trying to keep this combo's own currentIndex
+            // bidirectionally synced to it.
+            displayText: AppController.activeChatSessionTitle
+
+            delegate: ItemDelegate {
+                id: sessionDelegate
+                required property var model
+                width: sessionCombo.width
+                text: sessionDelegate.model.title
+                highlighted: sessionDelegate.model.sessionId === AppController.activeChatSessionId
+                onClicked: {
+                    AppController.selectChatSession(sessionDelegate.model.sessionId)
+                    sessionCombo.popup.close()
+                }
+            }
+        }
+
+        ToolButton {
+            text: "New Chat"
+            onClicked: AppController.startNewChat()
+        }
+    }
+
     Label {
         text: {
             if (AppController.activeCorpusId < 0)
