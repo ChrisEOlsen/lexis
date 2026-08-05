@@ -5,6 +5,12 @@
 // guards against firing a second query while local_llm_chat_completion()
 // is still running the first one (see AppController.h's own comment on
 // why that's a hard constraint, not just a UX nicety).
+//
+// ComponentBehavior: Bound -- the session and message delegates below
+// reference outer IDs (sessionCombo, messageList); this binds those
+// lookups lexically instead of resolving them dynamically at runtime.
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -113,7 +119,13 @@ ColumnLayout {
                     model: messageDelegate.model.sources
                     delegate: Label {
                         required property var modelData
-                        text: modelData.documentName + " (chunk " + modelData.chunkId + ")"
+                        // chunkId is only present for SEARCH-path sources
+                        // (a specific matched passage) -- READ-path
+                        // sources are whole documents, no single chunk to
+                        // point at.
+                        text: modelData.chunkId !== undefined
+                              ? modelData.documentName + " (chunk " + modelData.chunkId + ")"
+                              : modelData.documentName
                         font.pixelSize: 11
                         color: "#888888"
                     }

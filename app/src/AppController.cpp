@@ -22,7 +22,7 @@ namespace {
 const char *kConnInfo = "host=127.0.0.1 port=5434 dbname=lexis user=lexis password=lexis_dev_only";
 const char *kStopwordsPath = "data/stopwords/english.txt";
 const char *kWordnetDir = "data/wordnet";
-const char *kModelPath = "data/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf";
+const char *kModelPath = "data/models/Qwen3.5-2B-Q4_K_M.gguf"; // see main.c's LEXIS_MODEL_PATH comment
 } // namespace
 
 AppController::AppController(QObject *parent)

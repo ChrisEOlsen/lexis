@@ -50,4 +50,19 @@ char *generation_generate_answer(const char *query_text, PgStore *store,
 char *generation_generate_answer_with_history(const char *query_text, PgStore *store, const BM25ResultSet *results,
                                                const LocalLlmTurn *history, size_t history_count);
 
+/* "Read the whole group" counterpart: instead of BM25 passages, the
+ * context block is every document currently in the active corpus (via
+ * pg_store_get_all_documents()), included whole and in order until the
+ * next one wouldn't fit the model's context budget, then stopped -- see
+ * this function's .c-file implementation comment for the single-
+ * oversized-document edge case. `query_text` is the user's original
+ * question. `history` is windowed the same way
+ * generation_generate_answer_with_history() windows it, against
+ * whatever room is left after the document context block. Falls back to
+ * a plain single-turn call when `history_count == 0`. Returns NULL if
+ * the corpus has no documents, or if prompt-building or generation
+ * itself fails. */
+char *generation_generate_answer_from_documents(const char *query_text, PgStore *store, const LocalLlmTurn *history,
+                                                 size_t history_count);
+
 #endif /* LEXIS_GENERATION_H */

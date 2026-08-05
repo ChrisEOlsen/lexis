@@ -216,7 +216,7 @@ static char *run_decode_loop(llama_token *tokens, int32_t n_tokens) {
     return reply.data;
 }
 
-char *local_llm_chat_completion_multi(const LocalLlmTurn *turns, size_t count) {
+char *local_llm_chat_completion_multi(const LocalLlmTurn *turns, size_t count, const char *prefill) {
     if (!g_initialized) {
         fprintf(stderr, "local_llm_chat_completion_multi: module not initialized\n");
         return NULL;
@@ -239,16 +239,39 @@ char *local_llm_chat_completion_multi(const LocalLlmTurn *turns, size_t count) {
         return NULL;
     }
 
-    int32_t n_tokens_max = formatted_len + 16;
+    /* prefill is appended directly after the template's own
+     * assistant-turn opening (already the tail of `formatted`, since
+     * apply_chat_template_multi() always renders with
+     * add_generation_prompt=true) -- see this function's own doc
+     * comment in the header for why this is how thinking gets skipped
+     * for a given call. */
+    char *promptText = formatted;
+    int32_t promptLen = formatted_len;
+    char *withPrefill = NULL;
+    if (prefill != NULL) {
+        size_t prefillLen = strlen(prefill);
+        withPrefill = malloc((size_t)formatted_len + prefillLen + 1);
+        if (withPrefill == NULL) {
+            free(formatted);
+            return NULL;
+        }
+        memcpy(withPrefill, formatted, (size_t)formatted_len);
+        memcpy(withPrefill + formatted_len, prefill, prefillLen + 1);
+        promptText = withPrefill;
+        promptLen = formatted_len + (int32_t)prefillLen;
+    }
+
+    int32_t n_tokens_max = promptLen + 16;
     llama_token *tokens = malloc((size_t)n_tokens_max * sizeof(llama_token));
     if (tokens == NULL) {
         free(formatted);
+        free(withPrefill);
         return NULL;
     }
 
-    int32_t n_tokens =
-        llama_tokenize(g_vocab, formatted, formatted_len, tokens, n_tokens_max, true, true);
+    int32_t n_tokens = llama_tokenize(g_vocab, promptText, promptLen, tokens, n_tokens_max, true, true);
     free(formatted);
+    free(withPrefill);
     if (n_tokens < 0) {
         fprintf(stderr, "local_llm_chat_completion_multi: tokenization failed\n");
         free(tokens);
@@ -270,7 +293,7 @@ char *local_llm_chat_completion_multi(const LocalLlmTurn *turns, size_t count) {
 
 char *local_llm_chat_completion(const char *user_message) {
     LocalLlmTurn turn = {.role = "user", .content = user_message};
-    return local_llm_chat_completion_multi(&turn, 1);
+    return local_llm_chat_completion_multi(&turn, 1, NULL);
 }
 
 int local_llm_count_tokens(const char *text) {

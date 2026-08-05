@@ -85,6 +85,7 @@ set(LEXIS_CORE_SRCS
     ${LEXIS_ROOT}/src/core/bulk_ingest.c
     ${LEXIS_ROOT}/src/core/eval.c
     ${LEXIS_ROOT}/src/core/csv_parse.c
+    ${LEXIS_ROOT}/src/core/tool_router.c
 )
 
 add_library(lexis_core STATIC ${LEXIS_CORE_SRCS})

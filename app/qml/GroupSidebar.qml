@@ -1,5 +1,13 @@
 // Left-hand "groups" panel: lists every corpus via AppController.corpusModel,
 // lets the user create/delete groups and pick which one is active.
+//
+// ComponentBehavior: Bound -- delegates below reference IDs declared in
+// this outer file (listView, root, deleteConfirm). Without this pragma
+// those lookups happen dynamically at runtime and qmllint flags every
+// one as "unqualified access"; with it they bind lexically at compile
+// time, which is both faster and statically checkable.
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts

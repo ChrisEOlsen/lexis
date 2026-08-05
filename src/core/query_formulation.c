@@ -384,7 +384,7 @@ char *query_formulation_contextualize_question(const char *question, const Local
     free(windowed);
     turns[windowed_count] = (LocalLlmTurn){.role = "user", .content = builder.data};
 
-    char *response = local_llm_chat_completion_multi(turns, windowed_count + 1);
+    char *response = local_llm_chat_completion_multi(turns, windowed_count + 1, NULL);
     free(turns);
     free(builder.data);
 

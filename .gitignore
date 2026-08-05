@@ -30,3 +30,6 @@ venv/
 # OS/editor cruft
 .DS_Store
 /.cache/
+
+# qmlls config -- holds an absolute path to the local build tree
+**/.qmlls.ini

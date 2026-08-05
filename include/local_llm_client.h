@@ -67,8 +67,17 @@ char *local_llm_chat_completion(const char *user_message);
  * into one string -- then greedily decodes a reply to the implied next
  * turn. `count` must be >= 1. Same failure contract as
  * local_llm_chat_completion(): NULL if uninitialized, the formatted
- * prompt doesn't fit in the context window, or generation fails. */
-char *local_llm_chat_completion_multi(const LocalLlmTurn *turns, size_t count);
+ * prompt doesn't fit in the context window, or generation fails.
+ *
+ * `prefill`, if non-NULL, is appended to the templated prompt (after the
+ * chat template's own assistant-turn opening) before tokenizing --
+ * verified as the way to skip a thinking model's reasoning pass for a
+ * given call at zero extra latency and no template-engine work: passing
+ * "<think>\n\n</think>\n\n" makes the model see an already-closed, empty
+ * reasoning block as context it doesn't need to (re-)generate, so
+ * continuation goes straight to the real answer. Pass NULL for normal
+ * behavior (whatever the model's chat template does by default). */
+char *local_llm_chat_completion_multi(const LocalLlmTurn *turns, size_t count, const char *prefill);
 
 /* Tokenizes `text` (module's own vocabulary, no BOS/special tokens added
  * -- this counts one turn's own content toward a windowing budget, not a

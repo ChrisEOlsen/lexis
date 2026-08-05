@@ -4,6 +4,12 @@
 // concurrent rebuild while one is already running) and the chat panel
 // filling the rest of the width on the right, so both are visible at
 // once while a group is selected.
+//
+// ComponentBehavior: Bound -- the document delegate references the outer
+// documentList ID; this binds that lookup lexically instead of resolving
+// it dynamically at runtime.
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts

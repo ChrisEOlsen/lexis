@@ -1,0 +1,124 @@
+/*
+ * Implementation of tool routing.
+ * See include/tool_router.h for the module's role.
+ */
+
+#define _POSIX_C_SOURCE 200809L
+
+#include "tool_router.h"
+
+#include "string_builder.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+/* Reserves room for this call's own prompt wrapper + the question itself
+ * + the model's one-word answer -- deliberately tiny, since the whole
+ * point of this call is a single-word decision, not prose. */
+#define TOOL_ROUTER_RESERVED_TOKENS 500
+
+/* Prefill that skips the model's reasoning pass for this call -- see
+ * local_llm_chat_completion_multi()'s own doc comment. Tool *choice*
+ * held up fine without a reasoning pass in testing (a one-word
+ * classification doesn't need chain-of-thought the way open-ended
+ * generation might), so there's no reason to pay for it here. */
+#define TOOL_ROUTER_PREFILL "<think>\n\n</think>\n\n"
+
+/* Same windowing algorithm as query_formulation.c's/generation.c's own
+ * copies -- see either for the full behavior doc comment. Kept as its
+ * own copy rather than a shared helper for the same reason those two
+ * are separate from each other: each call site's budget differs, and
+ * the walking logic itself is short enough that sharing it would cost
+ * more in indirection than it'd save. */
+static LocalLlmTurn *window_history(const LocalLlmTurn *history, size_t history_count, int budget_tokens,
+                                     size_t *out_count) {
+    size_t start = history_count;
+    int running_tokens = 0;
+    for (size_t i = history_count; i-- > 0;) {
+        int turn_tokens = local_llm_count_tokens(history[i].content);
+        if (turn_tokens < 0) {
+            turn_tokens = 0;
+        }
+        if (running_tokens + turn_tokens > budget_tokens) {
+            break;
+        }
+        running_tokens += turn_tokens;
+        start = i;
+    }
+
+    size_t kept = history_count - start;
+    LocalLlmTurn *windowed = malloc(sizeof(LocalLlmTurn) * (kept > 0 ? kept : 1));
+    if (windowed == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < kept; i++) {
+        windowed[i] = history[start + i];
+    }
+    *out_count = kept;
+    return windowed;
+}
+
+/* Case-insensitive substring search -- strcasestr() is a BSD/glibc
+ * extension, not portable C11, so this project rolls its own the same
+ * way it already avoids other non-standard libc extensions elsewhere. */
+static int contains_case_insensitive(const char *haystack, const char *needle) {
+    size_t needle_len = strlen(needle);
+    for (const char *p = haystack; *p != '\0'; p++) {
+        size_t i = 0;
+        while (i < needle_len && p[i] != '\0' &&
+               (p[i] | 0x20) == (needle[i] | 0x20)) { /* ASCII-only lowercase fold, matches this
+                                                        * project's existing ASCII-only tokenizer
+                                                        * assumption (see tokenizer.c/LIMITATIONS.md) */
+            i++;
+        }
+        if (i == needle_len) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+ToolChoice tool_router_choose_tool(const char *question, const LocalLlmTurn *history, size_t history_count) {
+    size_t windowed_count = 0;
+    LocalLlmTurn *windowed =
+        window_history(history, history_count, LOCAL_LLM_N_CTX - TOOL_ROUTER_RESERVED_TOKENS, &windowed_count);
+    if (windowed == NULL) {
+        return TOOL_SEARCH_PASSAGES; /* allocation failure -- fall back to the proven path */
+    }
+
+    StringBuilder builder = {NULL, 0, 0};
+    if (string_builder_append(&builder,
+            "You must choose exactly one tool to answer the user's question. Respond with ONLY "
+            "one word: SEARCH or READ.\n\n"
+            "- SEARCH: for specific, narrow questions answerable by finding particular passages "
+            "(e.g. \"what is the minimum age for X?\").\n"
+            "- READ: for broad questions that need a whole document's context (e.g. \"what is "
+            "this document about?\", \"summarize this\", \"give me an overview\").\n\n"
+            "Question: \"") != 0 ||
+        string_builder_append(&builder, question) != 0 || string_builder_append(&builder, "\"") != 0) {
+        free(builder.data);
+        free(windowed);
+        return TOOL_SEARCH_PASSAGES;
+    }
+
+    LocalLlmTurn *turns = malloc(sizeof(LocalLlmTurn) * (windowed_count + 1));
+    if (turns == NULL) {
+        free(builder.data);
+        free(windowed);
+        return TOOL_SEARCH_PASSAGES;
+    }
+    for (size_t i = 0; i < windowed_count; i++) {
+        turns[i] = windowed[i];
+    }
+    free(windowed);
+    turns[windowed_count] = (LocalLlmTurn){.role = "user", .content = builder.data};
+
+    char *response = local_llm_chat_completion_multi(turns, windowed_count + 1, TOOL_ROUTER_PREFILL);
+    free(turns);
+    free(builder.data);
+
+    ToolChoice choice = (response != NULL && contains_case_insensitive(response, "READ")) ? TOOL_READ_DOCUMENTS
+                                                                                           : TOOL_SEARCH_PASSAGES;
+    free(response);
+    return choice;
+}

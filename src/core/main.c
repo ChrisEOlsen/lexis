@@ -54,12 +54,26 @@
 #define LEXIS_WORDNET_DIR "data/wordnet"
 #define LEXIS_CONFIG_PATH "config/lexis.conf"
 /* Local GGUF model, loaded once at startup (see local_llm_client.c) and
- * reused for both query formulation and generation -- replaces the
- * OpenRouter API per the project's move to a locally hosted model. See
- * SPEED.md/LIMITATIONS.md for why this specific model/quantization was
- * chosen (8GB RAM budget, shared with Postgres). */
-#define LEXIS_MODEL_PATH "data/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
-#define LEXIS_MODEL_LABEL "Llama-3.2-3B-Instruct-Q4_K_M (local)"
+ * reused for query formulation, tool routing, and generation -- replaces
+ * the OpenRouter API per the project's move to a locally hosted model.
+ * See SPEED.md/LIMITATIONS.md for why this specific model/quantization
+ * was chosen (8GB RAM budget, shared with Postgres). Switched from
+ * Llama-3.2-3B-Instruct to Qwen3.5-2B for the interactive chat app's
+ * tool-routing feature (see app/src/QueryWorker.cpp/src/core/
+ * tool_router.c) -- Qwen3.5-4B was tried first and reverted (a genuine
+ * "thinking" model, emits an unprompted <think>...</think> block before
+ * every answer with real latency cost); 2B is the same architecture
+ * family at a much smaller footprint (~2GB total vs 4B's ~4.8GB,
+ * verified via the model's own GGUF metadata) and testing confirmed
+ * prefilling the assistant turn with an already-closed, empty
+ * <think></think> block (see local_llm_chat_completion_multi()'s
+ * `prefill` parameter) reliably skips its reasoning pass at zero extra
+ * latency -- no thinking-mode tax, no Jinja template engine work
+ * needed. The CLI doesn't use tool routing (that's app-only, see
+ * QueryWorker.cpp), but shares this same model/path since only one
+ * model is loaded process-wide (see local_llm_client.c). */
+#define LEXIS_MODEL_PATH "data/models/Qwen3.5-2B-Q4_K_M.gguf"
+#define LEXIS_MODEL_LABEL "Qwen3.5-2B-Q4_K_M (local)"
 #define LEXIS_CHUNK_SIZE 200
 #define LEXIS_CHUNK_OVERLAP 40
 /* Thread count for bulk_ingest.c's Phase 2 worker pool. 6 measured at
