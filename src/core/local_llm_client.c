@@ -216,6 +216,38 @@ static char *run_decode_loop(llama_token *tokens, int32_t n_tokens) {
     return reply.data;
 }
 
+/* Strips a leading <think>...</think> block (plus any whitespace right
+ * after it), in place. Defense-in-depth against a thinking model's
+ * reasoning leaking into a caller's displayed/persisted output --
+ * `prefill` (see above) is how a call *tries* to suppress the block in
+ * the first place, but it isn't a hard guarantee the model won't still
+ * open a fresh <think> tag on its own, so this runs regardless of
+ * whether `prefill` was used. Only strips a block that starts at the
+ * very beginning of `reply` and actually closes -- if there's no
+ * <think>...</think> at all (the common case once every call site here
+ * either prefills or the model just doesn't open one), or an opened
+ * block never closes (e.g. generation hit LOCAL_LLM_MAX_NEW_TOKENS
+ * mid-thought), `reply` is left untouched rather than guessed at. */
+static void strip_leading_think_block(char *reply) {
+    static const char *open_tag = "<think>";
+    static const char *close_tag = "</think>";
+    size_t open_len = strlen(open_tag);
+
+    if (strncmp(reply, open_tag, open_len) != 0) {
+        return;
+    }
+    char *close = strstr(reply + open_len, close_tag);
+    if (close == NULL) {
+        return;
+    }
+
+    char *after = close + strlen(close_tag);
+    while (*after == '\n' || *after == '\r' || *after == ' ' || *after == '\t') {
+        after++;
+    }
+    memmove(reply, after, strlen(after) + 1); /* +1 to carry the NUL terminator along */
+}
+
 char *local_llm_chat_completion_multi(const LocalLlmTurn *turns, size_t count, const char *prefill) {
     if (!g_initialized) {
         fprintf(stderr, "local_llm_chat_completion_multi: module not initialized\n");
@@ -288,6 +320,9 @@ char *local_llm_chat_completion_multi(const LocalLlmTurn *turns, size_t count, c
 
     char *reply = run_decode_loop(tokens, n_tokens);
     free(tokens);
+    if (reply != NULL) {
+        strip_leading_think_block(reply);
+    }
     return reply;
 }
 

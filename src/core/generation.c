@@ -12,6 +12,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Prefilled into both generation_generate_answer_with_history()'s and
+ * generation_generate_answer_from_documents()'s calls (but not the
+ * plain generation_generate_answer(), which stays untouched for main.c/
+ * eval.c) -- unlike tool_router.c's routing decision, this isn't just
+ * about output cleanliness (local_llm_chat_completion_multi() already
+ * strips a leaked <think> block regardless), it's a real latency win:
+ * skipping the reasoning pass means the model spends every generated
+ * token on the actual answer instead of a discarded internal monologue
+ * first. Verified in testing that the interactive-chat answer quality
+ * held up without it anyway (the model produced comprehensive, accurate
+ * answers with an empty reasoning block even before this was forced). */
+#define GENERATION_PREFILL "<think>\n\n</think>\n\n"
+
 char *generation_build_prompt(const char *query_text, PgStore *store,
                                const BM25ResultSet *results) {
     if (results->count == 0) {
@@ -137,7 +150,8 @@ char *generation_generate_answer_with_history(const char *query_text, PgStore *s
     }
 
     if (history_count == 0) {
-        char *answer = local_llm_chat_completion(prompt);
+        LocalLlmTurn turn = {.role = "user", .content = prompt};
+        char *answer = local_llm_chat_completion_multi(&turn, 1, GENERATION_PREFILL);
         free(prompt);
         return answer;
     }
@@ -170,7 +184,7 @@ char *generation_generate_answer_with_history(const char *query_text, PgStore *s
     free(windowed);
     turns[windowed_count] = (LocalLlmTurn){.role = "user", .content = prompt};
 
-    char *answer = local_llm_chat_completion_multi(turns, windowed_count + 1, NULL);
+    char *answer = local_llm_chat_completion_multi(turns, windowed_count + 1, GENERATION_PREFILL);
     free(turns);
     free(prompt);
     return answer;
@@ -302,7 +316,8 @@ char *generation_generate_answer_from_documents(const char *query_text, PgStore 
     }
 
     if (history_count == 0) {
-        char *answer = local_llm_chat_completion(prompt);
+        LocalLlmTurn turn = {.role = "user", .content = prompt};
+        char *answer = local_llm_chat_completion_multi(&turn, 1, GENERATION_PREFILL);
         free(prompt);
         return answer;
     }
@@ -335,7 +350,7 @@ char *generation_generate_answer_from_documents(const char *query_text, PgStore 
     free(windowed);
     turns[windowed_count] = (LocalLlmTurn){.role = "user", .content = prompt};
 
-    char *answer = local_llm_chat_completion_multi(turns, windowed_count + 1, NULL);
+    char *answer = local_llm_chat_completion_multi(turns, windowed_count + 1, GENERATION_PREFILL);
     free(turns);
     free(prompt);
     return answer;
