@@ -27,11 +27,18 @@ QString extractPdfText(const QString &path, QString *errorOut) {
         if (page == nullptr) {
             continue;
         }
-        // physical_layout, not the default raw content-stream order --
-        // multi-column pages otherwise come out with columns
-        // interleaved instead of read in the order a person actually
-        // reads them.
-        poppler::ustring text = page->text(poppler::rectf(), poppler::page::physical_layout);
+        // raw_order_layout, not physical_layout -- physical_layout's
+        // geometric column-detection heuristic was tried first on the
+        // assumption it would handle multi-column pages better, but on a
+        // real two-column PDF (a DMV driver's manual) it did the
+        // opposite: it spliced a clause from the neighboring column into
+        // the middle of an unrelated sentence ("Minimum age is" ...
+        // [wrong column's text]... "16."), confirmed by extracting the
+        // same page under all three of poppler-cpp's text_layout_enum
+        // values and diffing the output. raw_order_layout (the PDF's own
+        // content-stream/drawing order) got it right, matching
+        // pdftotext's own default behavior on the same page.
+        poppler::ustring text = page->text(poppler::rectf(), poppler::page::raw_order_layout);
         poppler::byte_array utf8 = text.to_utf8();
         QString pageText = QString::fromUtf8(utf8.data(), static_cast<int>(utf8.size())).trimmed();
         if (pageText.isEmpty()) {
