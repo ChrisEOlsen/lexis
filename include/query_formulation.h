@@ -18,6 +18,7 @@
 #include <stddef.h>
 
 #include "lemmatizer.h"
+#include "local_llm_client.h"
 #include "stopwords.h"
 #include "tokenizer.h"
 #include "wordnet.h"
@@ -102,5 +103,22 @@ TokenList *query_formulation_formulate_query(const char *query_text,
  * NULL only on allocation failure" contract. */
 TokenList *query_formulation_terms_only(const char *query_text, const StopwordSet *stopwords,
                                          const WordNetTable *wordnet, const Lemmatizer *lemmatizer);
+
+/* Rewrites `question` as a standalone question given `history` (oldest
+ * first, alternating "user"/"assistant" turns) -- resolves pronouns and
+ * references against what was said earlier in the conversation (e.g.
+ * "what about that instead?" -> "what is the minimum age for a Junior
+ * Operator Class MJ license?"), so the *search* step gets a
+ * self-contained query even though the user's actual question wasn't
+ * one. Returns a copy of `question` unchanged if `history_count == 0` --
+ * no LLM call, since there's nothing to resolve against on the first
+ * message of a session. `history` is windowed internally (oldest turns
+ * dropped first) to whatever fits under LOCAL_LLM_N_CTX alongside this
+ * call's own prompt overhead. Falls back to a copy of `question` if the
+ * model call fails or returns nothing usable -- same graceful-
+ * degradation shape as query_formulation_formulate_query()'s WordNet-
+ * selection fallback. Returns NULL only on allocation failure. */
+char *query_formulation_contextualize_question(const char *question, const LocalLlmTurn *history,
+                                                size_t history_count);
 
 #endif /* LEXIS_QUERY_FORMULATION_H */

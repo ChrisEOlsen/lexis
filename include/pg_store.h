@@ -130,6 +130,84 @@ void pg_store_corpora_free(PgStoreCorpus *corpora, size_t count);
  * case nothing is deleted -- the whole operation rolls back). */
 int pg_store_delete_corpus(PgStore *store, int64_t corpus_id);
 
+/* -- Chat history -- each group ("corpus") can have multiple chat
+ * sessions. Both chat_sessions and chat_messages live permanently in the
+ * public schema, next to public.corpora, NOT inside a corpus's own
+ * per-corpus schema -- rebuild-on-append (see pg_store_swap_corpus_schema()
+ * below) drops and replaces a corpus's own schema on every document
+ * added to it, which would silently destroy chat history if it were
+ * stored alongside documents/passages/terms/postings. -- */
+
+/* One chat session as read back from the registry -- title is an owned
+ * copy, freed via pg_store_chat_sessions_free(). */
+typedef struct {
+    int64_t id;
+    char *title;
+} PgStoreChatSession;
+
+/* Creates public.chat_sessions/public.chat_messages if they don't already
+ * exist. Idempotent (IF NOT EXISTS). Returns 0 on success, -1 on failure.
+ * Called automatically by every other chat function below; exposed
+ * separately like pg_store_ensure_corpora_registry() for any caller that
+ * only needs to read. */
+int pg_store_ensure_chat_tables(PgStore *store);
+
+/* Creates a new chat session under corpus_id, titled `title` (the
+ * caller's job to derive -- e.g. the first ~60 chars of the first
+ * question; this function just stores whatever string it's given).
+ * Returns the new session's id (> 0) on success, -1 on failure
+ * (corpus_id doesn't exist, title NULL/empty, or any database error). */
+int64_t pg_store_create_chat_session(PgStore *store, int64_t corpus_id, const char *title);
+
+/* Lists every chat session under corpus_id, newest first (ORDER BY id
+ * DESC) -- matches how a chat sidebar wants to show sessions. Sets
+ * *count_out to the number found (0 if the corpus has none yet, not an
+ * error). Returns a newly allocated array the caller must free via
+ * pg_store_chat_sessions_free(), or NULL (with *count_out unset) on a
+ * database or allocation error. */
+PgStoreChatSession *pg_store_list_chat_sessions(PgStore *store, int64_t corpus_id, size_t *count_out);
+
+/* Frees an array returned by pg_store_list_chat_sessions(), including
+ * each entry's owned title. Safe to call with sessions == NULL. */
+void pg_store_chat_sessions_free(PgStoreChatSession *sessions, size_t count);
+
+/* Permanently deletes a chat session and every message in it (ON DELETE
+ * CASCADE from chat_messages.session_id). Returns 0 on success, -1 if
+ * session_id doesn't exist or the delete fails. */
+int pg_store_delete_chat_session(PgStore *store, int64_t session_id);
+
+/* One chat message as read back from a session -- text and sources_json
+ * are owned copies, freed via pg_store_chat_messages_free().
+ * sources_json is NULL for a user message (only assistant messages ever
+ * carry source citations), or whatever JSON string was passed to
+ * pg_store_append_chat_message() otherwise -- this module never parses
+ * it, just stores and returns it verbatim. */
+typedef struct {
+    int is_user;
+    char *text;
+    char *sources_json;
+} PgStoreChatMessage;
+
+/* Records one message in session_id -- is_user distinguishes the
+ * question from the answer, sources_json is NULL for a user message or a
+ * caller-supplied JSON string (typically a serialized array of source
+ * citations) for an assistant message. Returns 0 on success, -1 on
+ * failure (including session_id not existing). */
+int pg_store_append_chat_message(PgStore *store, int64_t session_id, int is_user, const char *text,
+                                  const char *sources_json);
+
+/* Reads back every message in session_id, oldest first (ORDER BY id) --
+ * the full conversation history a caller windows down to whatever fits
+ * the model's context budget. Sets *count_out to the number of messages
+ * found (0 for a session with none yet, not an error). Returns a newly
+ * allocated array the caller must free via pg_store_chat_messages_free(),
+ * or NULL (with *count_out unset) on a database or allocation error. */
+PgStoreChatMessage *pg_store_get_chat_messages(PgStore *store, int64_t session_id, size_t *count_out);
+
+/* Frees an array returned by pg_store_get_chat_messages(), including each
+ * entry's owned text/sources_json. Safe to call with messages == NULL. */
+void pg_store_chat_messages_free(PgStoreChatMessage *messages, size_t count);
+
 /* -- Rebuild-on-append primitives -- see APP_SPEC.md's "Adding documents
  * to an existing group" for the full design: a group is rebuilt (not
  * incrementally appended to) by combining its existing documents with

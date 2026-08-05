@@ -10,6 +10,35 @@
 #ifndef LEXIS_LOCAL_LLM_CLIENT_H
 #define LEXIS_LOCAL_LLM_CLIENT_H
 
+#include <stddef.h>
+
+/* The model's inference context window, in tokens -- large enough for
+ * TOP_K=5 passages at ~200 tokens/chunk plus prompt scaffolding (well
+ * under 2K tokens) AND several turns of windowed chat history (see
+ * query_formulation_contextualize_question()/
+ * generation_generate_answer_with_history()'s windowing helpers, which
+ * need this real ceiling to compute their budgets against). This model's
+ * GGUF metadata reports n_ctx_train = 131072, so 16384 is still a small,
+ * deliberately conservative fraction of what it actually supports,
+ * chosen against real KV-cache memory math (28 layers x 8 KV heads x
+ * 128-dim x 2 bytes(F16) x 2(K+V) per token =~112KB/token, so 16384
+ * tokens =~1.8GB of KV cache) fitting comfortably alongside the ~5.7GB
+ * Metal working-set budget measured on the dev machine (see
+ * LIMITATIONS.md). Declared here, not just in local_llm_client.c, so
+ * every caller that needs to budget against it shares one number rather
+ * than each hardcoding its own copy. */
+#define LOCAL_LLM_N_CTX 16384
+
+/* One turn of a conversation, in the model's own chat-template terms --
+ * `role` is "user" or "assistant" (the two roles this project ever sends;
+ * no "system" turn is used anywhere yet). Both fields are borrowed, never
+ * freed by this module -- the caller owns their lifetime for the duration
+ * of the local_llm_chat_completion_multi() call they're passed to. */
+typedef struct {
+    const char *role;
+    const char *content;
+} LocalLlmTurn;
+
 /* Loads the GGUF model at `model_path` into memory (offloaded to GPU via
  * Metal where available) and initializes the llama.cpp backend. Must be
  * called exactly once, before any other function in this module. Returns
@@ -28,7 +57,26 @@ void local_llm_client_cleanup(void);
  * smart, just fast and grounded" goal over creative variety). Returns the
  * reply text (caller must free()), or NULL if the module hasn't been
  * initialized, the prompt doesn't fit in the context window, or
- * generation fails. */
+ * generation fails. Equivalent to calling
+ * local_llm_chat_completion_multi() with a single "user" turn. */
 char *local_llm_chat_completion(const char *user_message);
+
+/* Multi-turn counterpart: formats `turns[0..count)` (in order, oldest
+ * first, alternating "user"/"assistant") using the model's own chat
+ * template -- the real per-role template markup, not history flattened
+ * into one string -- then greedily decodes a reply to the implied next
+ * turn. `count` must be >= 1. Same failure contract as
+ * local_llm_chat_completion(): NULL if uninitialized, the formatted
+ * prompt doesn't fit in the context window, or generation fails. */
+char *local_llm_chat_completion_multi(const LocalLlmTurn *turns, size_t count);
+
+/* Tokenizes `text` (module's own vocabulary, no BOS/special tokens added
+ * -- this counts one turn's own content toward a windowing budget, not a
+ * full templated prompt) and returns the token count, or -1 if the
+ * module hasn't been initialized or tokenization fails. Used by
+ * query_formulation_contextualize_question()/
+ * generation_generate_answer_with_history()'s windowing helpers to decide
+ * how much conversation history fits under LOCAL_LLM_N_CTX. */
+int local_llm_count_tokens(const char *text);
 
 #endif /* LEXIS_LOCAL_LLM_CLIENT_H */

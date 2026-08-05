@@ -16,15 +16,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Large enough for LEXIS's actual prompts (TOP_K=5 passages at ~200
- * tokens/chunk plus prompt scaffolding, well under 2K tokens) with
- * comfortable headroom, without paying for a context bigger than this
- * pipeline will ever fill. n_batch matches n_ctx so any prompt that fits
- * in the context also fits in a single prefill decode() call -- no
- * chunked-prefill logic needed at this prompt size. See LIMITATIONS.md if
- * that assumption ever needs revisiting (e.g. a much larger TOP_K). */
-#define LOCAL_LLM_N_CTX 4096
-#define LOCAL_LLM_N_BATCH 4096
+/* LOCAL_LLM_N_CTX is declared in local_llm_client.h, not here -- the
+ * windowing helpers in query_formulation.c/generation.c need the real
+ * ceiling to compute how much chat history budget they have, not a
+ * number they'd have to keep in sync with this file by hand. */
+#define LOCAL_LLM_N_BATCH LOCAL_LLM_N_CTX
 #define LOCAL_LLM_MAX_NEW_TOKENS 512
 
 static struct llama_model *g_model = NULL;
@@ -92,26 +88,38 @@ void local_llm_client_cleanup(void) {
     }
 }
 
-/* Formats `user_message` with the model's own chat template into a
+/* Formats `turns[0..count)` with the model's own chat template into a
  * heap buffer (caller must free()). Returns NULL on failure. Handles the
  * "buffer too small" case llama_chat_apply_template signals by reporting
  * a formatted_len larger than the buffer it was given -- grows once and
  * re-applies, per the API's documented contract. */
-static char *apply_chat_template(const char *user_message, int32_t *out_len) {
-    struct llama_chat_message msg = {.role = "user", .content = user_message};
+static char *apply_chat_template_multi(const LocalLlmTurn *turns, size_t count, int32_t *out_len) {
+    struct llama_chat_message *msgs = malloc(count * sizeof(struct llama_chat_message));
+    if (msgs == NULL) {
+        return NULL;
+    }
+    size_t content_len = 0;
+    for (size_t i = 0; i < count; i++) {
+        msgs[i].role = turns[i].role;
+        msgs[i].content = turns[i].content;
+        content_len += strlen(turns[i].content);
+    }
+
     const char *tmpl = llama_model_chat_template(g_model, NULL);
 
-    size_t buf_size = strlen(user_message) * 2 + 256;
+    size_t buf_size = content_len * 2 + 256;
     char *formatted = malloc(buf_size);
     if (formatted == NULL) {
+        free(msgs);
         return NULL;
     }
 
     int32_t formatted_len =
-        llama_chat_apply_template(tmpl, &msg, 1, true, formatted, (int32_t)buf_size);
+        llama_chat_apply_template(tmpl, msgs, count, true, formatted, (int32_t)buf_size);
     if (formatted_len < 0) {
-        fprintf(stderr, "local_llm_chat_completion: failed to apply chat template\n");
+        fprintf(stderr, "local_llm_chat_completion_multi: failed to apply chat template\n");
         free(formatted);
+        free(msgs);
         return NULL;
     }
 
@@ -119,69 +127,34 @@ static char *apply_chat_template(const char *user_message, int32_t *out_len) {
         char *bigger = realloc(formatted, (size_t)formatted_len);
         if (bigger == NULL) {
             free(formatted);
+            free(msgs);
             return NULL;
         }
         formatted = bigger;
         buf_size = (size_t)formatted_len;
         formatted_len =
-            llama_chat_apply_template(tmpl, &msg, 1, true, formatted, (int32_t)buf_size);
+            llama_chat_apply_template(tmpl, msgs, count, true, formatted, (int32_t)buf_size);
         if (formatted_len < 0) {
             free(formatted);
+            free(msgs);
             return NULL;
         }
     }
 
+    free(msgs);
     *out_len = formatted_len;
     return formatted;
 }
 
-char *local_llm_chat_completion(const char *user_message) {
-    if (!g_initialized) {
-        fprintf(stderr, "local_llm_chat_completion: module not initialized\n");
-        return NULL;
-    }
-
-    /* Each call is a fresh single turn (matching openrouter_chat_completion's
-     * "one prompt in, one reply out" contract) -- clear whatever KV cache
-     * state a previous call left behind so token positions start at 0 and
-     * the model doesn't see an unrelated earlier prompt as prior
-     * conversation. */
-    llama_memory_clear(llama_get_memory(g_ctx), true);
-
-    int32_t formatted_len = 0;
-    char *formatted = apply_chat_template(user_message, &formatted_len);
-    if (formatted == NULL) {
-        return NULL;
-    }
-
-    int32_t n_tokens_max = formatted_len + 16;
-    llama_token *tokens = malloc((size_t)n_tokens_max * sizeof(llama_token));
-    if (tokens == NULL) {
-        free(formatted);
-        return NULL;
-    }
-
-    int32_t n_tokens =
-        llama_tokenize(g_vocab, formatted, formatted_len, tokens, n_tokens_max, true, true);
-    free(formatted);
-    if (n_tokens < 0) {
-        fprintf(stderr, "local_llm_chat_completion: tokenization failed\n");
-        free(tokens);
-        return NULL;
-    }
-    if (n_tokens >= LOCAL_LLM_N_CTX) {
-        fprintf(stderr,
-                "local_llm_chat_completion: prompt (%d tokens) exceeds the %d-token context "
-                "window\n",
-                n_tokens, LOCAL_LLM_N_CTX);
-        free(tokens);
-        return NULL;
-    }
-
+/* Shared greedy-decode loop, run against an already-tokenized prompt
+ * (`tokens[0..n_tokens)`, already sized against LOCAL_LLM_N_CTX by the
+ * caller). Returns the generated reply text (caller must free(), never
+ * NULL on success -- an empty string is a valid reply, see below), or
+ * NULL on failure. Does not free `tokens` -- the caller owns it. */
+static char *run_decode_loop(llama_token *tokens, int32_t n_tokens) {
     struct llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
     struct llama_sampler *sampler = llama_sampler_chain_init(sparams);
     if (sampler == NULL) {
-        free(tokens);
         return NULL;
     }
     /* Greedy (always the highest-probability token) -- deterministic and
@@ -227,7 +200,6 @@ char *local_llm_chat_completion(const char *user_message) {
     }
 
     llama_sampler_free(sampler);
-    free(tokens);
 
     if (!ok) {
         free(reply.data);
@@ -242,4 +214,87 @@ char *local_llm_chat_completion(const char *user_message) {
     }
 
     return reply.data;
+}
+
+char *local_llm_chat_completion_multi(const LocalLlmTurn *turns, size_t count) {
+    if (!g_initialized) {
+        fprintf(stderr, "local_llm_chat_completion_multi: module not initialized\n");
+        return NULL;
+    }
+    if (count == 0) {
+        return NULL;
+    }
+
+    /* Each call is a fresh conversation, not a continuation of whatever
+     * the previous call left in the KV cache -- the full turn history is
+     * always passed in explicitly (see the windowing helpers in
+     * query_formulation.c/generation.c), so token positions must start
+     * at 0 here or the model would see an unrelated earlier prompt
+     * layered underneath this one. */
+    llama_memory_clear(llama_get_memory(g_ctx), true);
+
+    int32_t formatted_len = 0;
+    char *formatted = apply_chat_template_multi(turns, count, &formatted_len);
+    if (formatted == NULL) {
+        return NULL;
+    }
+
+    int32_t n_tokens_max = formatted_len + 16;
+    llama_token *tokens = malloc((size_t)n_tokens_max * sizeof(llama_token));
+    if (tokens == NULL) {
+        free(formatted);
+        return NULL;
+    }
+
+    int32_t n_tokens =
+        llama_tokenize(g_vocab, formatted, formatted_len, tokens, n_tokens_max, true, true);
+    free(formatted);
+    if (n_tokens < 0) {
+        fprintf(stderr, "local_llm_chat_completion_multi: tokenization failed\n");
+        free(tokens);
+        return NULL;
+    }
+    if (n_tokens >= LOCAL_LLM_N_CTX) {
+        fprintf(stderr,
+                "local_llm_chat_completion_multi: prompt (%d tokens) exceeds the %d-token context "
+                "window\n",
+                n_tokens, LOCAL_LLM_N_CTX);
+        free(tokens);
+        return NULL;
+    }
+
+    char *reply = run_decode_loop(tokens, n_tokens);
+    free(tokens);
+    return reply;
+}
+
+char *local_llm_chat_completion(const char *user_message) {
+    LocalLlmTurn turn = {.role = "user", .content = user_message};
+    return local_llm_chat_completion_multi(&turn, 1);
+}
+
+int local_llm_count_tokens(const char *text) {
+    if (!g_initialized) {
+        fprintf(stderr, "local_llm_count_tokens: module not initialized\n");
+        return -1;
+    }
+
+    int32_t text_len = (int32_t)strlen(text);
+    int32_t n_tokens_max = text_len + 16;
+    llama_token *tokens = malloc((size_t)n_tokens_max * sizeof(llama_token));
+    if (tokens == NULL) {
+        return -1;
+    }
+
+    /* add_special = false -- this counts one turn's own content toward a
+     * windowing budget, not a full templated prompt (which gets exactly
+     * one BOS token regardless of how many turns it's made of, added by
+     * apply_chat_template_multi()/llama_tokenize() above, not here). */
+    int32_t n_tokens = llama_tokenize(g_vocab, text, text_len, tokens, n_tokens_max, false, true);
+    free(tokens);
+    if (n_tokens < 0) {
+        fprintf(stderr, "local_llm_count_tokens: tokenization failed\n");
+        return -1;
+    }
+    return n_tokens;
 }

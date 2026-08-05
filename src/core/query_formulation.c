@@ -293,3 +293,109 @@ TokenList *query_formulation_terms_only(const char *query_text, const StopwordSe
     query_formulation_candidates_free(candidates);
     return terms;
 }
+
+/* Reserves room for this call's own prompt wrapper + the question itself
+ * + the model's reformulated-question output -- generous since a
+ * rewritten question is always short, unlike generation's own budget
+ * (see generation.c's equivalent constant), which also has to leave room
+ * for a much longer answer. */
+#define QUERY_FORMULATION_CONTEXTUALIZE_RESERVED_TOKENS 1000
+
+/* Trims `history` to the newest suffix that fits within `budget_tokens`
+ * (measured via local_llm_count_tokens() per turn's own content -- the
+ * per-turn chat-template markup itself is a small, roughly fixed
+ * overhead this doesn't bother accounting for separately), walking
+ * backward from the most recent turn so oldest turns are the ones
+ * dropped. Sets *out_count to the number of turns kept (0 is valid --
+ * the whole history got dropped because even the single most recent
+ * turn alone doesn't fit). Returns a newly allocated array of
+ * *out_count entries whose contents are borrowed from `history` (safe
+ * since `history` outlives the caller's use of the result) -- caller
+ * must free() the array itself, not its entries -- or NULL on
+ * allocation failure. */
+static LocalLlmTurn *window_history(const LocalLlmTurn *history, size_t history_count, int budget_tokens,
+                                     size_t *out_count) {
+    size_t start = history_count; /* first surviving index; history_count itself means "keep nothing" */
+    int running_tokens = 0;
+    for (size_t i = history_count; i-- > 0;) {
+        int turn_tokens = local_llm_count_tokens(history[i].content);
+        if (turn_tokens < 0) {
+            turn_tokens = 0; /* a count failure shouldn't drop an otherwise-fitting turn */
+        }
+        if (running_tokens + turn_tokens > budget_tokens) {
+            break;
+        }
+        running_tokens += turn_tokens;
+        start = i;
+    }
+
+    size_t kept = history_count - start;
+    LocalLlmTurn *windowed = malloc(sizeof(LocalLlmTurn) * (kept > 0 ? kept : 1));
+    if (windowed == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < kept; i++) {
+        windowed[i] = history[start + i];
+    }
+    *out_count = kept;
+    return windowed;
+}
+
+char *query_formulation_contextualize_question(const char *question, const LocalLlmTurn *history,
+                                                size_t history_count) {
+    if (history_count == 0) {
+        return strdup(question);
+    }
+
+    size_t windowed_count = 0;
+    LocalLlmTurn *windowed = window_history(
+        history, history_count, LOCAL_LLM_N_CTX - QUERY_FORMULATION_CONTEXTUALIZE_RESERVED_TOKENS, &windowed_count);
+    if (windowed == NULL) {
+        return NULL;
+    }
+    if (windowed_count == 0) {
+        /* Even the single most recent turn didn't fit the budget --
+         * nothing usable to contextualize against. */
+        free(windowed);
+        return strdup(question);
+    }
+
+    StringBuilder builder = {NULL, 0, 0};
+    if (string_builder_append(&builder,
+            "Given the conversation so far, rewrite the following question as a standalone "
+            "question that makes sense with no prior context -- resolve any pronouns or "
+            "references to what was discussed earlier. Respond with ONLY the rewritten "
+            "question, no other text.\n\nQuestion: \"") != 0 ||
+        string_builder_append(&builder, question) != 0 || string_builder_append(&builder, "\"") != 0) {
+        free(builder.data);
+        free(windowed);
+        return strdup(question);
+    }
+
+    LocalLlmTurn *turns = malloc(sizeof(LocalLlmTurn) * (windowed_count + 1));
+    if (turns == NULL) {
+        free(builder.data);
+        free(windowed);
+        return strdup(question);
+    }
+    for (size_t i = 0; i < windowed_count; i++) {
+        turns[i] = windowed[i];
+    }
+    free(windowed);
+    turns[windowed_count] = (LocalLlmTurn){.role = "user", .content = builder.data};
+
+    char *response = local_llm_chat_completion_multi(turns, windowed_count + 1);
+    free(turns);
+    free(builder.data);
+
+    if (response == NULL || response[0] == '\0') {
+        /* Call failed or produced nothing usable -- fall back to the
+         * original question unresolved, same graceful-degradation shape
+         * as query_formulation_formulate_query()'s WordNet-selection
+         * fallback: an unreliable LLM step degrades search, doesn't
+         * break it. */
+        free(response);
+        return strdup(question);
+    }
+    return response;
+}

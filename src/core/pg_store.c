@@ -319,6 +319,200 @@ int pg_store_delete_corpus(PgStore *store, int64_t corpus_id) {
     return exec_simple(store->conn, "COMMIT;", "pg_store_delete_corpus");
 }
 
+/* Lives in public, next to public.corpora -- see pg_store.h's "Chat
+ * history" comment for why chat data can't live inside a corpus's own
+ * per-corpus schema. sources is JSONB, not TEXT, so a caller could in
+ * principle query into it later (e.g. "sessions that cited document X"),
+ * though nothing does yet -- this module only ever stores/returns it
+ * verbatim as text (see pg_store_append_chat_message()/
+ * pg_store_get_chat_messages()). */
+#define LEXIS_CHAT_TABLES_SQL                                           \
+    "CREATE TABLE IF NOT EXISTS public.chat_sessions ("                 \
+    "    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"           \
+    "    corpus_id BIGINT NOT NULL REFERENCES public.corpora(id) ON DELETE CASCADE," \
+    "    title TEXT NOT NULL,"                                          \
+    "    created_at TIMESTAMPTZ NOT NULL DEFAULT now()"                 \
+    ");"                                                                \
+    "CREATE TABLE IF NOT EXISTS public.chat_messages ("                 \
+    "    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"           \
+    "    session_id BIGINT NOT NULL REFERENCES public.chat_sessions(id) ON DELETE CASCADE," \
+    "    is_user BOOLEAN NOT NULL,"                                     \
+    "    text TEXT NOT NULL,"                                           \
+    "    sources JSONB,"                                                \
+    "    created_at TIMESTAMPTZ NOT NULL DEFAULT now()"                 \
+    ");"                                                                \
+    "CREATE INDEX IF NOT EXISTS chat_messages_session_id_idx ON public.chat_messages(session_id, id);"
+
+int pg_store_ensure_chat_tables(PgStore *store) {
+    return exec_simple(store->conn, LEXIS_CHAT_TABLES_SQL, "pg_store_ensure_chat_tables");
+}
+
+int64_t pg_store_create_chat_session(PgStore *store, int64_t corpus_id, const char *title) {
+    if (title == NULL || title[0] == '\0') {
+        return -1;
+    }
+    if (pg_store_ensure_chat_tables(store) != 0) {
+        return -1;
+    }
+
+    char corpus_id_str[32];
+    snprintf(corpus_id_str, sizeof(corpus_id_str), "%lld", (long long)corpus_id);
+    const char *params[2] = {corpus_id_str, title};
+    PGresult *res = PQexecParams(store->conn,
+                                  "INSERT INTO public.chat_sessions (corpus_id, title) VALUES ($1, $2) RETURNING id;",
+                                  2, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1) {
+        fprintf(stderr, "pg_store_create_chat_session: insert failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        return -1;
+    }
+    int64_t id = strtoll(PQgetvalue(res, 0, 0), NULL, 10);
+    PQclear(res);
+    return id;
+}
+
+PgStoreChatSession *pg_store_list_chat_sessions(PgStore *store, int64_t corpus_id, size_t *count_out) {
+    if (pg_store_ensure_chat_tables(store) != 0) {
+        return NULL;
+    }
+
+    char corpus_id_str[32];
+    snprintf(corpus_id_str, sizeof(corpus_id_str), "%lld", (long long)corpus_id);
+    const char *params[1] = {corpus_id_str};
+    PGresult *res = PQexecParams(
+        store->conn, "SELECT id, title FROM public.chat_sessions WHERE corpus_id = $1 ORDER BY id DESC;", 1, NULL,
+        params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        fprintf(stderr, "pg_store_list_chat_sessions: select failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        return NULL;
+    }
+
+    int rows = PQntuples(res);
+    PgStoreChatSession *sessions = malloc(sizeof(PgStoreChatSession) * (size_t)(rows > 0 ? rows : 1));
+    if (sessions == NULL) {
+        PQclear(res);
+        return NULL;
+    }
+
+    for (int r = 0; r < rows; r++) {
+        sessions[r].id = strtoll(PQgetvalue(res, r, 0), NULL, 10);
+        sessions[r].title = strdup(PQgetvalue(res, r, 1));
+        if (sessions[r].title == NULL) {
+            PQclear(res);
+            pg_store_chat_sessions_free(sessions, (size_t)r + 1);
+            return NULL;
+        }
+    }
+    PQclear(res);
+
+    *count_out = (size_t)rows;
+    return sessions;
+}
+
+void pg_store_chat_sessions_free(PgStoreChatSession *sessions, size_t count) {
+    if (sessions == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        free(sessions[i].title);
+    }
+    free(sessions);
+}
+
+int pg_store_delete_chat_session(PgStore *store, int64_t session_id) {
+    char id_str[32];
+    snprintf(id_str, sizeof(id_str), "%lld", (long long)session_id);
+    const char *params[1] = {id_str};
+
+    PGresult *res = PQexecParams(store->conn, "DELETE FROM public.chat_sessions WHERE id = $1;", 1, NULL, params,
+                                  NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "pg_store_delete_chat_session: delete failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        return -1;
+    }
+    /* affected == 0 means session_id never existed -- same "nonexistent
+     * id is a failure" convention pg_store_delete_corpus() follows. */
+    int affected = atoi(PQcmdTuples(res));
+    PQclear(res);
+    if (affected == 0) {
+        fprintf(stderr, "pg_store_delete_chat_session: no session with id %lld\n", (long long)session_id);
+        return -1;
+    }
+    return 0;
+}
+
+int pg_store_append_chat_message(PgStore *store, int64_t session_id, int is_user, const char *text,
+                                  const char *sources_json) {
+    char id_str[32];
+    snprintf(id_str, sizeof(id_str), "%lld", (long long)session_id);
+    const char *is_user_str = is_user ? "true" : "false";
+    /* A NULL entry in paramValues means SQL NULL regardless of what's in
+     * paramLengths/paramFormats at that index -- libpq's documented
+     * convention, used here so a user message's sources column comes out
+     * NULL, not the literal string "null". */
+    const char *params[4] = {id_str, is_user_str, text, sources_json};
+    PGresult *res = PQexecParams(
+        store->conn,
+        "INSERT INTO public.chat_messages (session_id, is_user, text, sources) VALUES ($1, $2, $3, $4::jsonb);", 4,
+        NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "pg_store_append_chat_message: insert failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        return -1;
+    }
+    PQclear(res);
+    return 0;
+}
+
+PgStoreChatMessage *pg_store_get_chat_messages(PgStore *store, int64_t session_id, size_t *count_out) {
+    char id_str[32];
+    snprintf(id_str, sizeof(id_str), "%lld", (long long)session_id);
+    const char *params[1] = {id_str};
+    PGresult *res = PQexecParams(
+        store->conn, "SELECT is_user, text, sources::text FROM public.chat_messages WHERE session_id = $1 ORDER BY id;",
+        1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        fprintf(stderr, "pg_store_get_chat_messages: select failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        return NULL;
+    }
+
+    int rows = PQntuples(res);
+    PgStoreChatMessage *messages = malloc(sizeof(PgStoreChatMessage) * (size_t)(rows > 0 ? rows : 1));
+    if (messages == NULL) {
+        PQclear(res);
+        return NULL;
+    }
+
+    for (int r = 0; r < rows; r++) {
+        messages[r].is_user = PQgetvalue(res, r, 0)[0] == 't';
+        messages[r].text = strdup(PQgetvalue(res, r, 1));
+        messages[r].sources_json = PQgetisnull(res, r, 2) ? NULL : strdup(PQgetvalue(res, r, 2));
+        if (messages[r].text == NULL || (!PQgetisnull(res, r, 2) && messages[r].sources_json == NULL)) {
+            PQclear(res);
+            pg_store_chat_messages_free(messages, (size_t)r + 1);
+            return NULL;
+        }
+    }
+    PQclear(res);
+
+    *count_out = (size_t)rows;
+    return messages;
+}
+
+void pg_store_chat_messages_free(PgStoreChatMessage *messages, size_t count) {
+    if (messages == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        free(messages[i].text);
+        free(messages[i].sources_json);
+    }
+    free(messages);
+}
+
 int pg_store_create_bare_schema(PgStore *store, const char *schema_name) {
     return create_lexis_tables_in_schema(store->conn, schema_name);
 }

@@ -9,6 +9,7 @@
 #define LEXIS_GENERATION_H
 
 #include "bm25.h"
+#include "local_llm_client.h"
 #include "pg_store.h"
 
 /* Builds the generation prompt: every passage in `results` is fetched
@@ -32,5 +33,21 @@ char *generation_build_prompt(const char *query_text, PgStore *store,
  * to decide how to handle "no answer available". */
 char *generation_generate_answer(const char *query_text, PgStore *store,
                                   const BM25ResultSet *results);
+
+/* History-aware counterpart to generation_generate_answer(): builds the
+ * same context-block-plus-question prompt (via generation_build_prompt(),
+ * reused unchanged) as the final "user" turn, preceded by `history`
+ * (oldest first, alternating "user"/"assistant") windowed down to
+ * whatever fits under LOCAL_LLM_N_CTX alongside the already-built
+ * prompt's own real token count and a reserved output budget. `query_text`
+ * should be the user's original question, not a reformulated search
+ * query -- the reformulation step (see
+ * query_formulation_contextualize_question()) exists only to help
+ * retrieval, not to replace what the user actually asked. Falls back to
+ * generation_generate_answer()'s plain single-turn behavior when
+ * `history_count == 0`. Same failure contract: NULL if prompt-building
+ * or generation itself fails. */
+char *generation_generate_answer_with_history(const char *query_text, PgStore *store, const BM25ResultSet *results,
+                                               const LocalLlmTurn *history, size_t history_count);
 
 #endif /* LEXIS_GENERATION_H */
