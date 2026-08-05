@@ -90,10 +90,13 @@ ToolChoice tool_router_choose_tool(const char *question, const LocalLlmTurn *his
     if (string_builder_append(&builder,
             "You must choose exactly one tool to answer the user's question. Respond with ONLY "
             "one word: SEARCH or READ.\n\n"
-            "- SEARCH: for specific, narrow questions answerable by finding particular passages "
-            "(e.g. \"what is the minimum age for X?\").\n"
-            "- READ: for broad questions that need a whole document's context (e.g. \"what is "
-            "this document about?\", \"summarize this\", \"give me an overview\").\n\n"
+            "- SEARCH: the question asks for a specific fact, number, definition, or detail that "
+            "could be answered by finding one relevant passage -- regardless of how the question "
+            "is phrased (e.g. \"what is the minimum age for X?\", \"how many pounds is the weight "
+            "limit for Y?\", \"what forms are required for Z?\").\n"
+            "- READ: the question is about the document(s) as a whole and could NOT be answered "
+            "from a single excerpt (e.g. \"what is this document about?\", \"summarize this\", "
+            "\"give me an overview\", \"compare everything in this group\").\n\n"
             "Question: \"") != 0 ||
         string_builder_append(&builder, question) != 0 || string_builder_append(&builder, "\"") != 0) {
         free(builder.data);
