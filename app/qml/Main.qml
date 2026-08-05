@@ -9,8 +9,8 @@ import Lexis
 ApplicationWindow {
     id: window
     visible: true
-    width: 1000
-    height: 650
+    width: 1300
+    height: 700
     title: "LEXIS"
 
     Connections {

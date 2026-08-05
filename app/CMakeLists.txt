@@ -140,6 +140,7 @@ qt_add_qml_module(lexis_app
         qml/Main.qml
         qml/GroupSidebar.qml
         qml/GroupContentView.qml
+        qml/ChatPanel.qml
     SOURCES
         src/AppController.h
         src/AppController.cpp

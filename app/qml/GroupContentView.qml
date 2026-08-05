@@ -1,7 +1,9 @@
-// Main content area: shows the active group's documents and accepts
-// drag-and-drop file drops to add more. Disabled (including drops)
-// while AppController.busy -- also what prevents a second drop from
-// starting a second concurrent rebuild while one is already running.
+// Main content area: a narrow document list/drop target on the left
+// (accepts drag-and-drop file drops, disabled -- including drops --
+// while AppController.busy so a second drop can't start a second
+// concurrent rebuild while one is already running) and the chat panel
+// filling the rest of the width on the right, so both are visible at
+// once while a group is selected.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -10,15 +12,6 @@ import Lexis
 Rectangle {
     id: root
     color: "white"
-    enabled: !AppController.busy
-
-    DropArea {
-        anchors.fill: parent
-        enabled: AppController.activeCorpusId >= 0
-        onDropped: function (drop) {
-            AppController.ingestFiles(drop.urls)
-        }
-    }
 
     ColumnLayout {
         anchors.fill: parent
@@ -38,16 +31,37 @@ Rectangle {
             color: "#555555"
         }
 
-        ListView {
+        RowLayout {
             Layout.fillWidth: true
             Layout.fillHeight: true
-            clip: true
-            model: AppController.documentModel
+            spacing: 16
 
-            delegate: ItemDelegate {
-                required property var model
-                width: parent ? parent.width : 0
-                text: model.name
+            ListView {
+                id: documentList
+                Layout.preferredWidth: 260
+                Layout.fillHeight: true
+                clip: true
+                enabled: !AppController.busy
+                model: AppController.documentModel
+
+                delegate: ItemDelegate {
+                    required property var model
+                    width: documentList.width
+                    text: model.name
+                }
+
+                DropArea {
+                    anchors.fill: parent
+                    enabled: !AppController.busy && AppController.activeCorpusId >= 0
+                    onDropped: function (drop) {
+                        AppController.ingestFiles(drop.urls)
+                    }
+                }
+            }
+
+            ChatPanel {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
             }
         }
     }
