@@ -1,0 +1,21 @@
+# clangd (IDE) config only -- has no effect on the actual build.
+#
+# compile_flags.txt is a single flat flag list that clangd applies to
+# EVERY file it opens, and it is written for the C side of this project
+# (-std=c11, -Iinclude, -Iinclude/vendor). src/core/jinja_chat_template.cpp
+# is the one C++17 translation unit here (see the Makefile's separate
+# $(CXX)/$(CXXFLAGS) rule), so those flags are wrong for it twice over:
+#   1. -std=c11 makes clangd parse it as C -- `namespace {` on line 13
+#      becomes "type specifier missing, defaults to 'int'" and every
+#      construct after it cascades into more errors (the red squiggles).
+#   2. -Isrc/core/vendor is missing, so the vendored minja headers
+#      (#include "chat-template.hpp") do not resolve.
+# This fragment patches both, but only for C++ files, leaving the C
+# translation units on the compile_flags.txt settings they need.
+
+If:
+  PathMatch: .*\.(cpp|hpp)
+
+CompileFlags:
+  Remove: [-std=c11]
+  Add: [-std=c++17, -Isrc/core/vendor]

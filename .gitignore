@@ -33,3 +33,7 @@ venv/
 
 # qmlls config -- holds an absolute path to the local build tree
 **/.qmlls.ini
+
+# VSCode workspace settings -- same reason as .qmlls.ini above: pins
+# absolute paths to this machine's Homebrew qmlls and build tree.
+/.vscode/
