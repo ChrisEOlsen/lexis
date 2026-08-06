@@ -9,6 +9,7 @@
 
 #include "local_llm_client.h"
 
+#include "jinja_chat_template.h"
 #include "string_builder.h"
 
 #include <llama.h>
@@ -89,11 +90,33 @@ void local_llm_client_cleanup(void) {
 }
 
 /* Formats `turns[0..count)` with the model's own chat template into a
- * heap buffer (caller must free()). Returns NULL on failure. Handles the
- * "buffer too small" case llama_chat_apply_template signals by reporting
- * a formatted_len larger than the buffer it was given -- grows once and
- * re-applies, per the API's documented contract. */
-static char *apply_chat_template_multi(const LocalLlmTurn *turns, size_t count, int32_t *out_len) {
+ * heap buffer (caller must free()), with `prefill` (if non-NULL) already
+ * folded in -- one complete, ready-to-tokenize prompt either way.
+ * Returns NULL on failure.
+ *
+ * Tries llama_chat_apply_template() first (handles the "buffer too
+ * small" case it signals by reporting a formatted_len larger than the
+ * buffer it was given -- grows once and re-applies, per the API's
+ * documented contract). That function is NOT a real Jinja parser --
+ * llama.h documents it as only supporting a pre-defined list of known
+ * template formats -- so on a genuine failure (a model whose template is
+ * too sophisticated for that list, e.g. Gemma 4's native-tool-calling-
+ * capable template, confirmed directly by reading its raw Jinja source)
+ * this falls back to real Jinja rendering via jinja_render_chat_template()
+ * (minja, vendored under src/core/vendor/).
+ *
+ * The two paths handle `prefill` differently: the plain path appends it
+ * as a literal string after the template's own assistant-turn opening
+ * (see local_llm_chat_completion_multi()'s header doc comment on why
+ * that skips a thinking model's reasoning pass). The Jinja path instead
+ * passes `enable_thinking` as a real template context variable -- modern
+ * templates like Gemma 4's branch on it directly, so the literal prefill
+ * string isn't needed (and Gemma 4's template defaults enable_thinking
+ * to false on its own, confirmed by reading its source -- so prefill ==
+ * NULL going through this path still means "let the template's own
+ * default apply", not "force thinking on"). */
+static char *apply_chat_template_multi(const LocalLlmTurn *turns, size_t count, const char *prefill,
+                                        int32_t *out_len) {
     struct llama_chat_message *msgs = malloc(count * sizeof(struct llama_chat_message));
     if (msgs == NULL) {
         return NULL;
@@ -114,16 +137,9 @@ static char *apply_chat_template_multi(const LocalLlmTurn *turns, size_t count, 
         return NULL;
     }
 
-    int32_t formatted_len =
-        llama_chat_apply_template(tmpl, msgs, count, true, formatted, (int32_t)buf_size);
-    if (formatted_len < 0) {
-        fprintf(stderr, "local_llm_chat_completion_multi: failed to apply chat template\n");
-        free(formatted);
-        free(msgs);
-        return NULL;
-    }
+    int32_t formatted_len = llama_chat_apply_template(tmpl, msgs, count, true, formatted, (int32_t)buf_size);
 
-    if ((size_t)formatted_len > buf_size) {
+    if (formatted_len >= 0 && (size_t)formatted_len > buf_size) {
         char *bigger = realloc(formatted, (size_t)formatted_len);
         if (bigger == NULL) {
             free(formatted);
@@ -132,18 +148,45 @@ static char *apply_chat_template_multi(const LocalLlmTurn *turns, size_t count, 
         }
         formatted = bigger;
         buf_size = (size_t)formatted_len;
-        formatted_len =
-            llama_chat_apply_template(tmpl, msgs, count, true, formatted, (int32_t)buf_size);
-        if (formatted_len < 0) {
-            free(formatted);
-            free(msgs);
+        formatted_len = llama_chat_apply_template(tmpl, msgs, count, true, formatted, (int32_t)buf_size);
+    }
+    free(msgs);
+
+    if (formatted_len < 0) {
+        free(formatted);
+
+        const char *bos = llama_vocab_get_text(g_vocab, llama_vocab_bos(g_vocab));
+        const char *eos = llama_vocab_get_text(g_vocab, llama_vocab_eos(g_vocab));
+        char *jinja_result = jinja_render_chat_template(tmpl, bos, eos, turns, count, /*add_generation_prompt=*/1,
+                                                          /*enable_thinking=*/prefill != NULL ? 0 : 1,
+                                                          /*has_enable_thinking_override=*/prefill != NULL ? 1 : 0);
+        if (jinja_result == NULL) {
+            fprintf(stderr,
+                    "local_llm_chat_completion_multi: failed to apply chat template (plain built-in matcher and "
+                    "Jinja fallback both failed)\n");
             return NULL;
         }
+        *out_len = (int32_t)strlen(jinja_result);
+        return jinja_result;
     }
 
-    free(msgs);
-    *out_len = formatted_len;
-    return formatted;
+    if (prefill == NULL) {
+        *out_len = formatted_len;
+        return formatted;
+    }
+
+    size_t prefill_len = strlen(prefill);
+    char *with_prefill = malloc((size_t)formatted_len + prefill_len + 1);
+    if (with_prefill == NULL) {
+        free(formatted);
+        return NULL;
+    }
+    memcpy(with_prefill, formatted, (size_t)formatted_len);
+    memcpy(with_prefill + formatted_len, prefill, prefill_len + 1);
+    free(formatted);
+
+    *out_len = formatted_len + (int32_t)prefill_len;
+    return with_prefill;
 }
 
 /* Shared greedy-decode loop, run against an already-tokenized prompt
@@ -266,44 +309,20 @@ char *local_llm_chat_completion_multi(const LocalLlmTurn *turns, size_t count, c
     llama_memory_clear(llama_get_memory(g_ctx), true);
 
     int32_t formatted_len = 0;
-    char *formatted = apply_chat_template_multi(turns, count, &formatted_len);
+    char *formatted = apply_chat_template_multi(turns, count, prefill, &formatted_len);
     if (formatted == NULL) {
         return NULL;
     }
 
-    /* prefill is appended directly after the template's own
-     * assistant-turn opening (already the tail of `formatted`, since
-     * apply_chat_template_multi() always renders with
-     * add_generation_prompt=true) -- see this function's own doc
-     * comment in the header for why this is how thinking gets skipped
-     * for a given call. */
-    char *promptText = formatted;
-    int32_t promptLen = formatted_len;
-    char *withPrefill = NULL;
-    if (prefill != NULL) {
-        size_t prefillLen = strlen(prefill);
-        withPrefill = malloc((size_t)formatted_len + prefillLen + 1);
-        if (withPrefill == NULL) {
-            free(formatted);
-            return NULL;
-        }
-        memcpy(withPrefill, formatted, (size_t)formatted_len);
-        memcpy(withPrefill + formatted_len, prefill, prefillLen + 1);
-        promptText = withPrefill;
-        promptLen = formatted_len + (int32_t)prefillLen;
-    }
-
-    int32_t n_tokens_max = promptLen + 16;
+    int32_t n_tokens_max = formatted_len + 16;
     llama_token *tokens = malloc((size_t)n_tokens_max * sizeof(llama_token));
     if (tokens == NULL) {
         free(formatted);
-        free(withPrefill);
         return NULL;
     }
 
-    int32_t n_tokens = llama_tokenize(g_vocab, promptText, promptLen, tokens, n_tokens_max, true, true);
+    int32_t n_tokens = llama_tokenize(g_vocab, formatted, formatted_len, tokens, n_tokens_max, true, true);
     free(formatted);
-    free(withPrefill);
     if (n_tokens < 0) {
         fprintf(stderr, "local_llm_chat_completion_multi: tokenization failed\n");
         free(tokens);

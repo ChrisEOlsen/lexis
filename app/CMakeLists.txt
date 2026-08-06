@@ -86,12 +86,22 @@ set(LEXIS_CORE_SRCS
     ${LEXIS_ROOT}/src/core/eval.c
     ${LEXIS_ROOT}/src/core/csv_parse.c
     ${LEXIS_ROOT}/src/core/tool_router.c
+    ${LEXIS_ROOT}/src/core/jinja_chat_template.cpp
 )
 
 add_library(lexis_core STATIC ${LEXIS_CORE_SRCS})
 target_include_directories(lexis_core PUBLIC
     ${LEXIS_ROOT}/include
     ${LEXIS_ROOT}/include/vendor
+)
+# src/core/vendor also holds the vendored minja/nlohmann-json headers
+# jinja_chat_template.cpp needs (real Jinja2 chat-template rendering for
+# models too sophisticated for llama_chat_apply_template()'s plain
+# built-in matcher -- see local_llm_client.c's own comment). PRIVATE, not
+# PUBLIC like the two above -- nothing outside this one C++ translation
+# unit needs to see minja/nlohmann directly.
+target_include_directories(lexis_core PRIVATE
+    ${LEXIS_ROOT}/src/core/vendor
 )
 
 # Same hardcoded-postgresql@18-keg tradeoff the top-level Makefile makes

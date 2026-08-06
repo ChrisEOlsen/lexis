@@ -32,14 +32,32 @@ LLAMA_CPP_DIR := /opt/homebrew/Cellar/llama.cpp/10180
 GGML_DIR := /opt/homebrew/Cellar/ggml/0.18.0
 
 CFLAGS  := $(shell cat compile_flags.txt) -pedantic
+# -lc++ is needed at link time even though almost everything here is
+# plain C -- jinja_chat_template.cpp (see below) is the one C++
+# translation unit in this project, compiled separately since minja
+# (real Jinja2 rendering, needed for chat templates too sophisticated
+# for llama_chat_apply_template()'s plain built-in matcher -- see
+# local_llm_client.c's own comment) is a C++17 library. Its object file
+# still needs the C++ runtime resolved at final link time even when $(CC)
+# does the linking.
 LDLIBS  := -L$(shell $(PG_CONFIG) --libdir) -lpq -lm -lpthread \
            -L$(LLAMA_CPP_DIR)/lib -L$(GGML_DIR)/lib -lllama -lggml -lggml-base \
-           -Wl,-rpath,$(LLAMA_CPP_DIR)/lib -Wl,-rpath,$(GGML_DIR)/lib
+           -Wl,-rpath,$(LLAMA_CPP_DIR)/lib -Wl,-rpath,$(GGML_DIR)/lib -lc++
 TESTDIR := tests/core
 BUILD   := build
 
 # Real (non-stub) module sources — grows as stub .c files gain content.
 CORE_SRCS := src/core/tokenizer.c src/core/stopwords.c src/core/pg_store.c src/core/bm25.c src/core/ingest.c src/core/local_llm_client.c src/core/vendor/cJSON.c src/core/wordnet.c src/core/query_formulation.c src/core/string_builder.c src/core/generation.c src/core/lemmatizer.c src/core/query_log.c src/core/config.c src/core/bulk_ingest.c src/core/eval.c src/core/csv_parse.c src/core/tool_router.c
+
+# The one C++ translation unit -- not in CORE_SRCS (which $(CC) compiles
+# directly as C11 via $(CFLAGS), wrong flags/language for this file).
+# Compiled separately below with its own $(CXX)/$(CXXFLAGS), then linked
+# into lexis/every test binary as a precompiled object alongside the
+# plain C sources.
+JINJA_SRC := src/core/jinja_chat_template.cpp
+JINJA_OBJ := $(BUILD)/jinja_chat_template.o
+CXX      := c++
+CXXFLAGS := -std=c++17 -Wall -Wextra -Iinclude -Isrc/core/vendor
 
 TEST_SRCS := $(wildcard $(TESTDIR)/test_*.c)
 TEST_BINS := $(patsubst $(TESTDIR)/%.c,$(BUILD)/%,$(TEST_SRCS))
@@ -64,12 +82,16 @@ check: $(TEST_BINS)
 		./$$bin || exit 1; \
 	done
 
-$(BUILD)/%: $(TESTDIR)/%.c $(CORE_SRCS)
+$(JINJA_OBJ): $(JINJA_SRC)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -I$(TESTDIR) -o $@ $< $(CORE_SRCS) $(LDLIBS)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-lexis: src/core/main.c $(CORE_SRCS)
-	$(CC) $(CFLAGS) -o lexis src/core/main.c $(CORE_SRCS) $(LDLIBS)
+$(BUILD)/%: $(TESTDIR)/%.c $(CORE_SRCS) $(JINJA_OBJ)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -I$(TESTDIR) -o $@ $< $(CORE_SRCS) $(JINJA_OBJ) $(LDLIBS)
+
+lexis: src/core/main.c $(CORE_SRCS) $(JINJA_OBJ)
+	$(CC) $(CFLAGS) -o lexis src/core/main.c $(CORE_SRCS) $(JINJA_OBJ) $(LDLIBS)
 
 clean:
 	rm -rf $(BUILD) lexis
