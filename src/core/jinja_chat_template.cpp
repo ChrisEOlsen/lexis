@@ -7,6 +7,27 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <memory>
+#include <string>
+
+namespace {
+// Parsing Gemma 4's real template (18,810 characters of Jinja2 --
+// macros, loops, dictsort) is not cheap: measured directly at ~11
+// seconds per parse on the dev machine, completely dwarfing actual
+// model inference for a short prompt (the router's one-word decision
+// was taking ~12s total for this reason, not because of thinking or
+// generation). The template source is fixed for the lifetime of
+// whichever model is loaded (local_llm_client.c loads exactly one
+// model process-wide), so there's no reason to re-parse it on every
+// call -- cache the parsed template, keyed by its source string, and
+// only reconstruct it if the source actually changes (in practice:
+// only when a different model gets loaded). Not thread-safe, but
+// neither is anything else in this module -- the caller (AppController)
+// already guarantees only one LLM call runs at a time (see
+// local_llm_client.h's own documented constraint).
+std::string g_cached_source;
+std::unique_ptr<minja::chat_template> g_cached_template;
+} // namespace
 
 char *jinja_render_chat_template(const char *jinja_template_src, const char *bos_token, const char *eos_token,
                                   const LocalLlmTurn *turns, size_t count, int add_generation_prompt,
@@ -17,8 +38,11 @@ char *jinja_render_chat_template(const char *jinja_template_src, const char *bos
     // that propagate into local_llm_client.c would be undefined
     // behavior. Matches this bridge's "NULL on failure" contract.
     try {
-        minja::chat_template tmpl(jinja_template_src, bos_token != nullptr ? bos_token : "",
-                                   eos_token != nullptr ? eos_token : "");
+        if (g_cached_template == nullptr || g_cached_source != jinja_template_src) {
+            g_cached_template = std::make_unique<minja::chat_template>(
+                jinja_template_src, bos_token != nullptr ? bos_token : "", eos_token != nullptr ? eos_token : "");
+            g_cached_source = jinja_template_src;
+        }
 
         nlohmann::ordered_json messages = nlohmann::ordered_json::array();
         for (size_t i = 0; i < count; i++) {
@@ -48,7 +72,7 @@ char *jinja_render_chat_template(const char *jinja_template_src, const char *bos
         minja::chat_template_options opts;
         opts.use_bos_token = false;
 
-        std::string rendered = tmpl.apply(inputs, opts);
+        std::string rendered = g_cached_template->apply(inputs, opts);
 
         char *result = static_cast<char *>(std::malloc(rendered.size() + 1));
         if (result == nullptr) {

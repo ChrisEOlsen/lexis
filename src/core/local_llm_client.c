@@ -41,6 +41,12 @@ static void local_llm_log_callback(enum ggml_log_level level, const char *text, 
     }
 }
 
+/* Forward declaration -- defined later in this file, needed here so
+ * local_llm_client_init() can warm its cache (see the call site below
+ * for why). */
+static char *apply_chat_template_multi(const LocalLlmTurn *turns, size_t count, const char *prefill,
+                                        int32_t *out_len);
+
 int local_llm_client_init(const char *model_path) {
     llama_log_set(local_llm_log_callback, NULL);
     llama_backend_init();
@@ -71,6 +77,29 @@ int local_llm_client_init(const char *model_path) {
     }
 
     g_initialized = 1;
+
+    /* Prime the chat-template path now, during startup, rather than
+     * paying for it on the user's first real chat message. Models whose
+     * template needs the Jinja fallback (see apply_chat_template_multi()
+     * below and jinja_chat_template.cpp's own comment) pay real parse
+     * cost the first time it runs -- measured at ~11-12 seconds for
+     * Gemma 4's real Jinja2 template -- which the fallback's own cache
+     * then eliminates for every call after. Without this warm-up, that
+     * one-time cost would land as a jarring delay on the very first
+     * question a user asks instead of overlapping with the ~9-19s model
+     * load this function already costs (same reasoning ModelLoader.h
+     * documents for why the app loads the model proactively at startup
+     * rather than deferring to first use). For models on the plain
+     * built-in template path (Llama, Qwen), this warm-up is
+     * essentially free. Result is discarded either way -- this call
+     * exists purely for its cache side effect; if it fails for some
+     * transient reason, the real call later just tries again on its own
+     * merits. */
+    LocalLlmTurn warmup_turn = {.role = "user", .content = "hi"};
+    int32_t warmup_len = 0;
+    char *warmup_result = apply_chat_template_multi(&warmup_turn, 1, NULL, &warmup_len);
+    free(warmup_result);
+
     return 0;
 }
 
