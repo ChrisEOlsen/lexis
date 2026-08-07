@@ -144,13 +144,26 @@ qt_add_executable(lexis_app src/main.cpp)
 # are plain C++ backend logic with no QML_ELEMENT of their own (nothing
 # in QML ever names them directly), so they're listed as ordinary
 # SOURCES here rather than needing their own registration.
+# pragma Singleton inside Theme.qml only takes effect once the
+# generated qmldir also marks the type "singleton" -- without this,
+# qt_add_qml_module emits a plain "Theme 1.0 Theme.qml" qmldir entry,
+# every Theme.* property access silently evaluates to undefined at
+# runtime (confirmed: "Unable to assign [undefined] to QColor" for
+# every single token, across every file), and yet the type itself still
+# resolves fine (no "Theme unavailable" error), which is what let this
+# go unnoticed until enough files referenced Theme to make the pattern
+# obvious. Must be set before the QML_FILES entry below is processed.
+set_source_files_properties(qml/Theme.qml PROPERTIES QT_QML_SINGLETON_TYPE TRUE)
+
 qt_add_qml_module(lexis_app
     URI Lexis
     VERSION 1.0
     QML_FILES
+        qml/Theme.qml
         qml/Main.qml
         qml/GroupSidebar.qml
-        qml/GroupContentView.qml
+        qml/GroupsListView.qml
+        qml/GroupDocumentsView.qml
         qml/ChatPanel.qml
     SOURCES
         src/AppController.h

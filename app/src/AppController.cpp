@@ -216,7 +216,7 @@ void AppController::selectChatSession(qint64 sessionId) {
                 sources = doc.array().toVariantList();
             }
         }
-        messages.append(ChatMessage{entry.text, entry.isUser, sources});
+        messages.append(ChatMessage{entry.text, entry.isUser, sources, /*isFresh=*/false});
     }
     m_chatModel->setMessages(messages);
 

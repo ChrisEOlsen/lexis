@@ -379,9 +379,16 @@ PgStoreChatSession *pg_store_list_chat_sessions(PgStore *store, int64_t corpus_i
     char corpus_id_str[32];
     snprintf(corpus_id_str, sizeof(corpus_id_str), "%lld", (long long)corpus_id);
     const char *params[1] = {corpus_id_str};
+    /* created_at::text would follow the connection's DateStyle setting
+     * (space-separated, no 'T'/'Z' by default) rather than true ISO
+     * 8601 -- to_char() here pins the wire format so the app side
+     * (QDateTime::fromString(..., Qt::ISODate)) can parse it reliably
+     * regardless of server config. */
     PGresult *res = PQexecParams(
-        store->conn, "SELECT id, title FROM public.chat_sessions WHERE corpus_id = $1 ORDER BY id DESC;", 1, NULL,
-        params, NULL, NULL, 0);
+        store->conn,
+        "SELECT id, title, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+        "FROM public.chat_sessions WHERE corpus_id = $1 ORDER BY id DESC;",
+        1, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         fprintf(stderr, "pg_store_list_chat_sessions: select failed: %s\n", PQerrorMessage(store->conn));
         PQclear(res);
@@ -398,7 +405,8 @@ PgStoreChatSession *pg_store_list_chat_sessions(PgStore *store, int64_t corpus_i
     for (int r = 0; r < rows; r++) {
         sessions[r].id = strtoll(PQgetvalue(res, r, 0), NULL, 10);
         sessions[r].title = strdup(PQgetvalue(res, r, 1));
-        if (sessions[r].title == NULL) {
+        sessions[r].created_at = strdup(PQgetvalue(res, r, 2));
+        if (sessions[r].title == NULL || sessions[r].created_at == NULL) {
             PQclear(res);
             pg_store_chat_sessions_free(sessions, (size_t)r + 1);
             return NULL;
@@ -416,6 +424,7 @@ void pg_store_chat_sessions_free(PgStoreChatSession *sessions, size_t count) {
     }
     for (size_t i = 0; i < count; i++) {
         free(sessions[i].title);
+        free(sessions[i].created_at);
     }
     free(sessions);
 }

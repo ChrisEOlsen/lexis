@@ -20,6 +20,8 @@ QVariant ChatSessionListModel::data(const QModelIndex &index, int role) const {
         return session.id;
     case TitleRole:
         return session.title;
+    case CreatedAtRole:
+        return session.createdAt;
     default:
         return QVariant();
     }
@@ -29,6 +31,7 @@ QHash<int, QByteArray> ChatSessionListModel::roleNames() const {
     return {
         {IdRole, "sessionId"},
         {TitleRole, "title"},
+        {CreatedAtRole, "createdAt"},
     };
 }
 

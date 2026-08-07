@@ -21,6 +21,7 @@ public:
     enum Roles {
         IdRole = Qt::UserRole + 1,
         TitleRole,
+        CreatedAtRole,
     };
 
     explicit ChatSessionListModel(QObject *parent = nullptr);

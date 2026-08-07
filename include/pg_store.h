@@ -138,11 +138,16 @@ int pg_store_delete_corpus(PgStore *store, int64_t corpus_id);
  * added to it, which would silently destroy chat history if it were
  * stored alongside documents/passages/terms/postings. -- */
 
-/* One chat session as read back from the registry -- title is an owned
- * copy, freed via pg_store_chat_sessions_free(). */
+/* One chat session as read back from the registry -- title and
+ * created_at are owned copies, both freed via pg_store_chat_sessions_free().
+ * created_at is the raw TIMESTAMPTZ text as Postgres renders it
+ * (ISO 8601, e.g. "2026-08-06 14:32:07.123456+00") -- parsing into a
+ * real timestamp type is the caller's job (LexisEngine parses it via
+ * Qt::ISODate). */
 typedef struct {
     int64_t id;
     char *title;
+    char *created_at;
 } PgStoreChatSession;
 
 /* Creates public.chat_sessions/public.chat_messages if they don't already

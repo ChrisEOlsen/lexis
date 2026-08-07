@@ -21,6 +21,14 @@ struct ChatMessage {
     QString text;
     bool isUser;
     QVariantList sources; // only ever non-empty for a non-user (answer) message
+    // true only for a message just appended live via addMessage() (this
+    // process, this run); false for anything loaded from history via
+    // setMessages(). Lets the message delegate tell "just arrived,
+    // animate it" apart from "loaded from history, render instantly" --
+    // both paths create fresh QML delegate instances either way, so
+    // Component.onCompleted alone can't distinguish them; this flag is
+    // the actual signal.
+    bool isFresh = false;
 };
 
 class ChatMessageListModel : public QAbstractListModel {
@@ -33,6 +41,7 @@ public:
         TextRole = Qt::UserRole + 1,
         IsUserRole,
         SourcesRole,
+        IsFreshRole,
     };
 
     explicit ChatMessageListModel(QObject *parent = nullptr);

@@ -156,7 +156,8 @@ bool LexisEngine::listChatSessions(qint64 corpusId, QVector<ChatSession> *out) {
 
     out->reserve(static_cast<int>(count));
     for (size_t i = 0; i < count; i++) {
-        out->append(ChatSession{static_cast<qint64>(sessions[i].id), QString::fromUtf8(sessions[i].title)});
+        QDateTime createdAt = QDateTime::fromString(QString::fromUtf8(sessions[i].created_at), Qt::ISODate);
+        out->append(ChatSession{static_cast<qint64>(sessions[i].id), QString::fromUtf8(sessions[i].title), createdAt});
     }
     pg_store_chat_sessions_free(sessions, count);
     return true;

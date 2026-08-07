@@ -1,108 +1,69 @@
-// Left-hand "groups" panel: lists every corpus via AppController.corpusModel,
-// lets the user create/delete groups and pick which one is active.
+// Left-hand panel: a single drill-down StackView. Level 1
+// (GroupsListView) is every group; clicking one selects it and pushes
+// level 2 (GroupDocumentsView), that group's documents; "back" pops.
+// Neither level knows about this StackView -- they only emit
+// groupOpened()/backRequested().
 //
-// ComponentBehavior: Bound -- delegates below reference IDs declared in
-// this outer file (listView, root, deleteConfirm). Without this pragma
-// those lookups happen dynamically at runtime and qmllint flags every
-// one as "unqualified access"; with it they bind lexically at compile
-// time, which is both faster and statically checkable.
+// The panel is a Fluent "layer": a rounded card filled one step lighter
+// than the window, with a hairline border. Fluent builds depth by
+// stacking lighter fills rather than by drawing shadows, so this is the
+// idiomatic way to separate the source list from the content pane -- and
+// it replaces the previous 1px divider that only worked while the window
+// color happened to contrast with both sides.
 pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Controls
-import QtQuick.Layouts
 import Lexis
 
 Rectangle {
     id: root
-    color: "#f5f5f5"
+    color: Qt.lighter(root.palette.window, Theme.layerCard)
+    radius: Theme.radiusM
+    border.width: 1
+    border.color: root.palette.midlight
 
-    property int pendingDeleteId: -1
-    property string pendingDeleteName: ""
-
-    ColumnLayout {
+    StackView {
+        id: stackView
         anchors.fill: parent
-        anchors.margins: 8
-        spacing: 8
+        anchors.margins: Theme.spacingS
+        // StackView does not clip by default -- during a push/pop the
+        // outgoing item is translated aside while the incoming one slides
+        // in, and without clipping both render outside this card's bounds
+        // mid-transition.
+        clip: true
 
-        ListView {
-            id: listView
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-            clip: true
-            model: AppController.corpusModel
-
-            delegate: ItemDelegate {
-                id: itemDelegate
-                required property var model
-                width: listView.width
-                highlighted: model.corpusId === AppController.activeCorpusId
-                onClicked: AppController.selectGroup(model.corpusId)
-
-                contentItem: RowLayout {
-                    Label {
-                        text: itemDelegate.model.displayName
-                        Layout.fillWidth: true
-                        elide: Text.ElideRight
-                        verticalAlignment: Text.AlignVCenter
-                    }
-                    ToolButton {
-                        text: "✕"
-                        onClicked: {
-                            root.pendingDeleteId = itemDelegate.model.corpusId
-                            root.pendingDeleteName = itemDelegate.model.displayName
-                            deleteConfirm.open()
-                        }
-                    }
-                }
-            }
+        // Explicit transitions instead of StackView's defaults, which are
+        // a 400ms full-width x-slide. At 400ms both pages overlap for
+        // most of the animation, which in a narrow column reads as the
+        // outgoing page's button smearing across the incoming one. A
+        // short offset plus a crossfade keeps the "went deeper / came
+        // back" cue without the long two-pages-visible window.
+        pushEnter: Transition {
+            NumberAnimation { property: "x"; from: 24; to: 0; duration: Theme.durationNav; easing.type: Easing.OutCubic }
+            NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Theme.durationNav }
+        }
+        pushExit: Transition {
+            NumberAnimation { property: "x"; from: 0; to: -24; duration: Theme.durationNav; easing.type: Easing.OutCubic }
+            NumberAnimation { property: "opacity"; from: 1; to: 0; duration: Theme.durationNav }
+        }
+        popEnter: Transition {
+            NumberAnimation { property: "x"; from: -24; to: 0; duration: Theme.durationNav; easing.type: Easing.OutCubic }
+            NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Theme.durationNav }
+        }
+        popExit: Transition {
+            NumberAnimation { property: "x"; from: 0; to: 24; duration: Theme.durationNav; easing.type: Easing.OutCubic }
+            NumberAnimation { property: "opacity"; from: 1; to: 0; duration: Theme.durationNav }
         }
 
-        Button {
-            Layout.fillWidth: true
-            text: "New Group"
-            onClicked: {
-                nameField.text = ""
-                newGroupDialog.open()
-            }
+        initialItem: GroupsListView {
+            onGroupOpened: stackView.push(documentsComponent)
         }
-    }
 
-    Dialog {
-        id: deleteConfirm
-        title: "Delete Group"
-        standardButtons: Dialog.Yes | Dialog.No
-        modal: true
-        anchors.centerIn: parent
-
-        Label {
-            text: "Delete \"" + root.pendingDeleteName + "\" and everything in it? This cannot be undone."
-            wrapMode: Text.WordWrap
-        }
-        onAccepted: AppController.deleteGroup(root.pendingDeleteId)
-    }
-
-    Dialog {
-        id: newGroupDialog
-        title: "New Group"
-        standardButtons: Dialog.Ok | Dialog.Cancel
-        modal: true
-        anchors.centerIn: parent
-
-        ColumnLayout {
-            Label {
-                text: "Group name:"
-            }
-            TextField {
-                id: nameField
-                Layout.fillWidth: true
-                Layout.minimumWidth: 220
-                onAccepted: newGroupDialog.accept()
-            }
-        }
-        onAccepted: {
-            if (nameField.text.trim().length > 0) {
-                AppController.createGroup(nameField.text)
+        Component {
+            id: documentsComponent
+            GroupDocumentsView {
+                onBackRequested: stackView.pop()
             }
         }
     }

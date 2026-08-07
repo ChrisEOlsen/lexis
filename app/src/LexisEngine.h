@@ -15,6 +15,7 @@
 #ifndef LEXIS_APP_LEXISENGINE_H
 #define LEXIS_APP_LEXISENGINE_H
 
+#include <QDateTime>
 #include <QString>
 #include <QVector>
 
@@ -30,10 +31,13 @@ struct Corpus {
     QString displayName;
 };
 
-// Qt-idiomatic mirror of PgStoreChatSession.
+// Qt-idiomatic mirror of PgStoreChatSession. createdAt is parsed from
+// PgStoreChatSession's created_at text (Postgres's TIMESTAMPTZ::text
+// rendering) via Qt::ISODate.
 struct ChatSession {
     qint64 id;
     QString title;
+    QDateTime createdAt;
 };
 
 // Qt-idiomatic mirror of PgStoreChatMessage. Named ChatHistoryEntry, not
