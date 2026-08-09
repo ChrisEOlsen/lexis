@@ -87,12 +87,16 @@
 /* One-shot classification into SEARCH / SUMMARY / CHAT. See tool_router.h
  * for what each choice means and why SUMMARY replaced a READ tool.
  *
- * The two closing rules are both load-bearing and both came from observed
- * misroutes. The "refers to the documents in any way" rule fixes a bare
- * fragment ("The documents in the corpus.") being classified CHAT and
- * answered with "you haven't provided any documents". The "judge the
- * latest message on its own" rule fixes history contamination: after two
- * turns of small talk, corpus questions were being pulled into CHAT.
+ * The closing rules are load-bearing and each came from an observed
+ * misroute. "Refers to the documents in any way" fixes a bare fragment
+ * ("The documents in the corpus.") being classified CHAT and answered with
+ * "you haven't provided any documents". "Earlier small talk does not make
+ * the current message conversational" fixes history contamination, where
+ * corpus questions after two chatty turns were pulled into CHAT. The
+ * follow-up rule fixes the reverse of that second one: an earlier version
+ * said simply "judge the latest message on its own", which made an
+ * elliptical continuation ("Is that all? What about the other buttons?")
+ * look like filler, since judged alone it names no subject at all.
  *
  * Verified against the live model, 8/8 intended routes with no history and
  * 3/3 with chatty history ahead of the question. Reword with care, and
@@ -108,21 +112,99 @@
     "- SUMMARY: asks what the collection is, what it covers, or what it is "   \
     "for -- anything about the documents as a whole rather than one detail "   \
     "in them (e.g. \"what is this about?\", \"what are these documents?\", "   \
-    "\"summarize this\", \"what can I ask you?\", \"what topics are "          \
-    "covered?\"). Choose SUMMARY for any question about the documents that "   \
+    "\"summarize this\", \"what topics are covered?\"). Choose SUMMARY for "   \
+    "any question about the CONTENT of the documents that "                    \
     "names no specific detail to look up.\n"                                   \
-    "- CHAT: asks nothing about the documents at all. Greetings, thanks, "     \
-    "apologies, acknowledgements, small talk, and questions about this "       \
-    "conversation itself (e.g. \"thank you!\", \"that was helpful\", "         \
-    "\"hello\", \"what did I just ask you?\").\n\n"                            \
+    "- CHAT: asks nothing about the content of the documents. Greetings, "     \
+    "thanks, apologies, acknowledgements, small talk, and questions about "    \
+    "this conversation itself (e.g. \"thank you!\", \"that was helpful\", "     \
+    "\"hello\", \"what did I just ask you?\"). ALSO questions about YOU "       \
+    "rather than about the documents: what you are, what you can do, what "    \
+    "you have access to, or whether you can reach anything outside the "       \
+    "documents (e.g. \"what are you?\", \"what can you do?\", \"can you "       \
+    "search the web?\", \"can you check online for X?\", \"can you email "      \
+    "this?\").\n\n"                                                            \
     "Rules. A message that refers to the documents in any way -- \"the "       \
     "documents\", \"the corpus\", \"this file\", a filename -- is SEARCH or "  \
     "SUMMARY, never CHAT: the documents exist and are available, so such a "   \
     "message is always a real request about them. Reserve CHAT for messages "  \
-    "that would make just as much sense with no documents present at all. "    \
-    "Judge the latest message on its own; do not let earlier small talk in "   \
-    "the conversation make the current message conversational.\n\n"            \
+    "that would make just as much sense with no documents present at all.\n"   \
+    "Exception: a question about whether you can reach something OUTSIDE "     \
+    "the documents -- the web, the internet, email, other files, another "     \
+    "group, the user's computer -- is CHAT even when it names a document "     \
+    "topic. \"Can you check online whether there is a recall on this "         \
+    "vehicle?\" is CHAT: what is being asked for (the internet) is outside "   \
+    "the documents. A request to look something up INSIDE the documents "      \
+    "stays SEARCH or SUMMARY no matter how it is phrased -- \"can you find "   \
+    "the towing limit?\", \"could you look up the minimum age?\", \"are you "  \
+    "able to tell me the tire pressure?\" are all ordinary document "          \
+    "requests.\n"                                                              \
+    "Earlier small talk does not make the current message conversational -- "  \
+    "judge what THIS message is asking for.\n"                                 \
+    "But a message that continues the previous request -- \"is that all?\", "   \
+    "\"what about the others?\", \"tell me more\", \"and X?\" -- is asking for " \
+    "more of whatever was just answered, and inherits that request's subject " \
+    "even though it names none of its own. Such a follow-up is SEARCH or "     \
+    "SUMMARY, never CHAT.\n\n"                                                 \
     "Message: \""
+
+/* Appended to the router prompt only when the previous answer in this
+ * conversation came from a retrieval tool. Stating it as a fact beats
+ * hoping the model infers it from the transcript, and it is what makes the
+ * follow-up rule above actionable: "is that all?" is only unambiguously a
+ * document request when the thing it follows was one. */
+#define LEXIS_PROMPT_TOOL_ROUTER_PRIOR_RETRIEVAL                              \
+    "\n\nNote: the previous answer in this conversation was drawn from the "  \
+    "documents, so a follow-up here is very likely asking for more of that."
+
+/* -- Conversation (no retrieval) --------------------------------------- */
+
+/* The CHAT path had no instruction block at all: it sent the bare question
+ * and the model answered as a general-purpose assistant with no idea a
+ * document collection was attached. That is how "What about the other
+ * buttons on the steering wheel?" produced a generic essay about modern
+ * cars ending in "please tell me the make, model, and year of your car" --
+ * the rule forbidding exactly that lives in the ANSWER prompts, and this
+ * path never used them.
+ *
+ * This is the ONLY prompt that describes what LEXIS is, deliberately. It
+ * is the one path where the model speaks as the application rather than
+ * answering from retrieved text, so it is the only place where "what are
+ * you?" or "can you check the recall notices?" can land.
+ *
+ * The router does not get this: it is a one-word classification, and every
+ * added sentence is more for it to weigh. The answer prompts do not get it
+ * either, and that one is a real conflict rather than a preference --
+ * LEXIS_PROMPT_RULE_PLAIN_PROSE tells the model not to describe how it
+ * knows what it knows, precisely because it was leaking retrieval
+ * bookkeeping into prose ("this is found in chunk 8"). Handing it the
+ * vocabulary of the retrieval architecture in the same prompt would push
+ * directly against that.
+ *
+ * What it says is capability-level, never implementation: no mention of
+ * BM25, chunks, passages or Postgres, for the same leak-avoidance reason.
+ * The limits matter more than the description -- without them the model
+ * does not know it cannot reach the web or anything outside the active
+ * group, and will make a plausible-looking attempt.
+ *
+ * Still kept short: this path exists for greetings and acknowledgements,
+ * and every sentence is prefill paid on every "thanks". */
+#define LEXIS_PROMPT_CONVERSE_HEAD                                            \
+    "You are LEXIS, an assistant that answers questions about the user's "    \
+    "own documents. The user organises documents into groups and asks "       \
+    "questions about one group at a time; you can answer a specific "         \
+    "question from that group's documents, or describe what the group "       \
+    "covers as a whole. You cannot see anything outside the active group -- " \
+    "no other group, no web access, no files on the user's machine -- so if " \
+    "asked for something beyond it, say plainly that you only have this "     \
+    "group's documents.\n\n"                                                 \
+    "The message below is conversational rather than a request for "          \
+    "information from those documents, so reply directly and briefly. "       \
+    LEXIS_PROMPT_RULE_NO_ASK_FOR_DOCS                                         \
+    "Never ask which product, vehicle, model or version the user means -- "   \
+    "the collection is already loaded and is the only subject. If the "       \
+    "message does need information from the documents after all, say you can " \
+    "look it up and invite them to ask.\n\nMessage: "
 
 /* -- Answer generation ------------------------------------------------- */
 

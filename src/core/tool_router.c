@@ -78,7 +78,8 @@ static int contains_case_insensitive(const char *haystack, const char *needle) {
     return 0;
 }
 
-ToolChoice tool_router_choose_tool(const char *question, const LocalLlmTurn *history, size_t history_count) {
+ToolChoice tool_router_choose_tool(const char *question, const LocalLlmTurn *history, size_t history_count,
+                                    int previous_answer_used_documents) {
     size_t windowed_count = 0;
     LocalLlmTurn *windowed =
         window_history(history, history_count, LOCAL_LLM_N_CTX - TOOL_ROUTER_RESERVED_TOKENS, &windowed_count);
@@ -88,7 +89,9 @@ ToolChoice tool_router_choose_tool(const char *question, const LocalLlmTurn *his
 
     StringBuilder builder = {NULL, 0, 0};
     if (string_builder_append(&builder, LEXIS_PROMPT_TOOL_ROUTER_HEAD) != 0 ||
-        string_builder_append(&builder, question) != 0 || string_builder_append(&builder, "\"") != 0) {
+        string_builder_append(&builder, question) != 0 || string_builder_append(&builder, "\"") != 0 ||
+        (previous_answer_used_documents &&
+         string_builder_append(&builder, LEXIS_PROMPT_TOOL_ROUTER_PRIOR_RETRIEVAL) != 0)) {
         free(builder.data);
         free(windowed);
         return TOOL_SEARCH_PASSAGES;

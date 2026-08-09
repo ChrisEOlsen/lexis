@@ -53,6 +53,16 @@ typedef enum {
  * today's proven pipeline -- on anything ambiguous, unparseable, or if
  * the model call itself fails; this function has no failure return of
  * its own for that reason. */
-ToolChoice tool_router_choose_tool(const char *question, const LocalLlmTurn *history, size_t history_count);
+/* `previous_answer_used_documents` tells the router whether the last answer
+ * in this conversation came from a retrieval tool (SEARCH or SUMMARY). It
+ * exists because an elliptical follow-up -- "is that all?", "what about the
+ * others?" -- names no subject of its own, so judged in isolation it looks
+ * like conversational filler and routes to CHAT. Observed: after three
+ * answers drawn from a vehicle manual, "Is that all? What about the other
+ * buttons on the steering wheel?" routed to CHAT and was answered with a
+ * generic essay about cars that asked the user for their make and model.
+ * Pass 0 when there is no previous answer or it was conversational. */
+ToolChoice tool_router_choose_tool(const char *question, const LocalLlmTurn *history, size_t history_count,
+                                    int previous_answer_used_documents);
 
 #endif /* LEXIS_TOOL_ROUTER_H */

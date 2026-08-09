@@ -32,7 +32,12 @@ import Lexis
 
 Item {
     id: root
-    enabled: AppController.activeCorpusId >= 0
+    // NOT `enabled: activeCorpusId >= 0` on the whole panel. Disabling the
+    // root disables every descendant -- a child cannot re-enable itself,
+    // since effective enabled is the AND of the chain -- which greyed out
+    // the startup loading indicator, the one thing that must look alive
+    // while the model loads and no group is selected yet. The controls that
+    // genuinely need a group now say so individually.
 
     // Readable measure. At 1300px wide, full-bleed paragraphs run to
     // ~180 characters per line; this caps the conversation column and
@@ -188,13 +193,14 @@ Item {
                 }
 
                 Label {
-                    text: {
-                        if (AppController.activeCorpusId < 0)
-                            return qsTr("Select a group to start chatting")
-                        if (!AppController.modelReady)
-                            return qsTr("Loading local model…")
-                        return AppController.activeChatSessionTitle
-                    }
+                    // Deliberately no longer reports model loading. A
+                    // caption in the corner while the whole chat area sits
+                    // empty and disabled reads as a frozen window; the
+                    // loading state now owns the centre of the conversation
+                    // area instead, where the user is already looking.
+                    text: AppController.activeCorpusId < 0
+                          ? qsTr("Select a group to start chatting")
+                          : AppController.activeChatSessionTitle
                     color: root.palette.placeholderText
                     font.pixelSize: Theme.fontSizeCaption
                     Layout.fillWidth: true
@@ -205,12 +211,14 @@ Item {
             Button {
                 text: qsTr("History")
                 flat: true
+                enabled: AppController.activeCorpusId >= 0
                 onClicked: historyDrawer.open()
             }
 
             Button {
                 text: qsTr("New chat")
                 flat: true
+                enabled: AppController.activeCorpusId >= 0
                 onClicked: AppController.startNewChat()
             }
         }
@@ -229,13 +237,38 @@ Item {
             // ListView does not auto-follow once content overflows.
             onCountChanged: positionViewAtEnd()
 
-            // Empty state. An empty ListView with no explanation is the
-            // single most common "is this broken?" moment in a chat UI.
-            Label {
+            // Centre-of-screen state for an empty conversation: either the
+            // model is still loading, or it is ready and waiting for a
+            // question. An empty ListView with no explanation is the single
+            // most common "is this broken?" moment in a chat UI, and a
+            // static caption during a 9-19 second model load reads as a
+            // hung window -- a moving indicator is the difference between
+            // "working" and "frozen".
+            ColumnLayout {
                 anchors.centerIn: parent
-                visible: messageList.count === 0 && AppController.activeCorpusId >= 0
-                color: root.palette.placeholderText
-                text: qsTr("Ask a question about this group's documents.")
+                spacing: Theme.spacingM
+                visible: messageList.count === 0
+
+                BusyIndicator {
+                    running: !AppController.modelReady
+                    visible: running
+                    implicitWidth: 48
+                    implicitHeight: 48
+                    Layout.alignment: Qt.AlignHCenter
+                }
+
+                Label {
+                    Layout.alignment: Qt.AlignHCenter
+                    horizontalAlignment: Text.AlignHCenter
+                    color: root.palette.placeholderText
+                    text: {
+                        if (!AppController.modelReady)
+                            return qsTr("Loading the local model…\nThis takes a few seconds on first start.")
+                        if (AppController.activeCorpusId < 0)
+                            return qsTr("Select a group to start chatting.")
+                        return qsTr("Ask a question about this group's documents.")
+                    }
+                }
             }
 
             delegate: Item {
@@ -283,61 +316,71 @@ Item {
                     anchors.horizontalCenter: parent.horizontalCenter
                     spacing: Theme.spacingXS
 
+                    // Asymmetric on purpose: the user gets a bubble, the
+                    // assistant does not.
+                    //
+                    // A bubble is a speech affordance -- it says "someone
+                    // said this to you", which is right for a short question
+                    // and wrong for a long structured answer. Wrapping
+                    // markdown in a rounded rectangle fights it: headings,
+                    // bullet lists and paragraphs all want the full measure
+                    // and a flush left edge, and a bubble that hugs its text
+                    // gives them a ragged one. Every assistant of this kind
+                    // (Claude, ChatGPT, Gemini) lands on the same split for
+                    // the same reason. It also removes the widest surface
+                    // that had to be re-measured on every reveal tick.
                     Rectangle {
-                        id: bubble
+                        id: userBubble
+                        visible: messageDelegate.model.isUser
                         // Hug the text up to 85% of the column, then wrap.
-                        // No Behavior on width/height: during the
-                        // word-by-word reveal an animated resize fights
-                        // the next word's arrival every 30ms, which is
-                        // visible as the bubble juddering.
-                        width: Math.min(bubbleLabel.implicitWidth + 2 * Theme.spacingM,
+                        // No Behavior on width/height: the user's text never
+                        // animates, and an animated resize during the
+                        // assistant reveal was visible as juddering.
+                        width: Math.min(userLabel.implicitWidth + 2 * Theme.spacingM,
                                         messageColumn.width * 0.85)
-                        height: bubbleLabel.implicitHeight + 2 * Theme.spacingM
+                        height: visible ? userLabel.implicitHeight + 2 * Theme.spacingM : 0
                         radius: Theme.radiusL
-                        anchors.right: messageDelegate.model.isUser ? parent.right : undefined
-                        anchors.left: messageDelegate.model.isUser ? undefined : parent.left
-                        // User speaks in the accent color; the assistant
-                        // speaks on a raised neutral layer. Both come from
-                        // the palette, so a light mode would follow.
-                        color: messageDelegate.model.isUser
-                               ? root.palette.accent
-                               : Qt.lighter(root.palette.window, Theme.layerRaised)
-                        border.width: messageDelegate.model.isUser ? 0 : 1
-                        border.color: root.palette.midlight
+                        anchors.right: parent.right
+                        color: root.palette.accent
 
                         Label {
-                            id: bubbleLabel
+                            id: userLabel
                             anchors.fill: parent
                             anchors.margins: Theme.spacingM
-                            // Assistant answers are Markdown; the model
-                            // emits **bold**, "*  " bullet lists and
-                            // headings, which previously rendered as
-                            // literal punctuation. User messages stay
-                            // PlainText on purpose -- a question that
-                            // happens to contain * or _ is text the user
-                            // typed, not markup they authored.
-                            textFormat: messageDelegate.model.isUser
-                                        ? Text.PlainText : Text.MarkdownText
-                            // Once the reveal is complete, show the stored
-                            // text verbatim rather than the trimmed
-                            // prefix. markdownSafePrefix() must not touch
-                            // the final text: if an answer legitimately
-                            // contains an odd number of "**", trimming
-                            // would hide its tail permanently instead of
-                            // for a frame.
-                            text: messageDelegate.revealComplete
-                                  ? messageDelegate.model.text
-                                  : root.markdownSafePrefix(
-                                        messageDelegate.streamWords.slice(
-                                            0, messageDelegate.revealedWordCount).join(" "))
+                            // PlainText on purpose -- a question that happens
+                            // to contain * or _ is text the user typed, not
+                            // markup they authored.
+                            textFormat: Text.PlainText
+                            text: messageDelegate.model.text
                             wrapMode: Text.WordWrap
-                            color: messageDelegate.model.isUser
-                                   ? root.palette.highlightedText
-                                   : root.palette.text
-                            // Markdown can produce real links. Without
-                            // this they render as links and do nothing.
-                            onLinkActivated: link => Qt.openUrlExternally(link)
+                            color: root.palette.highlightedText
                         }
+                    }
+
+                    // The assistant's answer: full column measure, no
+                    // container, rendered as Markdown.
+                    Label {
+                        id: answerLabel
+                        visible: !messageDelegate.model.isUser
+                        width: messageColumn.width
+                        height: visible ? implicitHeight : 0
+                        textFormat: Text.MarkdownText
+                        // Once the reveal is complete, show the stored text
+                        // verbatim rather than the trimmed prefix.
+                        // markdownSafePrefix() must not touch the final
+                        // text: if an answer legitimately contains an odd
+                        // number of "**", trimming would hide its tail
+                        // permanently instead of for a frame.
+                        text: messageDelegate.revealComplete
+                              ? messageDelegate.model.text
+                              : root.markdownSafePrefix(
+                                    messageDelegate.streamWords.slice(
+                                        0, messageDelegate.revealedWordCount).join(" "))
+                        wrapMode: Text.WordWrap
+                        color: root.palette.text
+                        // Markdown can produce real links. Without this they
+                        // render as links and do nothing.
+                        onLinkActivated: link => Qt.openUrlExternally(link)
                     }
 
                     // Provenance disclosure. Replaces the old row of
@@ -421,7 +464,8 @@ Item {
                 TextField {
                     id: questionField
                     Layout.fillWidth: true
-                    enabled: AppController.modelReady && !AppController.chatBusy
+                    enabled: AppController.activeCorpusId >= 0 && AppController.modelReady
+                             && !AppController.chatBusy
                     placeholderText: qsTr("Ask a question…")
                     onAccepted: if (sendButton.enabled) sendButton.clicked()
                 }
@@ -430,8 +474,8 @@ Item {
                     id: sendButton
                     text: qsTr("Send")
                     highlighted: true
-                    enabled: AppController.modelReady && !AppController.chatBusy
-                             && questionField.text.trim().length > 0
+                    enabled: AppController.activeCorpusId >= 0 && AppController.modelReady
+                             && !AppController.chatBusy && questionField.text.trim().length > 0
                     onClicked: {
                         AppController.sendChatMessage(questionField.text)
                         questionField.text = ""

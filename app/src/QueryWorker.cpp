@@ -39,6 +39,7 @@ extern "C" {
 #include <QJsonObject>
 
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -249,7 +250,12 @@ bool runConversePipeline(const char *questionCstr, const std::vector<LocalLlmTur
     for (size_t i = start; i < turns.size(); i++) {
         windowed.push_back(turns[i]);
     }
-    windowed.push_back(LocalLlmTurn{"user", questionCstr});
+    // The question carries an instruction block now. Without one this path
+    // sent the bare question and the model answered as a general-purpose
+    // assistant with no idea a document collection was attached -- see
+    // LEXIS_PROMPT_CONVERSE_HEAD in prompts.h for the observed failure.
+    QByteArray conversePrompt = QByteArray(LEXIS_PROMPT_CONVERSE_HEAD) + questionCstr;
+    windowed.push_back(LocalLlmTurn{"user", conversePrompt.constData()});
 
     char *answer = local_llm_chat_completion_multi(windowed.data(), windowed.size(), LEXIS_PREFILL_NO_THINK);
     if (answer == nullptr) {
@@ -359,9 +365,29 @@ void QueryWorker::run() {
         turns[i].content = history_rows[i].text;
     }
 
+    // Did the previous answer in this conversation come from a retrieval
+    // tool? The router needs this to read an elliptical follow-up correctly:
+    // "is that all?" names no subject, so judged alone it looks like filler.
+    // Scans backwards for the most recent assistant message and reads the
+    // tool out of its stored provenance -- the same JSON the source
+    // inspector reads, so no new column is needed.
+    bool previousAnswerUsedDocuments = false;
+    for (size_t i = history_count; i-- > 0;) {
+        if (history_rows[i].is_user) {
+            continue;
+        }
+        const char *sources = history_rows[i].sources_json;
+        if (sources != nullptr) {
+            previousAnswerUsedDocuments =
+                strstr(sources, "\"tool\":\"search\"") != nullptr || strstr(sources, "\"tool\":\"summary\"") != nullptr;
+        }
+        break; // only the most recent answer matters
+    }
+
     pg_store_append_chat_message(store, m_sessionId, 1, questionCstr, nullptr);
 
-    ToolChoice tool = tool_router_choose_tool(questionCstr, turns.data(), turns.size());
+    ToolChoice tool =
+        tool_router_choose_tool(questionCstr, turns.data(), turns.size(), previousAnswerUsedDocuments ? 1 : 0);
 
     QString answerText;
     QVariantList sources;
