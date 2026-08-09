@@ -522,6 +522,85 @@ void pg_store_chat_messages_free(PgStoreChatMessage *messages, size_t count) {
     free(messages);
 }
 
+/* Lives in public next to public.corpora -- see pg_store.h's "Group
+ * summaries" comment for why the cache can't live in the corpus's own
+ * schema. PRIMARY KEY on corpus_id, not a generated id: there is exactly
+ * one summary per group, which makes the write an upsert rather than an
+ * insert-plus-cleanup. */
+#define LEXIS_SUMMARY_TABLE_SQL                                              \
+    "CREATE TABLE IF NOT EXISTS public.corpus_summaries ("                   \
+    "    corpus_id BIGINT PRIMARY KEY REFERENCES public.corpora(id) ON DELETE CASCADE," \
+    "    text TEXT NOT NULL,"                                                \
+    "    document_count INT NOT NULL,"                                       \
+    "    generated_at TIMESTAMPTZ NOT NULL DEFAULT now()"                    \
+    ");"
+
+int pg_store_ensure_summary_table(PgStore *store) {
+    return exec_simple(store->conn, LEXIS_SUMMARY_TABLE_SQL, "pg_store_ensure_summary_table");
+}
+
+char *pg_store_get_corpus_summary(PgStore *store, int64_t corpus_id, int *document_count_out) {
+    if (pg_store_ensure_summary_table(store) != 0) {
+        return NULL;
+    }
+
+    char corpus_id_str[32];
+    snprintf(corpus_id_str, sizeof(corpus_id_str), "%lld", (long long)corpus_id);
+    const char *params[1] = {corpus_id_str};
+    PGresult *res =
+        PQexecParams(store->conn, "SELECT text, document_count FROM public.corpus_summaries WHERE corpus_id = $1;", 1,
+                      NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        fprintf(stderr, "pg_store_get_corpus_summary: select failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        return NULL;
+    }
+    /* No row is the normal first-question case, not an error -- no
+     * diagnostic, the caller just builds one. */
+    if (PQntuples(res) != 1) {
+        PQclear(res);
+        return NULL;
+    }
+
+    char *text = strdup(PQgetvalue(res, 0, 0));
+    if (text != NULL && document_count_out != NULL) {
+        *document_count_out = atoi(PQgetvalue(res, 0, 1));
+    }
+    PQclear(res);
+    return text;
+}
+
+int pg_store_set_corpus_summary(PgStore *store, int64_t corpus_id, const char *text, int document_count) {
+    if (text == NULL || text[0] == '\0') {
+        return -1;
+    }
+    if (pg_store_ensure_summary_table(store) != 0) {
+        return -1;
+    }
+
+    char corpus_id_str[32];
+    char document_count_str[32];
+    snprintf(corpus_id_str, sizeof(corpus_id_str), "%lld", (long long)corpus_id);
+    snprintf(document_count_str, sizeof(document_count_str), "%d", document_count);
+    const char *params[3] = {corpus_id_str, text, document_count_str};
+
+    /* Upsert: a regenerated summary replaces the stale one in place, so a
+     * group never accumulates historical summaries nobody reads. */
+    PGresult *res = PQexecParams(store->conn,
+                                  "INSERT INTO public.corpus_summaries (corpus_id, text, document_count) "
+                                  "VALUES ($1, $2, $3) "
+                                  "ON CONFLICT (corpus_id) DO UPDATE SET text = EXCLUDED.text, "
+                                  "document_count = EXCLUDED.document_count, generated_at = now();",
+                                  3, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "pg_store_set_corpus_summary: upsert failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        return -1;
+    }
+    PQclear(res);
+    return 0;
+}
+
 int pg_store_create_bare_schema(PgStore *store, const char *schema_name) {
     return create_lexis_tables_in_schema(store->conn, schema_name);
 }

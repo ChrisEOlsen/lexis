@@ -230,6 +230,45 @@ int bm25_result_set_add(BM25ResultSet *set, int64_t passage_id, double score) {
     return 0;
 }
 
+void bm25_result_set_trim(PgStore *store, BM25ResultSet *set, size_t max_passages, int token_budget,
+                           double score_floor_ratio) {
+    if (set == NULL || set->count == 0) {
+        return;
+    }
+
+    /* set->items is already sorted descending by bm25_search(), so the top
+     * score is item 0 and a single forward pass can apply all three
+     * limits. */
+    double floor_score = (score_floor_ratio > 0.0) ? set->items[0].score * score_floor_ratio : 0.0;
+
+    size_t kept = 0;
+    int running_tokens = 0;
+    for (size_t i = 0; i < set->count && kept < max_passages; i++) {
+        if (score_floor_ratio > 0.0 && set->items[i].score < floor_score) {
+            break;
+        }
+
+        PgStorePassage *passage = pg_store_get_passage(store, set->items[i].passage_id);
+        int passage_tokens = 0;
+        if (passage != NULL) {
+            passage_tokens = passage->token_count;
+            pg_store_passage_free(passage);
+        }
+
+        /* Always keep the top result, however long it is: returning zero
+         * passages because the single best match happens to exceed the
+         * budget would turn a good answer into no answer. */
+        if (kept > 0 && running_tokens + passage_tokens > token_budget) {
+            break;
+        }
+
+        running_tokens += passage_tokens;
+        kept++;
+    }
+
+    set->count = kept;
+}
+
 void bm25_result_set_free(BM25ResultSet *set) {
     if (set == NULL) return;
     free(set->items);

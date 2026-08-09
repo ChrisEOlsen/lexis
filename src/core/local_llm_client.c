@@ -22,7 +22,14 @@
  * ceiling to compute how much chat history budget they have, not a
  * number they'd have to keep in sync with this file by hand. */
 #define LOCAL_LLM_N_BATCH LOCAL_LLM_N_CTX
-#define LOCAL_LLM_MAX_NEW_TOKENS 512
+/* Raised from 512 when thinking mode was enabled for the answer step. A
+ * reasoning pass plus the answer does not fit in 512: measured directly,
+ * a grounded answer's reasoning block alone ran past the cap and the
+ * model never reached the answer at all, returning a truncated monologue.
+ * Calls that don't reason (the one-word tool router, a short summary)
+ * stop at EOS long before this, so the higher ceiling costs them
+ * nothing. */
+#define LOCAL_LLM_MAX_NEW_TOKENS 2048
 
 static struct llama_model *g_model = NULL;
 static struct llama_context *g_ctx = NULL;
@@ -45,7 +52,7 @@ static void local_llm_log_callback(enum ggml_log_level level, const char *text, 
  * local_llm_client_init() can warm its cache (see the call site below
  * for why). */
 static char *apply_chat_template_multi(const LocalLlmTurn *turns, size_t count, const char *prefill,
-                                        int32_t *out_len);
+                                        int force_thinking, int32_t *out_len);
 
 int local_llm_client_init(const char *model_path) {
     llama_log_set(local_llm_log_callback, NULL);
@@ -97,7 +104,7 @@ int local_llm_client_init(const char *model_path) {
      * merits. */
     LocalLlmTurn warmup_turn = {.role = "user", .content = "hi"};
     int32_t warmup_len = 0;
-    char *warmup_result = apply_chat_template_multi(&warmup_turn, 1, NULL, &warmup_len);
+    char *warmup_result = apply_chat_template_multi(&warmup_turn, 1, NULL, /*force_thinking=*/0, &warmup_len);
     free(warmup_result);
 
     return 0;
@@ -145,7 +152,7 @@ void local_llm_client_cleanup(void) {
  * NULL going through this path still means "let the template's own
  * default apply", not "force thinking on"). */
 static char *apply_chat_template_multi(const LocalLlmTurn *turns, size_t count, const char *prefill,
-                                        int32_t *out_len) {
+                                        int force_thinking, int32_t *out_len) {
     struct llama_chat_message *msgs = malloc(count * sizeof(struct llama_chat_message));
     if (msgs == NULL) {
         return NULL;
@@ -187,8 +194,9 @@ static char *apply_chat_template_multi(const LocalLlmTurn *turns, size_t count, 
         const char *bos = llama_vocab_get_text(g_vocab, llama_vocab_bos(g_vocab));
         const char *eos = llama_vocab_get_text(g_vocab, llama_vocab_eos(g_vocab));
         char *jinja_result = jinja_render_chat_template(tmpl, bos, eos, turns, count, /*add_generation_prompt=*/1,
-                                                          /*enable_thinking=*/prefill != NULL ? 0 : 1,
-                                                          /*has_enable_thinking_override=*/prefill != NULL ? 1 : 0);
+                                                          /*enable_thinking=*/force_thinking ? 1 : (prefill != NULL ? 0 : 1),
+                                                          /*has_enable_thinking_override=*/
+                                                          (force_thinking || prefill != NULL) ? 1 : 0);
         if (jinja_result == NULL) {
             fprintf(stderr,
                     "local_llm_chat_completion_multi: failed to apply chat template (plain built-in matcher and "
@@ -288,39 +296,57 @@ static char *run_decode_loop(llama_token *tokens, int32_t n_tokens) {
     return reply.data;
 }
 
-/* Strips a leading <think>...</think> block (plus any whitespace right
- * after it), in place. Defense-in-depth against a thinking model's
- * reasoning leaking into a caller's displayed/persisted output --
- * `prefill` (see above) is how a call *tries* to suppress the block in
- * the first place, but it isn't a hard guarantee the model won't still
- * open a fresh <think> tag on its own, so this runs regardless of
- * whether `prefill` was used. Only strips a block that starts at the
- * very beginning of `reply` and actually closes -- if there's no
- * <think>...</think> at all (the common case once every call site here
- * either prefills or the model just doesn't open one), or an opened
- * block never closes (e.g. generation hit LOCAL_LLM_MAX_NEW_TOKENS
- * mid-thought), `reply` is left untouched rather than guessed at. */
+/* Strips a leading reasoning block (plus any whitespace right after it),
+ * in place, so a thinking model's internal monologue never reaches a
+ * caller's displayed or persisted output.
+ *
+ * Two formats are recognised, because the delimiters are per-model and
+ * getting them wrong is silent -- the reasoning simply arrives as the
+ * answer:
+ *
+ *   <think> ... </think>                 the widespread convention
+ *   <|channel>thought ... <channel|>     Gemma 4's, taken from its own
+ *                                        chat template (note the pipe
+ *                                        moves to the other side on the
+ *                                        closing tag -- it is NOT a typo,
+ *                                        and the template's own
+ *                                        strip_thinking macro splits on
+ *                                        exactly that string)
+ *
+ * Only strips a block that starts at the very beginning of `reply` and
+ * actually closes. An unterminated block -- generation having hit
+ * LOCAL_LLM_MAX_NEW_TOKENS mid-thought -- is left untouched rather than
+ * guessed at, so the truncation is visible instead of being silently
+ * turned into a plausible-looking answer. */
 static void strip_leading_think_block(char *reply) {
-    static const char *open_tag = "<think>";
-    static const char *close_tag = "</think>";
-    size_t open_len = strlen(open_tag);
+    static const struct {
+        const char *open;
+        const char *close;
+    } formats[] = {
+        {"<think>", "</think>"},
+        {"<|channel>thought", "<channel|>"},
+    };
 
-    if (strncmp(reply, open_tag, open_len) != 0) {
+    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
+        size_t open_len = strlen(formats[i].open);
+        if (strncmp(reply, formats[i].open, open_len) != 0) {
+            continue;
+        }
+        char *close = strstr(reply + open_len, formats[i].close);
+        if (close == NULL) {
+            return; /* opened but never closed -- leave it visible */
+        }
+        char *after = close + strlen(formats[i].close);
+        while (*after == '\n' || *after == '\r' || *after == ' ' || *after == '\t') {
+            after++;
+        }
+        memmove(reply, after, strlen(after) + 1); /* +1 carries the NUL along */
         return;
     }
-    char *close = strstr(reply + open_len, close_tag);
-    if (close == NULL) {
-        return;
-    }
-
-    char *after = close + strlen(close_tag);
-    while (*after == '\n' || *after == '\r' || *after == ' ' || *after == '\t') {
-        after++;
-    }
-    memmove(reply, after, strlen(after) + 1); /* +1 to carry the NUL terminator along */
 }
 
-char *local_llm_chat_completion_multi(const LocalLlmTurn *turns, size_t count, const char *prefill) {
+char *local_llm_chat_completion_multi_ex(const LocalLlmTurn *turns, size_t count, const char *prefill,
+                                          int force_thinking) {
     if (!g_initialized) {
         fprintf(stderr, "local_llm_chat_completion_multi: module not initialized\n");
         return NULL;
@@ -338,7 +364,7 @@ char *local_llm_chat_completion_multi(const LocalLlmTurn *turns, size_t count, c
     llama_memory_clear(llama_get_memory(g_ctx), true);
 
     int32_t formatted_len = 0;
-    char *formatted = apply_chat_template_multi(turns, count, prefill, &formatted_len);
+    char *formatted = apply_chat_template_multi(turns, count, prefill, force_thinking, &formatted_len);
     if (formatted == NULL) {
         return NULL;
     }
@@ -403,4 +429,8 @@ int local_llm_count_tokens(const char *text) {
         return -1;
     }
     return n_tokens;
+}
+
+char *local_llm_chat_completion_multi(const LocalLlmTurn *turns, size_t count, const char *prefill) {
+    return local_llm_chat_completion_multi_ex(turns, count, prefill, /*force_thinking=*/0);
 }

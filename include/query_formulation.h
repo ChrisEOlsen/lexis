@@ -101,6 +101,35 @@ TokenList *query_formulation_formulate_query(const char *query_text,
  * directly runnable (see eval.c's `use_llm_expansion` parameter). Same
  * "empty TokenList (not NULL) if nothing survives stopword filtering, or
  * NULL only on allocation failure" contract. */
+/* The union of query_formulation_terms_only(`raw_query`) and
+ * query_formulation_terms_only(`rewritten_query`), deduplicated, with the
+ * raw query's terms first.
+ *
+ * Exists because contextual rewriting and lexical search want opposite
+ * things. query_formulation_contextualize_question() resolves pronouns by
+ * PARAPHRASING -- which is right for comprehension and wrong for BM25,
+ * because a paraphrase can drop the one word the index is keyed on.
+ * Measured against a real corpus: "What are the license classes?" was
+ * rewritten to "What are the different types of driver licenses in New
+ * York State?", which discarded "class" -- the only discriminative term,
+ * since the source text literally reads "Class D", "Class M". Searching
+ * the raw question put the two passages holding every license class at
+ * ranks 1 and 2; searching the rewrite returned none of them at all.
+ *
+ * Taking the union means the rewrite can only ever ADD terms, never lose
+ * one. `rewritten_query` may be NULL (or equal to `raw_query`), in which
+ * case this degrades to plain terms_only() on the raw text.
+ *
+ * Duplicates are removed rather than left in: bm25_search() sums a score
+ * contribution per supplied term, so a term appearing twice would be
+ * double-weighted by accident rather than by design.
+ *
+ * Same "empty TokenList (not NULL) if nothing survives stopword
+ * filtering, NULL only on allocation failure" contract as terms_only(). */
+TokenList *query_formulation_terms_union(const char *raw_query, const char *rewritten_query,
+                                          const StopwordSet *stopwords, const WordNetTable *wordnet,
+                                          const Lemmatizer *lemmatizer);
+
 TokenList *query_formulation_terms_only(const char *query_text, const StopwordSet *stopwords,
                                          const WordNetTable *wordnet, const Lemmatizer *lemmatizer);
 

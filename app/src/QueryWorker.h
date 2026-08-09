@@ -48,8 +48,18 @@ public:
 
 signals:
     // Named queryFinished, not finished -- same QThread::finished()
-    // shadowing reason as IngestWorker::ingestFinished. `sources` is a
-    // QVariantList of QVariantMaps ({"documentName", "chunkId", "score"})
+    // shadowing reason as IngestWorker::ingestFinished.
+    //
+    // `tool` is which tool the router picked -- "search", "read" or
+    // "chat" -- and is what the UI's source inspector reports. It is
+    // carried here rather than inferred from `sources` because the two
+    // are not equivalent: a SEARCH that matched nothing and a CHAT that
+    // retrieved nothing both arrive with an empty list, and they are not
+    // the same event. Empty string when ok is false.
+    //
+    // `sources` is a QVariantList of QVariantMaps -- SEARCH supplies
+    // {"documentName", "chunkId", "score", "text", "tokenCount"}, READ
+    // supplies {"documentName"} per document, CHAT supplies nothing --
     // rather than a custom C++ struct/model type -- already a registered
     // Qt meta-type (safe across the cross-thread queued signal this is
     // delivered over with no extra qRegisterMetaType() needed) and
@@ -58,7 +68,7 @@ signals:
     // text to show and persist -- never empty on ok == true (a "nothing
     // to search for" or "no matching passages" outcome is a real answer
     // string here, not a sentinel the caller has to special-case).
-    void queryFinished(bool ok, QString answer, QVariantList sources);
+    void queryFinished(bool ok, QString answer, QVariantList sources, QString tool);
 
 protected:
     void run() override;

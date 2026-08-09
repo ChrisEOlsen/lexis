@@ -65,4 +65,19 @@ char *generation_generate_answer_with_history(const char *query_text, PgStore *s
 char *generation_generate_answer_from_documents(const char *query_text, PgStore *store, const LocalLlmTurn *history,
                                                  size_t history_count);
 
+/* Answers a broad question from an already-generated group summary (see
+ * corpus_summary.h) rather than from document text. This is what the
+ * SUMMARY tool runs, and it replaced
+ * generation_generate_answer_from_documents() on that path: the summary is
+ * a few hundred tokens, so this is a small, fast prompt no matter how
+ * large the group is.
+ *
+ * `summary_text` must be non-NULL and non-empty -- there is no
+ * "summarize nothing" behavior here, the caller decides what to do when a
+ * group has no summary. `history` is windowed against whatever room is
+ * left after the summary block, same as the other history-aware
+ * generators. Returns NULL on prompt-building or generation failure. */
+char *generation_generate_answer_from_summary(const char *query_text, const char *summary_text,
+                                              const LocalLlmTurn *history, size_t history_count);
+
 #endif /* LEXIS_GENERATION_H */

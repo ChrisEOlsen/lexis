@@ -79,6 +79,21 @@ char *local_llm_chat_completion(const char *user_message);
  * behavior (whatever the model's chat template does by default). */
 char *local_llm_chat_completion_multi(const LocalLlmTurn *turns, size_t count, const char *prefill);
 
+/* Same, with explicit control over the model's reasoning pass.
+ *
+ * `force_thinking` non-zero renders the chat template with
+ * enable_thinking = true AND the override flag set. Both are needed: passing
+ * prefill == NULL alone does NOT turn thinking on, because that path leaves
+ * the override unset and Gemma 4's template defaults enable_thinking to
+ * false on its own. Any reasoning block the model then emits is stripped
+ * from the returned reply, so callers still get just the answer.
+ *
+ * Exists to make "does reasoning improve grounded answers?" a measurable
+ * question rather than an assumption -- every generation call in this project
+ * currently disables it for latency. */
+char *local_llm_chat_completion_multi_ex(const LocalLlmTurn *turns, size_t count, const char *prefill,
+                                          int force_thinking);
+
 /* Tokenizes `text` (module's own vocabulary, no BOS/special tokens added
  * -- this counts one turn's own content toward a windowing budget, not a
  * full templated prompt) and returns the token count, or -1 if the

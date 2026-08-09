@@ -29,30 +29,76 @@ extern "C" {
 #include "generation.h"
 #include "pg_store.h"
 #include "query_formulation.h"
+#include "corpus_summary.h"
+#include "prompts.h"
 #include "tool_router.h"
 }
 
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QJsonObject>
 
 #include <cstdlib>
 #include <vector>
 
 namespace {
-// Mirrors main.c's LEXIS_TOP_K exactly -- no config UI for this yet,
-// and matching the CLI's own retrieval behavior matters more right now
-// than tuning it differently here.
-constexpr size_t kTopK = 5;
+// Retrieval depth is chosen per query now, not fixed. The CLI's own
+// LEXIS_TOP_K (main.c) is deliberately left at 5: it feeds the MS MARCO
+// eval harness, where a changed retrieval depth would silently invalidate
+// comparisons against previously recorded runs. The two are allowed to
+// differ; see LIMITATIONS.md.
+//
+// kCandidateCeiling is how deep to ask BM25 to rank, NOT how much reaches
+// the model -- bm25_result_set_trim() cuts that down.
+constexpr size_t kCandidateCeiling = 40;
 
-// Empty string (not "[]") when there's nothing to cite -- matches
-// pg_store_append_chat_message()'s NULL-means-no-sources convention, so
-// a user message and a sourceless assistant answer are stored the same
-// way.
-QString sourcesToJson(const QVariantList &sources) {
-    if (sources.isEmpty()) {
-        return QString();
+// The three limits, in the order they usually bind. Values come from
+// measurement against a real corpus rather than taste:
+//
+//  - kMaxPassages 12: depth 5 and 10 both produced correct answers to a
+//    "list every X" question, depth 20 fused a same-named label from an
+//    unrelated section into the answer, and depth 30 collapsed it. The
+//    usable window ends well before the context window does.
+//  - kTokenBudget 1500: roughly where depth 12 lands at this chunk size,
+//    and it leaves the bulk of LOCAL_LLM_N_CTX for conversation history,
+//    which generation.c windows against whatever the prompt leaves free.
+//  - kScoreFloorRatio 0.6: on the measured queries this cuts exactly the
+//    flat noise tail (a query scoring 5.87 down to 2.6 gets cut after
+//    rank 4) while leaving genuinely competitive runs intact (a query
+//    scoring 8.80 down to 5.27 keeps ~10).
+constexpr size_t kMaxPassages = 12;
+constexpr int kTokenBudget = 1500;
+constexpr double kScoreFloorRatio = 0.6;
+
+// Persisted provenance for one answer: which tool ran, and what it
+// retrieved. Stored as a JSON *object*, not the bare array this used to
+// write, because the tool name is a property of the answer rather than of
+// any one source -- and for the CHAT path there are no sources at all,
+// yet "no tool was called" is exactly what the UI needs to say.
+//
+// chat_messages.sources is JSONB, so this needs no migration. Readers
+// must still accept the legacy bare-array shape; see
+// AppController::selectChatSession().
+QString provenanceToJson(const QString &tool, const QVariantList &sources) {
+    QJsonObject root;
+    root[QStringLiteral("tool")] = tool;
+    root[QStringLiteral("passages")] = QJsonArray::fromVariantList(sources);
+    return QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Compact));
+}
+
+// The wire/storage name for each tool. Kept as short lowercase tokens
+// rather than the user-facing wording, so the UI owns presentation and
+// stored rows don't need rewriting when that wording changes.
+QString toolName(ToolChoice tool) {
+    switch (tool) {
+    case TOOL_SUMMARIZE_CORPUS:
+        return QStringLiteral("summary");
+    case TOOL_CONVERSE:
+        return QStringLiteral("chat");
+    case TOOL_SEARCH_PASSAGES:
+        break;
     }
-    return QString::fromUtf8(QJsonDocument(QJsonArray::fromVariantList(sources)).toJson(QJsonDocument::Compact));
+    return QStringLiteral("search");
 }
 
 // SEARCH path -- today's pipeline, extracted unchanged from before the
@@ -68,11 +114,17 @@ bool runSearchPipeline(PgStore *store, const char *questionCstr, const std::vect
         return false;
     }
 
-    // Tokenize/stopword-filter/lemmatize the *reformulated* text, not
-    // the raw question -- a follow-up like "what about that instead?"
-    // has almost nothing for BM25 to work with until reformulation has
-    // resolved it into something concrete.
-    TokenList *terms = query_formulation_terms_only(reformulated, stopwords, wordnet, lemmatizer);
+    // The UNION of the raw question's terms and the reformulated one's,
+    // not the reformulation alone. Reformulation resolves follow-ups like
+    // "what about that instead?" into something BM25 can work with, which
+    // is why it exists -- but it paraphrases, and a paraphrase can drop
+    // the one term the index is keyed on. Measured: "What are the license
+    // classes?" was rewritten to "What are the different types of driver
+    // licenses in New York State?", losing "class"; the raw question found
+    // the passages listing every class at ranks 1-2, the rewrite found
+    // none of them. Taking the union lets the rewrite only ever add.
+    TokenList *terms =
+        query_formulation_terms_union(questionCstr, reformulated, stopwords, wordnet, lemmatizer);
     free(reformulated);
     if (terms == nullptr) {
         return false;
@@ -91,14 +143,21 @@ bool runSearchPipeline(PgStore *store, const char *questionCstr, const std::vect
 
     BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B};
     BM25CorpusStats stats = bm25_corpus_stats(store);
-    BM25ResultSet *results = (stats.total_passages >= 0)
-                                  ? bm25_search(store, queryTerms.data(), terms->count, kTopK, stats, params)
-                                  : nullptr;
+    BM25ResultSet *results =
+        (stats.total_passages >= 0)
+            ? bm25_search(store, queryTerms.data(), terms->count, kCandidateCeiling, stats, params)
+            : nullptr;
     token_list_free(terms);
 
     if (results == nullptr) {
         return false;
     }
+    // Rank deep, send shallow: BM25 ranks up to kCandidateCeiling, then
+    // this cuts to the prefix actually worth putting in front of the
+    // model. Done here, once, before either the prompt or the provenance
+    // payload is built from `results` -- that is what keeps "what the
+    // model read" and "what the source inspector shows" the same list.
+    bm25_result_set_trim(store, results, kMaxPassages, kTokenBudget, kScoreFloorRatio);
     if (results->count == 0) {
         bm25_result_set_free(results);
         *answerOut = QObject::tr("No matching passages found in this group for that question.");
@@ -119,6 +178,14 @@ bool runSearchPipeline(PgStore *store, const char *questionCstr, const std::vect
         source[QStringLiteral("documentName")] = QString::fromUtf8(passage->document_name);
         source[QStringLiteral("chunkId")] = passage->chunk_id;
         source[QStringLiteral("score")] = results->items[i].score;
+        // The passage text itself, not just its id. The UI's source
+        // inspector shows the actual retrieved text -- a chunk id alone
+        // tells the user nothing about what the answer was grounded in,
+        // and re-reading the passage from the database at display time
+        // would show whatever is there *now* rather than what this answer
+        // was actually built from.
+        source[QStringLiteral("text")] = QString::fromUtf8(passage->text);
+        source[QStringLiteral("tokenCount")] = passage->token_count;
         sources.append(source);
         pg_store_passage_free(passage);
     }
@@ -138,30 +205,116 @@ bool runSearchPipeline(PgStore *store, const char *questionCstr, const std::vect
     return true;
 }
 
-// READ path -- answers from every document in the group instead of BM25
-// passages. Sources are the group's current document names, not
-// necessarily exactly what generation_generate_answer_from_documents()
-// ended up including after its own windowing -- see NOTES.md/the "Tool-
-// routed chat" plan for why that's an accepted simplification here
-// rather than threading an "actually included" list back out.
-bool runReadPipeline(PgStore *store, const char *questionCstr, const std::vector<LocalLlmTurn> &turns,
-                      QString *answerOut, QVariantList *sourcesOut) {
-    char *answer = generation_generate_answer_from_documents(questionCstr, store, turns.data(), turns.size());
+// CHAT path -- no retrieval at all. The model answers the message
+// directly, with the conversation as its only context.
+//
+// Windowed here rather than trusting the caller: history grows without
+// bound across a long session, and local_llm_chat_completion_multi()
+// fails outright (returns NULL) if the templated prompt doesn't fit in
+// the context window. Dropping the oldest turns degrades a reply; a NULL
+// would surface as "the query failed" for someone who typed "thanks".
+//
+// Reasoning-skip prefill comes from prompts.h (LEXIS_PREFILL_NO_THINK),
+// shared with every other model call in the project.
+
+// Leaves room for the chat template's own markup plus the reply itself;
+// the exact figure matters less than reserving *some* headroom, since
+// LOCAL_LLM_N_CTX bounds prompt and generation together.
+constexpr int kConverseReservedTokens = 2048;
+
+bool runConversePipeline(const char *questionCstr, const std::vector<LocalLlmTurn> &turns, QString *answerOut) {
+    int budget = LOCAL_LLM_N_CTX - kConverseReservedTokens;
+    int questionTokens = local_llm_count_tokens(questionCstr);
+    if (questionTokens > 0) {
+        budget -= questionTokens;
+    }
+
+    // Walk backwards, newest first, keeping whatever fits.
+    size_t start = turns.size();
+    int running = 0;
+    for (size_t i = turns.size(); i-- > 0;) {
+        int turnTokens = local_llm_count_tokens(turns[i].content);
+        if (turnTokens < 0) {
+            break;
+        }
+        if (running + turnTokens > budget) {
+            break;
+        }
+        running += turnTokens;
+        start = i;
+    }
+
+    std::vector<LocalLlmTurn> windowed;
+    windowed.reserve(turns.size() - start + 1);
+    for (size_t i = start; i < turns.size(); i++) {
+        windowed.push_back(turns[i]);
+    }
+    windowed.push_back(LocalLlmTurn{"user", questionCstr});
+
+    char *answer = local_llm_chat_completion_multi(windowed.data(), windowed.size(), LEXIS_PREFILL_NO_THINK);
     if (answer == nullptr) {
         return false;
     }
     *answerOut = QString::fromUtf8(answer);
     free(answer);
+    return true;
+}
+
+// SUMMARY path -- answers broad, whole-collection questions from the
+// group's cached overview (corpus_summary.h) instead of from document
+// text. Replaced a READ path that called
+// generation_generate_answer_from_documents() on every such question,
+// feeding whole documents through the context window each time; the
+// summary is built once per group and is a few hundred tokens, so this
+// path's cost no longer grows with the corpus.
+//
+// The summary is built here, lazily, on the first broad question about a
+// group -- which is also what keeps every local_llm_* call on this one
+// already-serialized worker thread rather than adding an unserialized
+// third caller inside IngestWorker. See corpus_summary.h.
+//
+// `sources` reports the summary itself as the first entry, with its text,
+// followed by one entry per document it covers. The summary IS what the
+// model read, so showing it is what makes the source inspector honest for
+// this path -- a list of document names alone would imply the documents
+// were read directly, which is exactly what this path does not do.
+bool runSummaryPipeline(PgStore *store, qint64 corpusId, const char *questionCstr,
+                         const std::vector<LocalLlmTurn> &turns, QString *answerOut, QVariantList *sourcesOut) {
+    char *summary = corpus_summary_get_or_build(store, static_cast<int64_t>(corpusId));
+    if (summary == nullptr) {
+        // No documents, or generation failed. A real answer, not a failure:
+        // the same convention runSearchPipeline() uses for "nothing to
+        // search for" -- see QueryWorker.h on why `answer` is never empty
+        // on success.
+        *answerOut = QObject::tr("There are no documents in this group yet, so there is nothing to summarize. "
+                                  "Add documents and ask again.");
+        return true;
+    }
+
+    char *answer = generation_generate_answer_from_summary(questionCstr, summary, turns.data(), turns.size());
+    if (answer == nullptr) {
+        free(summary);
+        return false;
+    }
+    *answerOut = QString::fromUtf8(answer);
+    free(answer);
+
+    QVariantList sources;
+    QVariantMap summarySource;
+    summarySource[QStringLiteral("documentName")] = QObject::tr("Group summary (generated)");
+    summarySource[QStringLiteral("text")] = QString::fromUtf8(summary);
+    sources.append(summarySource);
+    free(summary);
 
     size_t doc_count = 0;
     PgStoreDocument *docs = pg_store_get_all_documents(store, &doc_count);
-    QVariantList sources;
     for (size_t i = 0; i < doc_count; i++) {
         QVariantMap source;
         source[QStringLiteral("documentName")] = QString::fromUtf8(docs[i].document_name);
         sources.append(source);
     }
     pg_store_documents_free(docs, doc_count);
+
     *sourcesOut = sources;
     return true;
 }
@@ -177,12 +330,12 @@ QueryWorker::QueryWorker(QString conninfo, qint64 corpusId, qint64 sessionId, QS
 void QueryWorker::run() {
     PgStore *store = pg_store_open(m_conninfo.toUtf8().constData());
     if (store == nullptr) {
-        emit queryFinished(false, QString(), QVariantList());
+        emit queryFinished(false, QString(), QVariantList(), QString());
         return;
     }
     if (pg_store_use_corpus(store, m_corpusId) != 0) {
         pg_store_close(store);
-        emit queryFinished(false, QString(), QVariantList());
+        emit queryFinished(false, QString(), QVariantList(), QString());
         return;
     }
 
@@ -212,23 +365,37 @@ void QueryWorker::run() {
 
     QString answerText;
     QVariantList sources;
-    bool ok = (tool == TOOL_READ_DOCUMENTS)
-                  ? runReadPipeline(store, questionCstr, turns, &answerText, &sources)
-                  : runSearchPipeline(store, questionCstr, turns, m_stopwords, m_wordnet, m_lemmatizer, &answerText,
-                                      &sources);
+    bool ok = false;
+    switch (tool) {
+    case TOOL_SUMMARIZE_CORPUS:
+        ok = runSummaryPipeline(store, m_corpusId, questionCstr, turns, &answerText, &sources);
+        break;
+    case TOOL_CONVERSE:
+        // No store access and no `sources` -- the whole point of this
+        // branch is that nothing was retrieved.
+        ok = runConversePipeline(questionCstr, turns, &answerText);
+        break;
+    case TOOL_SEARCH_PASSAGES:
+        ok = runSearchPipeline(store, questionCstr, turns, m_stopwords, m_wordnet, m_lemmatizer, &answerText, &sources);
+        break;
+    }
 
     pg_store_chat_messages_free(history_rows, history_count);
 
     if (!ok) {
         pg_store_close(store);
-        emit queryFinished(false, QString(), QVariantList());
+        emit queryFinished(false, QString(), QVariantList(), QString());
         return;
     }
 
-    QString sourcesJson = sourcesToJson(sources);
+    // Always written now, even for CHAT with no sources: the tool name is
+    // what the UI reports, so "nothing was retrieved" has to be recorded
+    // rather than left as a NULL that reads identically to a legacy row.
+    const QString tool_name = toolName(tool);
+    const QString provenanceJson = provenanceToJson(tool_name, sources);
     pg_store_append_chat_message(store, m_sessionId, 0, answerText.toUtf8().constData(),
-                                  sourcesJson.isEmpty() ? nullptr : sourcesJson.toUtf8().constData());
+                                  provenanceJson.toUtf8().constData());
     pg_store_close(store);
 
-    emit queryFinished(true, answerText, sources);
+    emit queryFinished(true, answerText, sources, tool_name);
 }

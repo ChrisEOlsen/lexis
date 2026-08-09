@@ -135,10 +135,30 @@ Item {
             deleteConfirm.close()
         }
 
-        Label {
+        // Names the chat history explicitly. "everything in it" is
+        // accurate but reads as "the documents" -- and the chats really do
+        // go: public.chat_sessions.corpus_id references public.corpora
+        // ON DELETE CASCADE, and chat_messages cascades from the sessions,
+        // so deleting the group's registry row takes every conversation
+        // and every message with it in the same transaction. There is no
+        // soft delete and no export, so this dialog is the only warning
+        // the user gets.
+        ColumnLayout {
             width: deleteConfirm.availableWidth
-            wrapMode: Text.WordWrap
-            text: qsTr("Delete \"%1\" and everything in it? This cannot be undone.").arg(root.pendingDeleteName)
+            spacing: Theme.spacingS
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("Delete \"%1\"?").arg(root.pendingDeleteName)
+                font.weight: Theme.fontWeightBold
+            }
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("This permanently deletes the group's documents and its entire chat history — every conversation in this group, not just the current one. This cannot be undone.")
+            }
         }
     }
 

@@ -129,4 +129,35 @@ int bm25_accumulate_term_scores(PgStore *store, int64_t term_id, BM25CorpusStats
 BM25ResultSet *bm25_search(PgStore *store, const char **query_terms, size_t num_terms, size_t top_k,
                             BM25CorpusStats stats, BM25Params params);
 
+/* Shrinks an already-ranked `set` in place to the prefix worth sending to
+ * a model, keeping results in rank order and stopping at the FIRST of
+ * three limits:
+ *
+ *   - `max_passages`        a hard ceiling on how many to keep
+ *   - `token_budget`        cumulative passage token_count
+ *   - `score_floor_ratio`   drop anything scoring below this fraction of
+ *                           the top result's score (0.0 disables)
+ *
+ * Replaces passing a fixed top_k straight into generation. A constant K is
+ * unrelated to how big the chunks are or how sharply relevance falls off,
+ * and measurement showed both bounds are needed. The token budget alone is
+ * insufficient because BM25 scores plateau rather than fall to zero -- one
+ * measured query ran 5.87, 5.74, 4.95, 4.79, 3.39, 2.88, 2.63, 2.61,
+ * 2.61, 2.59, where everything from rank 6 on is noise a budget would
+ * happily swallow. The floor alone is insufficient because a query with a
+ * long flat run of genuinely similar scores would blow the context window.
+ *
+ * The ceiling exists because more context is not monotonically better:
+ * measured on a local 2B model, retrieval depth 5 and 10 both answered a
+ * "list every X" question correctly, depth 20 confused a matching label
+ * from an unrelated section, and depth 30 collapsed the answer entirely.
+ *
+ * Only `set->count` changes; nothing is freed here, and the set remains
+ * safe to pass to bm25_result_set_free(). Requires `store` because passage
+ * token counts live in the database, not in the result set. Passages that
+ * fail to load are counted as zero tokens and kept -- a display-time read
+ * failure shouldn't silently change retrieval depth. */
+void bm25_result_set_trim(PgStore *store, BM25ResultSet *set, size_t max_passages, int token_budget,
+                           double score_floor_ratio);
+
 #endif /* LEXIS_BM25_H */

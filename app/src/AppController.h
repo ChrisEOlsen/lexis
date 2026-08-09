@@ -62,6 +62,12 @@ class AppController : public QObject {
     Q_PROPERTY(QString activeChatSessionTitle READ activeChatSessionTitle NOTIFY activeChatSessionIdChanged)
     Q_PROPERTY(bool modelReady READ isModelReady NOTIFY modelReadyChanged)
     Q_PROPERTY(bool chatBusy READ isChatBusy NOTIFY chatBusyChanged)
+    // The local model's context window in tokens (LOCAL_LLM_N_CTX). CONSTANT
+    // because it is a compile-time constant of the loaded model, not per
+    // message -- the source inspector reports it when the READ tool fed
+    // documents to the model directly, since that path's real limit is how
+    // much text fits in this window.
+    Q_PROPERTY(int contextTokenLimit READ contextTokenLimit CONSTANT)
 
 public:
     explicit AppController(QObject *parent = nullptr);
@@ -80,9 +86,15 @@ public:
     QString activeChatSessionTitle() const;
     bool isModelReady() const;
     bool isChatBusy() const;
+    int contextTokenLimit() const;
 
     Q_INVOKABLE bool createGroup(const QString &displayName);
     Q_INVOKABLE bool deleteGroup(qint64 corpusId);
+    // Switches the active group and loads its documents and its chat
+    // session list. Always lands on a fresh chat (see startNewChat()) --
+    // it never resumes the group's most recent conversation, because a
+    // question typed right after opening a group must not silently append
+    // to an old thread. Resuming is explicit, via the history drawer.
     Q_INVOKABLE void selectGroup(qint64 corpusId);
 
     // Resets to a "pending new chat" state -- activeChatSessionId
@@ -134,7 +146,7 @@ private slots:
     void onIngestFinished(bool ok, qint64 totalPassages, QStringList skipped, QStringList malformed,
                            QStringList noTextFound);
     void onModelLoadFinished(bool ok);
-    void onQueryFinished(bool ok, QString answer, QVariantList sources);
+    void onQueryFinished(bool ok, QString answer, QVariantList sources, QString tool);
 
 private:
     void refreshCorpusModel();

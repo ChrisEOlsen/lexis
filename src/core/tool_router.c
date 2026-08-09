@@ -7,6 +7,7 @@
 
 #include "tool_router.h"
 
+#include "prompts.h"
 #include "string_builder.h"
 
 #include <stdlib.h>
@@ -17,12 +18,11 @@
  * point of this call is a single-word decision, not prose. */
 #define TOOL_ROUTER_RESERVED_TOKENS 500
 
-/* Prefill that skips the model's reasoning pass for this call -- see
- * local_llm_chat_completion_multi()'s own doc comment. Tool *choice*
- * held up fine without a reasoning pass in testing (a one-word
- * classification doesn't need chain-of-thought the way open-ended
- * generation might), so there's no reason to pay for it here. */
-#define TOOL_ROUTER_PREFILL "<think>\n\n</think>\n\n"
+/* The prompt itself and the reasoning-skip prefill both live in
+ * prompts.h -- see LEXIS_PROMPT_TOOL_ROUTER_HEAD and
+ * LEXIS_PREFILL_NO_THINK. Tool *choice* held up fine without a reasoning
+ * pass in testing: a one-word classification doesn't need
+ * chain-of-thought the way open-ended generation might. */
 
 /* Same windowing algorithm as query_formulation.c's/generation.c's own
  * copies -- see either for the full behavior doc comment. Kept as its
@@ -87,16 +87,7 @@ ToolChoice tool_router_choose_tool(const char *question, const LocalLlmTurn *his
     }
 
     StringBuilder builder = {NULL, 0, 0};
-    if (string_builder_append(&builder,
-            "You must choose exactly one tool to answer the user's question. Respond with ONLY "
-            "one word: SEARCH or READ.\n\n"
-            "- SEARCH: the question contains specific, searchable keywords fitting for a lexical "
-            "search -- a fact, number, or definition that could be answered by finding one "
-            "relevant passage (e.g. \"what is the minimum age for X?\", \"how many pounds is the "
-            "weight limit for Y?\").\n"
-            "- READ: the question is about the document(s) as a whole and could NOT be answered "
-            "from a single excerpt (e.g. \"what is this document about?\", \"summarize this\").\n\n"
-            "Question: \"") != 0 ||
+    if (string_builder_append(&builder, LEXIS_PROMPT_TOOL_ROUTER_HEAD) != 0 ||
         string_builder_append(&builder, question) != 0 || string_builder_append(&builder, "\"") != 0) {
         free(builder.data);
         free(windowed);
@@ -115,12 +106,27 @@ ToolChoice tool_router_choose_tool(const char *question, const LocalLlmTurn *his
     free(windowed);
     turns[windowed_count] = (LocalLlmTurn){.role = "user", .content = builder.data};
 
-    char *response = local_llm_chat_completion_multi(turns, windowed_count + 1, TOOL_ROUTER_PREFILL);
+    char *response = local_llm_chat_completion_multi(turns, windowed_count + 1, LEXIS_PREFILL_NO_THINK);
     free(turns);
     free(builder.data);
 
-    ToolChoice choice = (response != NULL && contains_case_insensitive(response, "READ")) ? TOOL_READ_DOCUMENTS
-                                                                                           : TOOL_SEARCH_PASSAGES;
+    /* CHAT is tested first, then SUMMARY, and SEARCH is what's left. Order
+     * matters because this is a substring test, not an exact match: a
+     * reply that editorialises ("CHAT -- no document lookup needed")
+     * still routes correctly, and the most specific intent wins if the
+     * model names more than one. SEARCH stays the fallback for an empty,
+     * unparseable, or failed call -- see this function's doc comment. */
+    ToolChoice choice = TOOL_SEARCH_PASSAGES;
+    if (response != NULL) {
+        if (contains_case_insensitive(response, "CHAT")) {
+            choice = TOOL_CONVERSE;
+        } else if (contains_case_insensitive(response, "SUMMAR")) {
+            /* "SUMMAR", not "SUMMARY": matches both the requested word and
+             * "summarize"/"summarise", which the model sometimes answers
+             * with instead. */
+            choice = TOOL_SUMMARIZE_CORPUS;
+        }
+    }
     free(response);
     return choice;
 }

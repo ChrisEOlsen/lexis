@@ -22,6 +22,8 @@ QVariant ChatMessageListModel::data(const QModelIndex &index, int role) const {
         return message.isUser;
     case SourcesRole:
         return message.sources;
+    case ToolRole:
+        return message.tool;
     case IsFreshRole:
         return message.isFresh;
     default:
@@ -34,14 +36,16 @@ QHash<int, QByteArray> ChatMessageListModel::roleNames() const {
         {TextRole, "text"},
         {IsUserRole, "isUser"},
         {SourcesRole, "sources"},
+        {ToolRole, "tool"},
         {IsFreshRole, "isFresh"},
     };
 }
 
-void ChatMessageListModel::addMessage(const QString &text, bool isUser, const QVariantList &sources) {
+void ChatMessageListModel::addMessage(const QString &text, bool isUser, const QVariantList &sources,
+                                      const QString &tool) {
     int row = m_messages.size();
     beginInsertRows(QModelIndex(), row, row);
-    m_messages.append({text, isUser, sources, /*isFresh=*/true});
+    m_messages.append({text, isUser, sources, tool, /*isFresh=*/true});
     endInsertRows();
 }
 

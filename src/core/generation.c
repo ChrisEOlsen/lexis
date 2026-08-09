@@ -6,24 +6,32 @@
 #include "generation.h"
 
 #include "local_llm_client.h"
+#include "prompts.h"
 #include "string_builder.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Prefilled into both generation_generate_answer_with_history()'s and
- * generation_generate_answer_from_documents()'s calls (but not the
- * plain generation_generate_answer(), which stays untouched for main.c/
- * eval.c) -- unlike tool_router.c's routing decision, this isn't just
- * about output cleanliness (local_llm_chat_completion_multi() already
- * strips a leaked <think> block regardless), it's a real latency win:
- * skipping the reasoning pass means the model spends every generated
- * token on the actual answer instead of a discarded internal monologue
- * first. Verified in testing that the interactive-chat answer quality
- * held up without it anyway (the model produced comprehensive, accurate
- * answers with an empty reasoning block even before this was forced). */
-#define GENERATION_PREFILL "<think>\n\n</think>\n\n"
+/* Every prompt in this file lives in prompts.h.
+ *
+ * The two user-facing answer generators below -- from retrieved passages
+ * and from a group summary -- now run WITH the model's reasoning pass
+ * enabled, via local_llm_chat_completion_multi_ex(..., force_thinking=1).
+ * Passing prefill = NULL alone would not do it: that leaves the template's
+ * enable_thinking override unset, and Gemma 4's template defaults it to
+ * false on its own (see local_llm_client.c). Any reasoning the model emits
+ * is stripped before the answer is returned.
+ *
+ * The rationale for disabling it was latency, on the theory that a
+ * grounded answer needs no deliberation. That theory went untested until
+ * a retrieved passage set where every candidate was legitimately on-topic
+ * and the model, given no opportunity to weigh them, simply answered from
+ * whichever it read first.
+ *
+ * The plain generation_generate_answer() is deliberately untouched -- it
+ * stays as-is for main.c/eval.c, where changing generation behavior would
+ * invalidate recorded eval runs. */
 
 char *generation_build_prompt(const char *query_text, PgStore *store,
                                const BM25ResultSet *results) {
@@ -33,10 +41,7 @@ char *generation_build_prompt(const char *query_text, PgStore *store,
 
     StringBuilder builder = {NULL, 0, 0};
 
-    if (string_builder_append(&builder,
-            "You are answering a question using only the provided context. If the "
-            "context doesn't contain enough information to answer, say so rather "
-            "than guessing.\n\nContext:\n\n") != 0) {
+    if (string_builder_append(&builder, LEXIS_PROMPT_ANSWER_FROM_PASSAGES_HEAD) != 0) {
         goto fail;
     }
 
@@ -151,7 +156,7 @@ char *generation_generate_answer_with_history(const char *query_text, PgStore *s
 
     if (history_count == 0) {
         LocalLlmTurn turn = {.role = "user", .content = prompt};
-        char *answer = local_llm_chat_completion_multi(&turn, 1, GENERATION_PREFILL);
+        char *answer = local_llm_chat_completion_multi_ex(&turn, 1, NULL, /*force_thinking=*/1);
         free(prompt);
         return answer;
     }
@@ -184,7 +189,7 @@ char *generation_generate_answer_with_history(const char *query_text, PgStore *s
     free(windowed);
     turns[windowed_count] = (LocalLlmTurn){.role = "user", .content = prompt};
 
-    char *answer = local_llm_chat_completion_multi(turns, windowed_count + 1, GENERATION_PREFILL);
+    char *answer = local_llm_chat_completion_multi_ex(turns, windowed_count + 1, NULL, /*force_thinking=*/1);
     free(turns);
     free(prompt);
     return answer;
@@ -232,10 +237,7 @@ static char *generation_build_document_prompt(const char *query_text, PgStore *s
     }
 
     StringBuilder builder = {NULL, 0, 0};
-    if (string_builder_append(&builder,
-            "You are answering a question using the full text of the documents below. If the "
-            "context doesn't contain enough information to answer, say so rather than "
-            "guessing.\n\nContext:\n\n") != 0) {
+    if (string_builder_append(&builder, LEXIS_PROMPT_ANSWER_FROM_DOCUMENTS_HEAD) != 0) {
         goto fail;
     }
 
@@ -317,7 +319,7 @@ char *generation_generate_answer_from_documents(const char *query_text, PgStore 
 
     if (history_count == 0) {
         LocalLlmTurn turn = {.role = "user", .content = prompt};
-        char *answer = local_llm_chat_completion_multi(&turn, 1, GENERATION_PREFILL);
+        char *answer = local_llm_chat_completion_multi(&turn, 1, LEXIS_PREFILL_NO_THINK);
         free(prompt);
         return answer;
     }
@@ -350,7 +352,86 @@ char *generation_generate_answer_from_documents(const char *query_text, PgStore 
     free(windowed);
     turns[windowed_count] = (LocalLlmTurn){.role = "user", .content = prompt};
 
-    char *answer = local_llm_chat_completion_multi(turns, windowed_count + 1, GENERATION_PREFILL);
+    char *answer = local_llm_chat_completion_multi(turns, windowed_count + 1, LEXIS_PREFILL_NO_THINK);
+    free(turns);
+    free(prompt);
+    return answer;
+}
+
+/* Builds the SUMMARY-tool prompt. Small by construction -- a group summary
+ * is a few hundred tokens regardless of corpus size, which is the entire
+ * reason this path exists instead of re-reading documents.
+ *
+ * The two negative instructions are both there in response to observed
+ * behavior, not as boilerplate. "Never ask the user to provide documents"
+ * addresses a real answer -- "Please provide the documents you are
+ * referring to" -- produced for a question about a corpus whose text was
+ * already in the prompt: with chatty history ahead of it, the model
+ * followed the conversational framing instead of the attached context.
+ * "Don't mention the summary" stops the reply becoming "the summary says
+ * ...", which tells the reader about the plumbing rather than answering
+ * them. */
+static char *generation_build_summary_prompt(const char *query_text, const char *summary_text) {
+    StringBuilder builder = {NULL, 0, 0};
+
+    if (string_builder_append(&builder, LEXIS_PROMPT_ANSWER_FROM_SUMMARY_HEAD) != 0 ||
+        string_builder_append(&builder, summary_text) != 0 ||
+        string_builder_append(&builder, "\n\nQuestion: ") != 0 ||
+        string_builder_append(&builder, query_text) != 0 ||
+        string_builder_append(&builder, "\nAnswer: ") != 0) {
+        free(builder.data);
+        return NULL;
+    }
+    return builder.data;
+}
+
+char *generation_generate_answer_from_summary(const char *query_text, const char *summary_text,
+                                              const LocalLlmTurn *history, size_t history_count) {
+    if (summary_text == NULL || summary_text[0] == '\0') {
+        return NULL;
+    }
+
+    char *prompt = generation_build_summary_prompt(query_text, summary_text);
+    if (prompt == NULL) {
+        return NULL;
+    }
+
+    if (history_count == 0) {
+        LocalLlmTurn turn = {.role = "user", .content = prompt};
+        char *answer = local_llm_chat_completion_multi_ex(&turn, 1, NULL, /*force_thinking=*/1);
+        free(prompt);
+        return answer;
+    }
+
+    int prompt_tokens = local_llm_count_tokens(prompt);
+    if (prompt_tokens < 0) {
+        prompt_tokens = LOCAL_LLM_N_CTX;
+    }
+    int budget = LOCAL_LLM_N_CTX - prompt_tokens - GENERATION_RESERVED_OUTPUT_TOKENS;
+    if (budget < 0) {
+        budget = 0;
+    }
+
+    size_t windowed_count = 0;
+    LocalLlmTurn *windowed = window_history(history, history_count, budget, &windowed_count);
+    if (windowed == NULL) {
+        free(prompt);
+        return NULL;
+    }
+
+    LocalLlmTurn *turns = malloc(sizeof(LocalLlmTurn) * (windowed_count + 1));
+    if (turns == NULL) {
+        free(windowed);
+        free(prompt);
+        return NULL;
+    }
+    for (size_t i = 0; i < windowed_count; i++) {
+        turns[i] = windowed[i];
+    }
+    free(windowed);
+    turns[windowed_count] = (LocalLlmTurn){.role = "user", .content = prompt};
+
+    char *answer = local_llm_chat_completion_multi_ex(turns, windowed_count + 1, NULL, /*force_thinking=*/1);
     free(turns);
     free(prompt);
     return answer;

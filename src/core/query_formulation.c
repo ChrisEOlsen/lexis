@@ -9,6 +9,8 @@
 
 #include "query_formulation.h"
 
+#include "prompts.h"
+
 #include "local_llm_client.h"
 #include "string_builder.h"
 #include "tokenizer.h"
@@ -111,8 +113,7 @@ char *query_formulation_build_prompt(const char *query_text,
                                       const QueryFormulationCandidates *candidates) {
     StringBuilder builder = {NULL, 0, 0};
 
-    if (string_builder_append(&builder,
-            "You are helping build a search query for a keyword-based (BM25) search engine.\n\n") != 0) {
+    if (string_builder_append(&builder, LEXIS_PROMPT_QUERY_TERMS_HEAD) != 0) {
         goto fail;
     }
     if (string_builder_append(&builder, "Original question: \"") != 0) {
@@ -121,12 +122,7 @@ char *query_formulation_build_prompt(const char *query_text,
     if (string_builder_append(&builder, query_text) != 0) {
         goto fail;
     }
-    if (string_builder_append(&builder,
-            "\"\n\nFor each query term below, candidate related words are listed: synonyms "
-            "(same meaning), hypernyms (broader terms), and hyponyms (narrower terms). Select "
-            "every word likely to appear in a document relevant to the original question, "
-            "including the original term itself when it is a good search term. Respond with "
-            "ONLY a JSON array of strings -- no other text.\n\n") != 0) {
+    if (string_builder_append(&builder, LEXIS_PROMPT_QUERY_TERMS_CANDIDATES) != 0) {
         goto fail;
     }
 
@@ -276,6 +272,43 @@ TokenList *query_formulation_formulate_query(const char *query_text,
     return selected_terms;
 }
 
+TokenList *query_formulation_terms_union(const char *raw_query, const char *rewritten_query,
+                                          const StopwordSet *stopwords, const WordNetTable *wordnet,
+                                          const Lemmatizer *lemmatizer) {
+    TokenList *combined = query_formulation_terms_only(raw_query, stopwords, wordnet, lemmatizer);
+    if (combined == NULL) {
+        return NULL;
+    }
+    if (rewritten_query == NULL || strcmp(rewritten_query, raw_query) == 0) {
+        return combined;
+    }
+
+    TokenList *extra = query_formulation_terms_only(rewritten_query, stopwords, wordnet, lemmatizer);
+    if (extra == NULL) {
+        /* The rewrite's terms are an enhancement, not a precondition --
+         * the raw query's terms alone are a perfectly good search. */
+        return combined;
+    }
+
+    for (size_t i = 0; i < extra->count; i++) {
+        int already_present = 0;
+        for (size_t j = 0; j < combined->count; j++) {
+            if (strcmp(extra->terms[i], combined->terms[j]) == 0) {
+                already_present = 1;
+                break;
+            }
+        }
+        /* O(n*m) over two short lists -- a handful of terms each, so a
+         * hash set would cost more in machinery than it saves. */
+        if (!already_present && token_list_append(combined, extra->terms[i]) != 0) {
+            break; /* Out of memory: keep what we have rather than lose the query. */
+        }
+    }
+
+    token_list_free(extra);
+    return combined;
+}
+
 TokenList *query_formulation_terms_only(const char *query_text, const StopwordSet *stopwords,
                                          const WordNetTable *wordnet, const Lemmatizer *lemmatizer) {
     QueryFormulationCandidates *candidates =
@@ -361,11 +394,7 @@ char *query_formulation_contextualize_question(const char *question, const Local
     }
 
     StringBuilder builder = {NULL, 0, 0};
-    if (string_builder_append(&builder,
-            "Given the conversation so far, rewrite the following question as a standalone "
-            "question that makes sense with no prior context -- resolve any pronouns or "
-            "references to what was discussed earlier. Respond with ONLY the rewritten "
-            "question, no other text.\n\nQuestion: \"") != 0 ||
+    if (string_builder_append(&builder, LEXIS_PROMPT_CONTEXTUALIZE_HEAD) != 0 ||
         string_builder_append(&builder, question) != 0 || string_builder_append(&builder, "\"") != 0) {
         free(builder.data);
         free(windowed);

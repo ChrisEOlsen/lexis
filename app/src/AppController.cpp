@@ -12,6 +12,7 @@ extern "C" {
 
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QJsonObject>
 #include <QUrl>
 
 namespace {
@@ -132,6 +133,10 @@ bool AppController::isChatBusy() const {
     return m_chatBusy;
 }
 
+int AppController::contextTokenLimit() const {
+    return LOCAL_LLM_N_CTX;
+}
+
 bool AppController::createGroup(const QString &displayName) {
     qint64 id = 0;
     if (!m_engine->createCorpus(displayName, &id)) {
@@ -151,6 +156,17 @@ bool AppController::deleteGroup(qint64 corpusId) {
         m_activeCorpusId = -1;
         m_activeCorpusName.clear();
         m_documentModel->setDocumentNames({});
+        // The chat state has to be torn down too, not just the documents.
+        // Deleting the active group used to leave the conversation sitting
+        // on screen and the deleted group's sessions still listed in the
+        // history drawer -- both referring to rows the ON DELETE CASCADE
+        // had already removed (public.chat_sessions.corpus_id references
+        // public.corpora ON DELETE CASCADE, so the sessions and every
+        // message in them go with the registry row). Clearing the session
+        // model is separate from startNewChat(), which only resets the
+        // active session and the message list.
+        m_chatSessionModel->setSessions({});
+        startNewChat();
         emit activeCorpusIdChanged();
     }
     refreshCorpusModel();
@@ -176,18 +192,25 @@ void AppController::selectGroup(qint64 corpusId) {
 
     refreshDocumentModel();
 
-    // Pick up where the user left off: auto-select the most recent
-    // session for this group (LexisEngine::listChatSessions() returns
-    // newest first), or fall back to startNewChat()'s pending state if
-    // the group has no chat history yet.
+    // Opening a group always lands on a fresh chat, never on the tail of
+    // whatever conversation happened last. Resuming is an explicit act
+    // via the history drawer.
+    //
+    // This deliberately replaces the earlier "pick up where the user left
+    // off" behavior, which auto-selected the most recent session. That
+    // made the group's newest conversation load itself on every open,
+    // which is wrong in two ways: a new question typed straight after
+    // opening a group would silently append to an old conversation (and
+    // be sent with its history as context, see QueryWorker), and there
+    // was no way to reach the empty state at all without pressing
+    // "New chat" every single time.
+    //
+    // The session list is still loaded here -- the history drawer reads
+    // it, and it must reflect this group rather than the previous one.
     QVector<ChatSession> sessions;
     m_engine->listChatSessions(corpusId, &sessions);
     m_chatSessionModel->setSessions(sessions);
-    if (!sessions.isEmpty()) {
-        selectChatSession(sessions.first().id);
-    } else {
-        startNewChat();
-    }
+    startNewChat();
 
     emit activeCorpusIdChanged();
 }
@@ -210,13 +233,27 @@ void AppController::selectChatSession(qint64 sessionId) {
     messages.reserve(history.size());
     for (const ChatHistoryEntry &entry : history) {
         QVariantList sources;
+        QString tool;
         if (!entry.sourcesJson.isEmpty()) {
             QJsonDocument doc = QJsonDocument::fromJson(entry.sourcesJson.toUtf8());
-            if (doc.isArray()) {
+            // Two accepted shapes, deliberately. The current one is an
+            // object, {"tool": ..., "passages": [...]}, written by
+            // QueryWorker::provenanceToJson(). The bare array is the legacy
+            // shape from before the tool was recorded; rows in that form
+            // predate the CHAT path, and every one of them came from the
+            // search pipeline, so naming the tool "search" for them is a
+            // statement of fact rather than a guess. Reading them as an
+            // object instead would silently drop their citations.
+            if (doc.isObject()) {
+                const QJsonObject root = doc.object();
+                tool = root.value(QStringLiteral("tool")).toString();
+                sources = root.value(QStringLiteral("passages")).toArray().toVariantList();
+            } else if (doc.isArray()) {
                 sources = doc.array().toVariantList();
+                tool = QStringLiteral("search");
             }
         }
-        messages.append(ChatMessage{entry.text, entry.isUser, sources, /*isFresh=*/false});
+        messages.append(ChatMessage{entry.text, entry.isUser, sources, tool, /*isFresh=*/false});
     }
     m_chatModel->setMessages(messages);
 
@@ -354,7 +391,7 @@ void AppController::onModelLoadFinished(bool ok) {
     }
 }
 
-void AppController::onQueryFinished(bool ok, QString answer, QVariantList sources) {
+void AppController::onQueryFinished(bool ok, QString answer, QVariantList sources, QString tool) {
     m_activeQueryWorker = nullptr; // cleaned up by the QThread::finished->deleteLater() connection
     m_chatBusy = false;
     emit chatBusyChanged();
@@ -369,7 +406,7 @@ void AppController::onQueryFinished(bool ok, QString answer, QVariantList source
     // chat_messages by QueryWorker), not a sentinel this slot has to
     // special-case into a synthesized message of its own; doing that
     // here would desync what's shown live from what's actually stored.
-    m_chatModel->addMessage(answer, false, sources);
+    m_chatModel->addMessage(answer, false, sources, tool);
 }
 
 void AppController::refreshCorpusModel() {

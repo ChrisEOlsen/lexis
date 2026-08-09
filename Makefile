@@ -47,7 +47,7 @@ TESTDIR := tests/core
 BUILD   := build
 
 # Real (non-stub) module sources — grows as stub .c files gain content.
-CORE_SRCS := src/core/tokenizer.c src/core/stopwords.c src/core/pg_store.c src/core/bm25.c src/core/ingest.c src/core/local_llm_client.c src/core/vendor/cJSON.c src/core/wordnet.c src/core/query_formulation.c src/core/string_builder.c src/core/generation.c src/core/lemmatizer.c src/core/query_log.c src/core/config.c src/core/bulk_ingest.c src/core/eval.c src/core/csv_parse.c src/core/tool_router.c
+CORE_SRCS := src/core/tokenizer.c src/core/stopwords.c src/core/pg_store.c src/core/bm25.c src/core/ingest.c src/core/local_llm_client.c src/core/vendor/cJSON.c src/core/wordnet.c src/core/query_formulation.c src/core/string_builder.c src/core/generation.c src/core/lemmatizer.c src/core/query_log.c src/core/config.c src/core/bulk_ingest.c src/core/eval.c src/core/csv_parse.c src/core/tool_router.c src/core/corpus_summary.c
 
 # The one C++ translation unit -- not in CORE_SRCS (which $(CC) compiles
 # directly as C11 via $(CFLAGS), wrong flags/language for this file).

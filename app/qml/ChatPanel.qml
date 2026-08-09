@@ -42,6 +42,109 @@ Item {
     property int pendingDeleteSessionId: -1
     property string pendingDeleteTitle: ""
 
+    // One shared inspector, populated on open, rather than a Popup per
+    // message delegate: a modal per row would instantiate one full-window
+    // dialog for every message in the conversation.
+    property string inspectAnswer: ""
+    property string inspectTool: ""
+    property var inspectSources: []
+
+    function openSourceInspector(messageModel) {
+        root.inspectAnswer = messageModel.text
+        root.inspectTool = messageModel.tool
+        root.inspectSources = messageModel.sources
+        sourceInspector.open()
+    }
+
+    // Human wording for a stored tool token. The stored values stay short
+    // and lowercase ("search"/"read"/"chat") so this presentation can
+    // change without rewriting rows -- see QueryWorker's toolName().
+    function toolHeadline(tool) {
+        if (tool === "search")
+            return qsTr("Lexical search (BM25)")
+        if (tool === "summary")
+            return qsTr("Group summary")
+        if (tool === "read")
+            return qsTr("Direct document read (retired)")
+        if (tool === "chat")
+            return qsTr("No tool called")
+        return qsTr("Unknown")
+    }
+
+    function toolDetail(tool) {
+        if (tool === "search")
+            return qsTr("The question was turned into search terms and matched against indexed passages. The passages below are what the answer was generated from, in rank order.")
+        if (tool === "summary")
+            return qsTr("This question was about the collection as a whole, so it was answered from a generated overview of the group rather than by re-reading the documents. The overview is built once per group, cached, and rebuilt when the document count changes. It is a representative sample of each document, not their full text, so it can miss a topic that appears only in an unsampled section.")
+        if (tool === "read")
+            return qsTr("An earlier version of this app answered broad questions by feeding whole documents to the local model, within a context limit of %1 tokens. That path has been replaced by the cached group summary; this answer predates the change.")
+                   .arg(AppController.contextTokenLimit)
+        if (tool === "chat")
+            return qsTr("The router classified this as conversation rather than a request for information, so no retrieval ran and no documents were consulted. The reply came from the model and the conversation so far.")
+        return qsTr("This answer was recorded before the tool was tracked, so which tool ran is not known. Any citations shown came from the search pipeline.")
+    }
+
+    // Trims a partially-revealed Markdown string back to the last point
+    // where its inline markup is balanced, so the word-by-word reveal
+    // never paints a dangling "**" or an unclosed link as literal text.
+    //
+    // Without this, rendering the revealed prefix as Markdown shows the
+    // raw asterisks of a half-arrived "**Operator, Class D:**" for a
+    // frame or two before they resolve into bold -- the same one-to-two
+    // frame flicker class that made the old hover styling feel janky. The
+    // visible effect of trimming is that a bold phrase appears as a unit
+    // instead of character-by-character, which reads as intentional.
+    //
+    // Deliberately handles only "**", backtick code spans and "[...](...)"
+    // links. Single "*" is NOT balanced here: this model emits list items
+    // as "*   item", so a lone leading asterisk is a bullet, and treating
+    // it as an unterminated italic would swallow every list line until
+    // its successor arrived.
+    function markdownSafePrefix(text) {
+        var s = text
+
+        // Bold: an odd number of "**" means the last one is unclosed.
+        var boldCount = 0
+        var lastBold = -1
+        var i = 0
+        while ((i = s.indexOf("**", i)) !== -1) {
+            boldCount++
+            lastBold = i
+            i += 2
+        }
+        if (boldCount % 2 === 1)
+            s = s.substring(0, lastBold)
+
+        // Inline code: same parity argument, single character.
+        var tickCount = 0
+        var lastTick = -1
+        for (var j = 0; j < s.length; j++) {
+            if (s.charAt(j) === "`") {
+                tickCount++
+                lastTick = j
+            }
+        }
+        if (tickCount % 2 === 1)
+            s = s.substring(0, lastTick)
+
+        // Links: hide "[text" and "[text](partial-url" until they close,
+        // otherwise the raw URL is briefly visible. Checked in two steps
+        // so an ordinary bracketed token that is not a link -- "[1]", a
+        // citation marker -- is left alone rather than being withheld
+        // until the end of the reveal.
+        var open = s.lastIndexOf("[")
+        if (open !== -1) {
+            var closeBracket = s.indexOf("]", open)
+            if (closeBracket === -1)
+                s = s.substring(0, open) // link text still arriving
+            else if (s.charAt(closeBracket + 1) === "("
+                     && s.indexOf(")", closeBracket) === -1)
+                s = s.substring(0, open) // URL still arriving
+        }
+
+        return s
+    }
+
     // "3 minutes ago" / "2 hours ago" / "Yesterday" / "5 days ago" / a
     // plain date beyond a week -- no new dependency, just Date math.
     function relativeTime(dateTime) {
@@ -153,6 +256,19 @@ Item {
                                                    ? messageDelegate.model.text.split(" ") : []
                 property int revealedWordCount: streaming ? 0 : streamWords.length
 
+                // Whether the reveal has caught up with the full text.
+                //
+                // NOT the same thing as `!streaming`, and conflating the
+                // two was a real bug: `streaming` is derived from isFresh,
+                // which stays true for the entire life of a live answer's
+                // delegate, so `!streaming` is permanently false for
+                // anything that just arrived. Gating the source
+                // disclosure on it meant the disclosure only ever appeared
+                // on answers reloaded from history -- never on the answer
+                // you just received.
+                readonly property bool revealComplete:
+                    messageDelegate.revealedWordCount >= messageDelegate.streamWords.length
+
                 Timer {
                     interval: 30
                     repeat: true
@@ -193,60 +309,62 @@ Item {
                             id: bubbleLabel
                             anchors.fill: parent
                             anchors.margins: Theme.spacingM
-                            text: messageDelegate.streaming
-                                  ? messageDelegate.streamWords.slice(0, messageDelegate.revealedWordCount).join(" ")
-                                  : messageDelegate.model.text
+                            // Assistant answers are Markdown; the model
+                            // emits **bold**, "*  " bullet lists and
+                            // headings, which previously rendered as
+                            // literal punctuation. User messages stay
+                            // PlainText on purpose -- a question that
+                            // happens to contain * or _ is text the user
+                            // typed, not markup they authored.
+                            textFormat: messageDelegate.model.isUser
+                                        ? Text.PlainText : Text.MarkdownText
+                            // Once the reveal is complete, show the stored
+                            // text verbatim rather than the trimmed
+                            // prefix. markdownSafePrefix() must not touch
+                            // the final text: if an answer legitimately
+                            // contains an odd number of "**", trimming
+                            // would hide its tail permanently instead of
+                            // for a frame.
+                            text: messageDelegate.revealComplete
+                                  ? messageDelegate.model.text
+                                  : root.markdownSafePrefix(
+                                        messageDelegate.streamWords.slice(
+                                            0, messageDelegate.revealedWordCount).join(" "))
                             wrapMode: Text.WordWrap
                             color: messageDelegate.model.isUser
                                    ? root.palette.highlightedText
                                    : root.palette.text
+                            // Markdown can produce real links. Without
+                            // this they render as links and do nothing.
+                            onLinkActivated: link => Qt.openUrlExternally(link)
                         }
                     }
 
-                    // Source citations as chips rather than a run of grey
-                    // text. Sources land only once the reveal finishes,
-                    // matching how a real streaming answer shows citations
-                    // after the text rather than mid-reveal.
-                    Flow {
-                        width: messageColumn.width
-                        spacing: Theme.spacingXS
-                        visible: !messageDelegate.model.isUser
+                    // Provenance disclosure. Replaces the old row of
+                    // filename/chunk-id chips, which showed identifiers
+                    // and nothing else: a chunk id tells you which
+                    // passage was retrieved but not what it said, so it
+                    // could not answer the only question worth asking of
+                    // a citation -- is the answer actually supported by
+                    // it.
+                    //
+                    // Shown only when something was actually retrieved.
+                    // An answer with no sources -- the CHAT path, or a
+                    // search that matched nothing -- gets no affordance
+                    // at all rather than a "no source" label: a control
+                    // whose only message is that it has nothing to show
+                    // is noise on every conversational reply.
+                    //
+                    // Also waits for the reveal to finish, matching how a
+                    // real streaming answer shows citations after the text
+                    // rather than mid-reveal.
+                    Button {
+                        flat: true
+                        visible: !messageDelegate.model.isUser && messageDelegate.revealComplete
                                  && messageDelegate.model.sources.length > 0
-                                 && !messageDelegate.streaming
-
-                        Repeater {
-                            model: messageDelegate.model.sources
-
-                            delegate: Rectangle {
-                                id: chip
-                                required property var modelData
-                                implicitWidth: chipLabel.implicitWidth + 2 * Theme.spacingS
-                                implicitHeight: chipLabel.implicitHeight + Theme.spacingS
-                                radius: Theme.radiusS
-                                // Filled, not outlined. palette.midlight
-                                // is white at ~7% alpha, which on this
-                                // background produced a border that did
-                                // not resolve at all -- the chips read as
-                                // loose grey text. A fill at the raised
-                                // layer reads as a chip at any size.
-                                color: Qt.lighter(chip.palette.window, Theme.layerRaised)
-
-                                Label {
-                                    id: chipLabel
-                                    anchors.centerIn: parent
-                                    // chunkId is only present for
-                                    // SEARCH-path sources (a specific
-                                    // matched passage) -- READ-path
-                                    // sources are whole documents, with no
-                                    // single chunk to point at.
-                                    text: chip.modelData.chunkId !== undefined
-                                          ? chip.modelData.documentName + " · chunk " + chip.modelData.chunkId
-                                          : chip.modelData.documentName
-                                    font.pixelSize: Theme.fontSizeCaption
-                                    color: chip.palette.placeholderText
-                                }
-                            }
-                        }
+                        text: qsTr("Source · %1  ⌄").arg(messageDelegate.model.sources.length)
+                        font.pixelSize: Theme.fontSizeCaption
+                        onClicked: root.openSourceInspector(messageDelegate.model)
                     }
                 }
             }
@@ -481,6 +599,189 @@ Item {
             width: deleteSessionConfirm.availableWidth
             wrapMode: Text.WordWrap
             text: qsTr("Delete \"%1\"? This cannot be undone.").arg(root.pendingDeleteTitle)
+        }
+    }
+
+    // Source inspector: what produced this answer, and what it read.
+    //
+    // Deliberately near-fullscreen. Passage text is the point of this
+    // dialog, and passages run to hundreds of words -- a modestly sized
+    // dialog would turn the one thing worth reading into a scroll-race
+    // through a letterbox.
+    Dialog {
+        id: sourceInspector
+        title: qsTr("Source")
+        modal: true
+        // parent, not just anchors.centerIn: the size is expressed against
+        // the overlay, so the overlay has to be this popup's parent for
+        // parent.width/height to mean the window. Same reasoning as the
+        // history drawer above.
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        width: parent ? Math.round(parent.width * 0.92) : 0
+        height: parent ? Math.round(parent.height * 0.9) : 0
+        standardButtons: Dialog.Close
+
+        ScrollView {
+            id: inspectorScroll
+            anchors.fill: parent
+            // Without this the Flickable's contentWidth is unset and the
+            // view scrolls sideways as well as vertically.
+            contentWidth: availableWidth
+            clip: true
+
+            ColumnLayout {
+                width: inspectorScroll.availableWidth
+                spacing: Theme.spacingS
+
+                // -- How it was answered --
+                Label {
+                    text: "TOOL CALLED"
+                    font.pixelSize: Theme.fontSizeCaption
+                    font.letterSpacing: 0.6
+                    color: sourceInspector.palette.placeholderText
+                }
+
+                Label {
+                    Layout.fillWidth: true
+                    text: root.toolHeadline(root.inspectTool)
+                    font.weight: Theme.fontWeightBold
+                }
+
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    color: sourceInspector.palette.placeholderText
+                    text: root.toolDetail(root.inspectTool)
+                }
+
+                // -- The answer it produced --
+                Label {
+                    text: "ANSWER"
+                    Layout.topMargin: Theme.spacingM
+                    font.pixelSize: Theme.fontSizeCaption
+                    font.letterSpacing: 0.6
+                    color: sourceInspector.palette.placeholderText
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    implicitHeight: inspectAnswerLabel.implicitHeight + 2 * Theme.spacingM
+                    radius: Theme.radiusM
+                    color: Qt.lighter(sourceInspector.palette.window, Theme.layerRaised)
+
+                    Label {
+                        id: inspectAnswerLabel
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingM
+                        text: root.inspectAnswer
+                        textFormat: Text.MarkdownText
+                        wrapMode: Text.WordWrap
+                        onLinkActivated: link => Qt.openUrlExternally(link)
+                    }
+                }
+
+                // -- What it read --
+                Label {
+                    visible: root.inspectSources.length > 0
+                    Layout.topMargin: Theme.spacingM
+                    text: {
+                        if (root.inspectTool === "summary")
+                            return qsTr("SUMMARY AND COVERAGE · %1").arg(root.inspectSources.length)
+                        if (root.inspectTool === "read")
+                            return qsTr("DOCUMENTS AVAILABLE · %1").arg(root.inspectSources.length)
+                        return qsTr("RETRIEVED PASSAGES · %1").arg(root.inspectSources.length)
+                    }
+                    font.pixelSize: Theme.fontSizeCaption
+                    font.letterSpacing: 0.6
+                    color: sourceInspector.palette.placeholderText
+                }
+
+                Repeater {
+                    model: root.inspectSources
+
+                    delegate: Rectangle {
+                        id: sourceCard
+                        required property var modelData
+                        Layout.fillWidth: true
+                        implicitHeight: cardColumn.implicitHeight + 2 * Theme.spacingM
+                        radius: Theme.radiusM
+                        color: Qt.lighter(sourceCard.palette.window, Theme.layerCard)
+                        border.width: 1
+                        border.color: sourceCard.palette.midlight
+
+                        ColumnLayout {
+                            id: cardColumn
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.top: parent.top
+                            anchors.margins: Theme.spacingM
+                            spacing: Theme.spacingXS
+
+                            // Identity line. chunkId is only present on
+                            // SEARCH sources (a specific matched passage);
+                            // READ sources are whole documents, with no
+                            // single chunk to point at.
+                            Label {
+                                Layout.fillWidth: true
+                                elide: Text.ElideMiddle
+                                font.weight: Theme.fontWeightBold
+                                text: {
+                                    var name = sourceCard.modelData.documentName
+                                    if (sourceCard.modelData.chunkId === undefined)
+                                        return name
+                                    return qsTr("%1 · chunk %2").arg(name).arg(sourceCard.modelData.chunkId)
+                                }
+                            }
+
+                            // Retrieval metadata, shown only when present
+                            // so READ rows don't display empty fields.
+                            Label {
+                                Layout.fillWidth: true
+                                visible: sourceCard.modelData.score !== undefined
+                                font.pixelSize: Theme.fontSizeCaption
+                                color: sourceCard.palette.placeholderText
+                                text: {
+                                    var parts = []
+                                    if (sourceCard.modelData.score !== undefined)
+                                        parts.push(qsTr("BM25 score %1").arg(sourceCard.modelData.score.toFixed(3)))
+                                    if (sourceCard.modelData.tokenCount !== undefined)
+                                        parts.push(qsTr("%1 tokens").arg(sourceCard.modelData.tokenCount))
+                                    return parts.join("   ·   ")
+                                }
+                            }
+
+                            // The passage itself -- the reason this dialog
+                            // exists. PlainText, not Markdown: this is
+                            // source material quoted verbatim, and any
+                            // punctuation in it must not be reinterpreted
+                            // as formatting.
+                            Label {
+                                Layout.fillWidth: true
+                                Layout.topMargin: Theme.spacingXS
+                                visible: text.length > 0
+                                text: sourceCard.modelData.text !== undefined
+                                      ? sourceCard.modelData.text : ""
+                                textFormat: Text.PlainText
+                                wrapMode: Text.WordWrap
+                            }
+                        }
+                    }
+                }
+
+                // Older search answers were stored before passage text was
+                // persisted, so they list chunk ids with nothing to show.
+                // Saying so beats rendering a column of empty cards.
+                Label {
+                    Layout.fillWidth: true
+                    Layout.topMargin: Theme.spacingS
+                    visible: root.inspectTool === "search" && root.inspectSources.length > 0
+                             && root.inspectSources[0].text === undefined
+                    wrapMode: Text.WordWrap
+                    color: sourceInspector.palette.placeholderText
+                    text: qsTr("This answer predates passage text being stored, so only the identifiers above are available for it. New answers include the full passage.")
+                }
+            }
         }
     }
 }

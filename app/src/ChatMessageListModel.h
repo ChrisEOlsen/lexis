@@ -21,6 +21,12 @@ struct ChatMessage {
     QString text;
     bool isUser;
     QVariantList sources; // only ever non-empty for a non-user (answer) message
+    // Which tool produced this answer: "search", "read", "chat", or empty
+    // for a user message (and for legacy rows stored before the tool was
+    // recorded). Not derivable from `sources`: a SEARCH that matched
+    // nothing and a CHAT that retrieved nothing both have an empty list,
+    // and the source inspector has to tell them apart.
+    QString tool;
     // true only for a message just appended live via addMessage() (this
     // process, this run); false for anything loaded from history via
     // setMessages(). Lets the message delegate tell "just arrived,
@@ -41,6 +47,7 @@ public:
         TextRole = Qt::UserRole + 1,
         IsUserRole,
         SourcesRole,
+        ToolRole,
         IsFreshRole,
     };
 
@@ -50,7 +57,8 @@ public:
     QVariant data(const QModelIndex &index, int role) const override;
     QHash<int, QByteArray> roleNames() const override;
 
-    void addMessage(const QString &text, bool isUser, const QVariantList &sources = QVariantList());
+    void addMessage(const QString &text, bool isUser, const QVariantList &sources = QVariantList(),
+                    const QString &tool = QString());
 
     // Replaces the whole list at once (begin/endResetModel, not per-row
     // inserts) -- for loading a chat session's full history on switch,

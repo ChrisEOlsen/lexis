@@ -176,6 +176,44 @@ PgStoreChatSession *pg_store_list_chat_sessions(PgStore *store, int64_t corpus_i
  * each entry's owned title. Safe to call with sessions == NULL. */
 void pg_store_chat_sessions_free(PgStoreChatSession *sessions, size_t count);
 
+/* -- Group summaries -- one cached, model-generated overview of what a
+ * group contains, built lazily on the first broad question about it (see
+ * corpus_summary.h) and reused afterward. Backs the SUMMARY tool, whose
+ * whole purpose is that answering "what is this collection about" must
+ * not re-read the entire corpus every time.
+ *
+ * Lives in the public schema alongside public.corpora, NOT in the
+ * corpus's own per-corpus schema, for the same reason chat history does:
+ * rebuild-on-append (pg_store_swap_corpus_schema()) drops and replaces a
+ * corpus's schema whenever a document is added to it. Storing the cache
+ * there would make invalidation an accident of that rebuild rather than
+ * a rule anyone can read -- and would break the moment rebuild-on-append
+ * became incremental.
+ *
+ * document_count is the staleness key: a cached summary describes the
+ * group as it was at that document count, so a mismatch against the
+ * group's current count means the cache must be rebuilt. Coarse on
+ * purpose -- it cannot detect a document being replaced by another one --
+ * see LIMITATIONS.md. */
+
+/* Creates public.corpus_summaries if it doesn't exist. Idempotent; safe
+ * to call before every read/write, same convention as
+ * pg_store_ensure_chat_tables(). Returns 0 on success, -1 on failure. */
+int pg_store_ensure_summary_table(PgStore *store);
+
+/* Reads corpus_id's cached summary. Returns a newly malloc()'d string the
+ * caller must free(), or NULL if this corpus has no cached summary yet or
+ * on a database/allocation error -- "absent" and "failed" are
+ * deliberately the same return here, because both mean the same thing to
+ * the only caller: build it. Sets *document_count_out to the document
+ * count the cached summary was generated at, untouched when NULL is
+ * returned. */
+char *pg_store_get_corpus_summary(PgStore *store, int64_t corpus_id, int *document_count_out);
+
+/* Inserts or replaces corpus_id's cached summary (one row per corpus).
+ * Returns 0 on success, -1 on failure. */
+int pg_store_set_corpus_summary(PgStore *store, int64_t corpus_id, const char *text, int document_count);
+
 /* Permanently deletes a chat session and every message in it (ON DELETE
  * CASCADE from chat_messages.session_id). Returns 0 on success, -1 if
  * session_id doesn't exist or the delete fails. */

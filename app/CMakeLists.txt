@@ -86,6 +86,7 @@ set(LEXIS_CORE_SRCS
     ${LEXIS_ROOT}/src/core/eval.c
     ${LEXIS_ROOT}/src/core/csv_parse.c
     ${LEXIS_ROOT}/src/core/tool_router.c
+    ${LEXIS_ROOT}/src/core/corpus_summary.c
     ${LEXIS_ROOT}/src/core/jinja_chat_template.cpp
 )
 
