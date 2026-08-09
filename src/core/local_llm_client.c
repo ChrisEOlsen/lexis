@@ -22,14 +22,8 @@
  * ceiling to compute how much chat history budget they have, not a
  * number they'd have to keep in sync with this file by hand. */
 #define LOCAL_LLM_N_BATCH LOCAL_LLM_N_CTX
-/* Raised from 512 when thinking mode was enabled for the answer step. A
- * reasoning pass plus the answer does not fit in 512: measured directly,
- * a grounded answer's reasoning block alone ran past the cap and the
- * model never reached the answer at all, returning a truncated monologue.
- * Calls that don't reason (the one-word tool router, a short summary)
- * stop at EOS long before this, so the higher ceiling costs them
- * nothing. */
-#define LOCAL_LLM_MAX_NEW_TOKENS 2048
+/* LOCAL_LLM_MAX_NEW_TOKENS now lives in local_llm_client.h -- callers have
+ * to size their own context reservations against it. */
 
 static struct llama_model *g_model = NULL;
 static struct llama_context *g_ctx = NULL;

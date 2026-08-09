@@ -103,14 +103,22 @@ char *generation_generate_answer(const char *query_text, PgStore *store,
     return answer;
 }
 
-/* Headroom reserved for the model's actual answer -- somewhat more than
- * LOCAL_LLM_MAX_NEW_TOKENS (512, local_llm_client.c) since the token
- * count this budget is computed against (local_llm_count_tokens() on the
- * already-built prompt) isn't run through the exact same
- * tokenize-the-full-formatted-prompt path the real call ends up using,
- * so a little slack is cheaper than risking a prompt that technically
- * doesn't fit. */
-#define GENERATION_RESERVED_OUTPUT_TOKENS 600
+/* Headroom held back from the history budget for the model's own output.
+ *
+ * Derived from LOCAL_LLM_MAX_NEW_TOKENS rather than written as a literal,
+ * because the two must move together and once did not: this was 600, chosen
+ * when the generation cap was 512, and stayed at 600 after the cap became
+ * 2048 for thinking mode. That combination is silently lossy -- history is
+ * allowed to fill the window to within 600 tokens of the end, generation then
+ * runs out of context part-way through (it stops cleanly, see
+ * local_llm_client.c's n_ctx_used check) and the user gets a truncated answer
+ * with nothing indicating it was cut short. Reasoning traces alone have been
+ * measured past 512 tokens, so the old margin was not close to enough.
+ *
+ * The extra slack on top covers the chat template's own markup: this budget
+ * is computed from local_llm_count_tokens() on the pre-template prompt, which
+ * undercounts what the real call ends up tokenizing. */
+#define GENERATION_RESERVED_OUTPUT_TOKENS (LOCAL_LLM_MAX_NEW_TOKENS + 256)
 
 /* Same windowing algorithm as query_formulation.c's own window_history()
  * -- kept as two small copies rather than one shared helper, since each

@@ -29,6 +29,22 @@
  * than each hardcoding its own copy. */
 #define LOCAL_LLM_N_CTX 16384
 
+/* Hard cap on tokens generated per call. Raised from 512 when thinking mode
+ * was enabled for the answer step: a reasoning pass plus the answer does not
+ * fit in 512 -- measured directly, the reasoning block alone ran past the cap
+ * and the model never reached an answer, returning a truncated monologue.
+ * Calls that don't reason (the one-word tool router, a short summary) stop at
+ * EOS long before this, so the higher ceiling costs them nothing.
+ *
+ * Declared here, not in the .c file, because callers that window conversation
+ * history have to reserve room for it. Generation stops cleanly once the
+ * context window fills (see the n_ctx_used check in
+ * local_llm_chat_completion_multi_ex()), so a caller that reserves LESS than
+ * this silently truncates long answers instead of failing -- which is exactly
+ * what generation.c did while this constant was private and its reservation
+ * was left at a value chosen when the cap was 512. */
+#define LOCAL_LLM_MAX_NEW_TOKENS 2048
+
 /* One turn of a conversation, in the model's own chat-template terms --
  * `role` is "user" or "assistant" (the two roles this project ever sends;
  * no "system" turn is used anywhere yet). Both fields are borrowed, never

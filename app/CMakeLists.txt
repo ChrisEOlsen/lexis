@@ -202,6 +202,22 @@ target_compile_definitions(lexis_app PRIVATE LEXIS_TESSDATA_PREFIX="${LEXIS_TESS
 target_link_libraries(lexis_app PRIVATE lexis_core Qt6::Quick Qt6::QuickControls2
     PkgConfig::POPPLER_CPP PkgConfig::PUGIXML PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBZIP)
 
+# Batch evaluation harness. Links the app's own QueryWorker so a measurement
+# run exercises the exact routing/retrieval/generation code the UI runs --
+# every earlier measurement in this project used a scratch program that
+# mirrored the pipeline by hand, and a mirror drifts. Qt6::Core only: no QML,
+# no widgets, nothing graphical.
+qt_add_executable(lexis_eval
+    src/eval_main.cpp
+    src/QueryWorker.h
+    src/QueryWorker.cpp
+)
+target_include_directories(lexis_eval PRIVATE ${PG_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(lexis_eval PRIVATE lexis_core Qt6::Core)
+set_target_properties(lexis_eval PROPERTIES
+    BUILD_RPATH "${LLAMA_CPP_DIR}/lib;${GGML_DIR}/lib"
+)
+
 # Needed to actually run the built binary straight out of the build
 # directory during development (no install step) -- lexis_core's link
 # requirements above only get the *linker* to llama.cpp/ggml at build
