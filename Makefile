@@ -28,8 +28,8 @@ PG_CONFIG := /opt/homebrew/opt/postgresql@18/bin/pg_config
 # Hardcoded to the exact installed Cellar versions, same tradeoff as
 # PG_CONFIG above -- `brew` doesn't put these on a stable, version-free
 # path, and this is an experimental branch, not meant to be portable as-is.
-LLAMA_CPP_DIR := /opt/homebrew/Cellar/llama.cpp/10180
-GGML_DIR := /opt/homebrew/Cellar/ggml/0.18.0
+LLAMA_CPP_DIR := /opt/homebrew/Cellar/llama.cpp/10360
+GGML_DIR := /opt/homebrew/Cellar/ggml/0.19.0
 
 CFLAGS  := $(shell cat compile_flags.txt) -pedantic
 # -lc++ is needed at link time even though almost everything here is

@@ -118,8 +118,8 @@ set(PG_CONFIG /opt/homebrew/opt/postgresql@18/bin/pg_config)
 execute_process(COMMAND ${PG_CONFIG} --includedir OUTPUT_VARIABLE PG_INCLUDE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
 execute_process(COMMAND ${PG_CONFIG} --libdir OUTPUT_VARIABLE PG_LIB_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
 
-set(LLAMA_CPP_DIR /opt/homebrew/Cellar/llama.cpp/10180)
-set(GGML_DIR /opt/homebrew/Cellar/ggml/0.18.0)
+set(LLAMA_CPP_DIR /opt/homebrew/Cellar/llama.cpp/10360)
+set(GGML_DIR /opt/homebrew/Cellar/ggml/0.19.0)
 
 # tesseract's language data (tessdata) lives under its own Cellar
 # version path, not a stable /opt/homebrew/share/ location -- resolved
