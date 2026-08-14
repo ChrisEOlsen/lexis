@@ -16,8 +16,10 @@
 #include "tokenizer.h"
 
 #include <cJSON.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 /* Cap on how many words from each candidate category (synonyms/
  * hypernyms/hyponyms) go into the prompt per term. Arbitrary first-N,
@@ -158,13 +160,12 @@ char *query_formulation_build_prompt(const char *query_text,
                     goto fail;
                 }
             }
-            if (term->candidates->hyponyms->count > 0) {
-                if (string_builder_append(&builder, "  hyponyms: ") != 0 ||
-                    append_capped_word_list(&builder, term->candidates->hyponyms) != 0 ||
-                    string_builder_append(&builder, "\n") != 0) {
-                    goto fail;
-                }
-            }
+            /* Hyponyms are deliberately NOT offered. They enumerate the
+             * answer space rather than paraphrase the question -- "which
+             * dynasty?" expanded with Bourbon_dynasty/Han_dynasty pulls
+             * passages about the wrong dynasties up the ranking. Measured
+             * as part of the expansion-hurts-retrieval finding in
+             * LIMITATIONS.md. */
         }
 
         if (string_builder_append(&builder, "\n") != 0) {
@@ -179,57 +180,121 @@ fail:
     return NULL;
 }
 
-/* Copies `candidates`'s original terms into a fresh TokenList -- used
- * whenever the small model's response can't be trusted (API failure or
- * an unparseable/empty response), so search still runs on the plain
- * stopword-filtered query instead of failing outright. */
-static TokenList *query_formulation_fallback_terms(const QueryFormulationCandidates *candidates) {
+static int token_list_contains(const TokenList *list, const char *word) {
+    for (size_t i = 0; i < list->count; i++) {
+        if (strcmp(list->terms[i], word) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Case-insensitive "was this word actually offered as a candidate?"
+ * check across every term's synonym/hypernym lists. Constrains the
+ * model to vetoing/keeping what it was shown -- an invented term can't
+ * enter the query. Hyponyms aren't checked because build_prompt() no
+ * longer offers them. */
+static int is_offered_candidate(const QueryFormulationCandidates *candidates, const char *word) {
+    for (size_t i = 0; i < candidates->count; i++) {
+        const WordNetLookupResult *entry = candidates->terms[i].candidates;
+        if (entry == NULL) {
+            continue;
+        }
+        const TokenList *lists[2] = {entry->synonyms, entry->hypernyms};
+        for (size_t l = 0; l < 2; l++) {
+            for (size_t j = 0; j < lists[l]->count; j++) {
+                if (strcasecmp(lists[l]->terms[j], word) == 0) {
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* Lowercase copy of `word`, or NULL if it contains anything but ASCII
+ * letters/digits. Rejects WordNet collocations ("family_line") and
+ * hyphenations outright: the ingest tokenizer strips punctuation, so no
+ * such string can ever exist in the terms table -- they'd be dead
+ * weight in the query. Lowercasing is what lets "Rex" match the
+ * all-lowercase index. */
+static char *normalize_expansion(const char *word) {
+    size_t len = strlen(word);
+    if (len == 0) {
+        return NULL;
+    }
+    char *normalized = malloc(len + 1);
+    if (normalized == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)word[i];
+        if (!isalnum(c)) {
+            free(normalized);
+            return NULL;
+        }
+        normalized[i] = (char)tolower(c);
+    }
+    normalized[len] = '\0';
+    return normalized;
+}
+
+TokenList *query_formulation_parse_selected_terms(
+    const char *response_text, const QueryFormulationCandidates *candidates,
+    size_t *original_count_out) {
+    /* The original question terms are searched unconditionally -- the
+     * model's selection can only ADD sense-checked expansions, never
+     * remove the question itself from its own search. (The old contract
+     * let the model drop original terms, and it did: see the king-tut
+     * postmortem in LIMITATIONS.md.) */
     TokenList *result = token_list_create();
     if (result == NULL) {
         return NULL;
     }
-
     for (size_t i = 0; i < candidates->count; i++) {
+        if (token_list_contains(result, candidates->terms[i].term)) {
+            continue; /* a question can repeat a word; search it once */
+        }
         if (token_list_append(result, candidates->terms[i].term) != 0) {
             token_list_free(result);
             return NULL;
         }
     }
+    if (original_count_out != NULL) {
+        *original_count_out = result->count;
+    }
 
-    return result;
-}
-
-TokenList *query_formulation_parse_selected_terms(
-    const char *response_text, const QueryFormulationCandidates *fallback_candidates) {
+    /* Expansions: accepted only if parseable, offered in the prompt,
+     * index-shaped (single lowercase word), and not already present. An
+     * unparseable response degrades to originals-only -- same graceful
+     * floor the old fallback provided. */
     cJSON *parsed = cJSON_Parse(response_text);
-    if (parsed == NULL || !cJSON_IsArray(parsed)) {
-        cJSON_Delete(parsed);
-        return query_formulation_fallback_terms(fallback_candidates);
-    }
-
-    TokenList *result = token_list_create();
-    if (result == NULL) {
-        cJSON_Delete(parsed);
-        return NULL;
-    }
-
-    int array_size = cJSON_GetArraySize(parsed);
-    for (int i = 0; i < array_size; i++) {
-        cJSON *item = cJSON_GetArrayItem(parsed, i);
-        if (item != NULL && cJSON_IsString(item)) {
-            if (token_list_append(result, item->valuestring) != 0) {
+    if (parsed != NULL && cJSON_IsArray(parsed)) {
+        int array_size = cJSON_GetArraySize(parsed);
+        for (int i = 0; i < array_size; i++) {
+            cJSON *item = cJSON_GetArrayItem(parsed, i);
+            if (item == NULL || !cJSON_IsString(item)) {
+                continue;
+            }
+            char *normalized = normalize_expansion(item->valuestring);
+            if (normalized == NULL) {
+                continue;
+            }
+            if (token_list_contains(result, normalized) ||
+                !is_offered_candidate(candidates, normalized)) {
+                free(normalized);
+                continue;
+            }
+            if (token_list_append(result, normalized) != 0) {
+                free(normalized);
                 cJSON_Delete(parsed);
                 token_list_free(result);
                 return NULL;
             }
+            free(normalized);
         }
     }
     cJSON_Delete(parsed);
-
-    if (result->count == 0) {
-        token_list_free(result);
-        return query_formulation_fallback_terms(fallback_candidates);
-    }
 
     return result;
 }
@@ -237,7 +302,8 @@ TokenList *query_formulation_parse_selected_terms(
 TokenList *query_formulation_formulate_query(const char *query_text,
                                               const StopwordSet *stopwords,
                                               const WordNetTable *wordnet,
-                                              const Lemmatizer *lemmatizer) {
+                                              const Lemmatizer *lemmatizer,
+                                              size_t *original_count_out) {
     QueryFormulationCandidates *candidates =
         query_formulation_gather_candidates(query_text, stopwords, wordnet, lemmatizer);
     if (candidates == NULL) {
@@ -248,6 +314,9 @@ TokenList *query_formulation_formulate_query(const char *query_text,
         /* Nothing survived stopword filtering -- nothing to expand or
          * search for. A valid empty outcome, not a failure. */
         query_formulation_candidates_free(candidates);
+        if (original_count_out != NULL) {
+            *original_count_out = 0;
+        }
         return token_list_create();
     }
 
@@ -260,13 +329,12 @@ TokenList *query_formulation_formulate_query(const char *query_text,
     char *response = local_llm_chat_completion(prompt);
     free(prompt);
 
-    TokenList *selected_terms;
-    if (response == NULL) {
-        selected_terms = query_formulation_fallback_terms(candidates);
-    } else {
-        selected_terms = query_formulation_parse_selected_terms(response, candidates);
-        free(response);
-    }
+    /* A NULL response flows through unchanged -- cJSON_Parse treats NULL
+     * as unparseable, and the parser's originals-first contract already
+     * degrades that to plain question terms. */
+    TokenList *selected_terms =
+        query_formulation_parse_selected_terms(response, candidates, original_count_out);
+    free(response);
 
     query_formulation_candidates_free(candidates);
     return selected_terms;
@@ -318,11 +386,13 @@ TokenList *query_formulation_terms_only(const char *query_text, const StopwordSe
     }
 
     /* Same "nothing survived stopword filtering" empty-outcome handling
-     * as query_formulation_formulate_query() -- no prompt, no model call,
-     * just the plain lemmatized terms query_formulation_fallback_terms()
-     * would have produced anyway had the LLM call failed. */
-    TokenList *terms = (candidates->count == 0) ? token_list_create()
-                                                 : query_formulation_fallback_terms(candidates);
+     * as query_formulation_formulate_query() -- no prompt, no model call.
+     * parse_selected_terms(NULL, ...) is the originals-only path: a NULL
+     * response contributes no expansions, leaving exactly the plain
+     * deduplicated lemmatized terms. */
+    TokenList *terms = (candidates->count == 0)
+                           ? token_list_create()
+                           : query_formulation_parse_selected_terms(NULL, candidates, NULL);
     query_formulation_candidates_free(candidates);
     return terms;
 }

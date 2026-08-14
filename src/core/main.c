@@ -217,6 +217,7 @@ static int run_query(const char *question) {
     char *qf_response = NULL;
     int used_fallback = 0;
     TokenList *terms = NULL;
+    size_t original_count = 0;
 
     if (candidates->count == 0) {
         terms = token_list_create();
@@ -226,11 +227,10 @@ static int run_query(const char *question) {
             qf_response = local_llm_chat_completion(qf_prompt);
             used_fallback = (qf_response == NULL);
         }
-        /* query_formulation_parse_selected_terms() falls back to
-         * `candidates`'s original terms on a NULL response too (cJSON_Parse
-         * safely treats NULL as unparseable) -- same fallback behavior
-         * query_formulation_formulate_query() itself relies on. */
-        terms = query_formulation_parse_selected_terms(qf_response, candidates);
+        /* A NULL response degrades to originals-only inside the parser
+         * (cJSON_Parse safely treats NULL as unparseable) -- same
+         * graceful floor query_formulation_formulate_query() relies on. */
+        terms = query_formulation_parse_selected_terms(qf_response, candidates, &original_count);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &qf_end);
@@ -270,26 +270,34 @@ static int run_query(const char *question) {
 
     {
         const char **query_terms = malloc(terms->count * sizeof(char *));
-        if (query_terms == NULL) {
+        double *term_weights = malloc(terms->count * sizeof(double));
+        if (query_terms == NULL || term_weights == NULL) {
             fprintf(stderr, "lexis: out of memory\n");
+            free(query_terms);
+            free(term_weights);
             token_list_free(terms);
             exit_code = 1;
             goto cleanup;
         }
         for (size_t i = 0; i < terms->count; i++) {
             query_terms[i] = terms->terms[i];
+            /* Originals lead the list (parse_selected_terms's contract);
+             * everything after original_count is a discounted expansion. */
+            term_weights[i] = (i < original_count) ? 1.0 : LEXIS_EXPANSION_WEIGHT;
         }
 
         struct timespec search_start, search_end;
         clock_gettime(CLOCK_MONOTONIC, &search_start);
-        BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B};
+        BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B, BM25_DEFAULT_COORD_BONUS};
         BM25CorpusStats stats = bm25_corpus_stats(store);
         BM25ResultSet *results =
             (stats.total_passages >= 0)
-                ? bm25_search(store, query_terms, terms->count, LEXIS_TOP_K, stats, params)
+                ? bm25_search_weighted(store, query_terms, term_weights, terms->count, LEXIS_TOP_K,
+                                        stats, params)
                 : NULL;
         clock_gettime(CLOCK_MONOTONIC, &search_end);
         free(query_terms);
+        free(term_weights);
         token_list_free(terms);
 
         if (results == NULL) {

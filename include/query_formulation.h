@@ -39,6 +39,14 @@ typedef struct {
     const WordNetLookupResult *candidates;
 } QueryFormulationTermCandidates;
 
+/* BM25 weight for expansion terms (everything after original_count in
+ * parse_selected_terms's output) -- originals weigh 1.0. 0.4 sits in the
+ * classical Rocchio/RM3 interpolation range: expansions assist ranking
+ * but a passage matching only expansions cannot outrank one matching
+ * the question's own words. Shared by every caller that searches an
+ * expanded query (CLI, eval). */
+#define LEXIS_EXPANSION_WEIGHT 0.4
+
 /* Every surviving term from one query, each with its candidates. */
 typedef struct {
     QueryFormulationTermCandidates *terms;
@@ -69,14 +77,22 @@ void query_formulation_candidates_free(QueryFormulationCandidates *candidates);
 char *query_formulation_build_prompt(const char *query_text,
                                       const QueryFormulationCandidates *candidates);
 
-/* Parses `response_text` as a JSON array of strings into a flat term
- * list ready for bm25_search(). Falls back to `fallback_candidates`'s
- * original (unexpanded) terms if the response isn't valid JSON, isn't an
- * array, or parses to zero usable strings -- an unreliable external LLM
- * response degrades search gracefully rather than breaking it. Returns
- * NULL only on allocation failure. */
+/* Builds the final search-term list: `candidates`'s original question
+ * terms FIRST and unconditionally (deduplicated -- the model cannot
+ * remove the question from its own search), then any expansions from
+ * `response_text` (a JSON array of strings) that survive four checks:
+ * parseable, actually offered in the prompt's candidate lists
+ * (case-insensitive -- an invented term can't enter the query),
+ * index-shaped after lowercasing (single ASCII word; WordNet
+ * collocations like "family_line" can never match the tokenized terms
+ * table), and not already present. An unparseable/NULL response
+ * degrades to originals-only. If `original_count_out` is non-NULL it
+ * receives how many leading entries are original terms -- the boundary
+ * bm25's per-term weighting needs to discount expansions. Returns NULL
+ * only on allocation failure. */
 TokenList *query_formulation_parse_selected_terms(const char *response_text,
-                                                   const QueryFormulationCandidates *fallback_candidates);
+                                                   const QueryFormulationCandidates *candidates,
+                                                   size_t *original_count_out);
 
 /* Runs the full query formulation step: gathers WordNet candidates,
  * builds the prompt, calls the local model, and parses the result --
@@ -88,7 +104,8 @@ TokenList *query_formulation_parse_selected_terms(const char *response_text,
 TokenList *query_formulation_formulate_query(const char *query_text,
                                               const StopwordSet *stopwords,
                                               const WordNetTable *wordnet,
-                                              const Lemmatizer *lemmatizer);
+                                              const Lemmatizer *lemmatizer,
+                                              size_t *original_count_out);
 
 /* The local-only half of query_formulation_formulate_query() -- tokenize,
  * stopword-filter, lemmatize, done. Skips WordNet candidate gathering's

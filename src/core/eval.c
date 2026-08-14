@@ -258,7 +258,7 @@ EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNet
     struct timespec run_start;
     clock_gettime(CLOCK_MONOTONIC, &run_start);
 
-    BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B};
+    BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B, BM25_DEFAULT_COORD_BONUS};
 
     for (long qi = 0; qi < query_count; qi++) {
         const char *query_id = queries[qi].query_id;
@@ -279,9 +279,13 @@ EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNet
             continue;
         }
 
+        size_t original_count = 0;
         TokenList *terms = use_llm_expansion
-                               ? query_formulation_formulate_query(query_text, stopwords, wordnet, lemmatizer)
+                               ? query_formulation_formulate_query(query_text, stopwords, wordnet, lemmatizer, &original_count)
                                : query_formulation_terms_only(query_text, stopwords, wordnet, lemmatizer);
+        if (terms != NULL && !use_llm_expansion) {
+            original_count = terms->count; /* no expansions on this path */
+        }
         if (terms == NULL) {
             fprintf(stderr, "eval_run: query formulation failed (allocation failure) on query %s\n",
                     query_id);
@@ -295,17 +299,26 @@ EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNet
 
         if (terms->count > 0) {
             const char **query_terms = malloc(terms->count * sizeof(char *));
-            if (query_terms == NULL) {
+            double *term_weights = malloc(terms->count * sizeof(double));
+            if (query_terms == NULL || term_weights == NULL) {
+                free(query_terms);
+                free(term_weights);
                 token_list_free(terms);
                 eval_cleanup(relevant_ids, qrels, qrels_count, queries, query_count);
                 return failure;
             }
             for (size_t i = 0; i < terms->count; i++) {
                 query_terms[i] = terms->terms[i];
+                /* Originals lead the list (parse_selected_terms's
+                 * contract); everything after original_count is a
+                 * discounted expansion. */
+                term_weights[i] = (i < original_count) ? 1.0 : LEXIS_EXPANSION_WEIGHT;
             }
 
-            BM25ResultSet *results = bm25_search(store, query_terms, terms->count, 100, stats, params);
+            BM25ResultSet *results =
+                bm25_search_weighted(store, query_terms, term_weights, terms->count, 100, stats, params);
             free(query_terms);
+            free(term_weights);
 
             if (results == NULL) {
                 fprintf(stderr, "eval_run: search failed on query %s\n", query_id);

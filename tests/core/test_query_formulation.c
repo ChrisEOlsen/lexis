@@ -199,13 +199,20 @@ static void test_parse_selected_terms_valid_json(void) {
     QueryFormulationCandidates *fallback = make_two_term_candidates(stopwords, wordnet, lemmatizer);
     TEST_ASSERT(fallback != NULL, "expected setup to succeed");
 
+    /* Originals-first contract: "dog" and "cat" are present regardless
+     * of the response. "canine" is an offered hypernym of dog -> kept.
+     * "domestic_dog" is offered but contains an underscore -- no such
+     * token can exist in the tokenized terms table -> dropped. The
+     * response's own "dog" is already an original -> deduplicated. */
+    size_t original_count = 0;
     TokenList *result = query_formulation_parse_selected_terms(
-        "[\"dog\", \"canine\", \"domestic_dog\"]", fallback);
+        "[\"dog\", \"canine\", \"domestic_dog\"]", fallback, &original_count);
     TEST_ASSERT(result != NULL, "expected parse to succeed");
-    TEST_ASSERT(result->count == 3, "expected 3 selected terms, got %zu", result->count);
+    TEST_ASSERT(original_count == 2, "expected 2 original terms, got %zu", original_count);
+    TEST_ASSERT(result->count == 3, "expected originals + 1 surviving expansion, got %zu", result->count);
     TEST_ASSERT_STR_EQ(result->terms[0], "dog");
-    TEST_ASSERT_STR_EQ(result->terms[1], "canine");
-    TEST_ASSERT_STR_EQ(result->terms[2], "domestic_dog");
+    TEST_ASSERT_STR_EQ(result->terms[1], "cat");
+    TEST_ASSERT_STR_EQ(result->terms[2], "canine");
 
     token_list_free(result);
     query_formulation_candidates_free(fallback);
@@ -221,7 +228,8 @@ static void test_parse_selected_terms_invalid_json_falls_back(void) {
     QueryFormulationCandidates *fallback = make_two_term_candidates(stopwords, wordnet, lemmatizer);
     TEST_ASSERT(fallback != NULL, "expected setup to succeed");
 
-    TokenList *result = query_formulation_parse_selected_terms("this is not json at all {{{", fallback);
+    TokenList *result =
+        query_formulation_parse_selected_terms("this is not json at all {{{", fallback, NULL);
     TEST_ASSERT(result != NULL, "expected a fallback result, not NULL, on unparseable JSON");
     TEST_ASSERT(result->count == 2, "expected fallback to the 2 original terms, got %zu", result->count);
     TEST_ASSERT_STR_EQ(result->terms[0], "dog");
@@ -242,7 +250,7 @@ static void test_parse_selected_terms_non_array_falls_back(void) {
     TEST_ASSERT(fallback != NULL, "expected setup to succeed");
 
     /* Valid JSON, but an object, not the array the prompt asked for. */
-    TokenList *result = query_formulation_parse_selected_terms("{\"terms\": [\"dog\"]}", fallback);
+    TokenList *result = query_formulation_parse_selected_terms("{\"terms\": [\"dog\"]}", fallback, NULL);
     TEST_ASSERT(result != NULL, "expected a fallback result, not NULL, on a non-array response");
     TEST_ASSERT(result->count == 2, "expected fallback to the 2 original terms, got %zu", result->count);
 
@@ -260,7 +268,7 @@ static void test_parse_selected_terms_empty_array_falls_back(void) {
     QueryFormulationCandidates *fallback = make_two_term_candidates(stopwords, wordnet, lemmatizer);
     TEST_ASSERT(fallback != NULL, "expected setup to succeed");
 
-    TokenList *result = query_formulation_parse_selected_terms("[]", fallback);
+    TokenList *result = query_formulation_parse_selected_terms("[]", fallback, NULL);
     TEST_ASSERT(result != NULL, "expected a fallback result, not NULL, on an empty array");
     TEST_ASSERT(result->count == 2, "expected fallback to the 2 original terms, got %zu", result->count);
 
@@ -278,11 +286,60 @@ static void test_parse_selected_terms_ignores_non_string_items(void) {
     QueryFormulationCandidates *fallback = make_two_term_candidates(stopwords, wordnet, lemmatizer);
     TEST_ASSERT(fallback != NULL, "expected setup to succeed");
 
-    TokenList *result = query_formulation_parse_selected_terms("[\"dog\", 42, \"canine\", null]", fallback);
+    TokenList *result =
+        query_formulation_parse_selected_terms("[\"dog\", 42, \"canine\", null]", fallback, NULL);
     TEST_ASSERT(result != NULL, "expected parse to succeed");
-    TEST_ASSERT(result->count == 2, "expected only the 2 string items kept, got %zu", result->count);
+    TEST_ASSERT(result->count == 3, "expected 2 originals + 1 expansion, got %zu", result->count);
     TEST_ASSERT_STR_EQ(result->terms[0], "dog");
-    TEST_ASSERT_STR_EQ(result->terms[1], "canine");
+    TEST_ASSERT_STR_EQ(result->terms[1], "cat");
+    TEST_ASSERT_STR_EQ(result->terms[2], "canine");
+
+    token_list_free(result);
+    query_formulation_candidates_free(fallback);
+    wordnet_table_free(wordnet);
+    lemmatizer_free(lemmatizer);
+    stopword_set_free(stopwords);
+}
+
+static void test_parse_selected_terms_rejects_uninvented_and_dedups(void) {
+    StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
+    WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
+    Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
+    QueryFormulationCandidates *fallback = make_two_term_candidates(stopwords, wordnet, lemmatizer);
+    TEST_ASSERT(fallback != NULL, "expected setup to succeed");
+
+    /* "elephant" was never offered as a candidate for dog/cat -- an
+     * invented term must not enter the query. "canine" repeated must
+     * appear once. */
+    TokenList *result = query_formulation_parse_selected_terms(
+        "[\"canine\", \"elephant\", \"canine\"]", fallback, NULL);
+    TEST_ASSERT(result != NULL, "expected parse to succeed");
+    TEST_ASSERT(result->count == 3, "expected 2 originals + 1 deduped expansion, got %zu",
+                result->count);
+    TEST_ASSERT_STR_EQ(result->terms[2], "canine");
+
+    token_list_free(result);
+    query_formulation_candidates_free(fallback);
+    wordnet_table_free(wordnet);
+    lemmatizer_free(lemmatizer);
+    stopword_set_free(stopwords);
+}
+
+static void test_parse_selected_terms_lowercases_expansions(void) {
+    StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
+    WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
+    Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
+    QueryFormulationCandidates *fallback = make_two_term_candidates(stopwords, wordnet, lemmatizer);
+    TEST_ASSERT(fallback != NULL, "expected setup to succeed");
+
+    /* The terms table is all-lowercase (the ingest tokenizer lowercases),
+     * so an expansion kept as "CANINE" could never match a posting. The
+     * offered-candidate check is case-insensitive; the stored term must
+     * come out lowercase. */
+    TokenList *result = query_formulation_parse_selected_terms("[\"CANINE\"]", fallback, NULL);
+    TEST_ASSERT(result != NULL, "expected parse to succeed");
+    TEST_ASSERT(result->count == 3, "expected 2 originals + 1 expansion, got %zu", result->count);
+    TEST_ASSERT_STR_EQ(result->terms[2], "canine");
 
     token_list_free(result);
     query_formulation_candidates_free(fallback);
@@ -302,7 +359,7 @@ static void test_formulate_query_falls_back_without_local_model(void) {
      * happens. This exercises the real generation-failure fallback path
      * without needing a loaded model in this test binary. */
     TokenList *result = query_formulation_formulate_query(
-        "What is the treatment for hypertension?", stopwords, wordnet, lemmatizer);
+        "What is the treatment for hypertension?", stopwords, wordnet, lemmatizer, NULL);
     TEST_ASSERT(result != NULL, "expected a fallback result, not NULL, when the API call fails");
     TEST_ASSERT(result->count == 2, "expected fallback to the 2 original terms, got %zu", result->count);
     TEST_ASSERT_STR_EQ(result->terms[0], "treatment");
@@ -321,7 +378,7 @@ static void test_formulate_query_all_stopwords_returns_empty_not_null(void) {
     TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
     TokenList *result =
-        query_formulation_formulate_query("what is the for", stopwords, wordnet, lemmatizer);
+        query_formulation_formulate_query("what is the for", stopwords, wordnet, lemmatizer, NULL);
     TEST_ASSERT(result != NULL, "expected an empty result, not NULL, for an all-stopwords query");
     TEST_ASSERT(result->count == 0, "expected 0 terms, got %zu", result->count);
 
@@ -343,6 +400,8 @@ int main(void) {
     test_parse_selected_terms_non_array_falls_back();
     test_parse_selected_terms_empty_array_falls_back();
     test_parse_selected_terms_ignores_non_string_items();
+    test_parse_selected_terms_rejects_uninvented_and_dedups();
+    test_parse_selected_terms_lowercases_expansions();
     test_formulate_query_falls_back_without_local_model();
     test_formulate_query_all_stopwords_returns_empty_not_null();
     return test_summary();
