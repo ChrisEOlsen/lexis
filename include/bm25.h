@@ -22,10 +22,21 @@
 typedef struct {
     double k1;
     double b;
+    /* Coordination bonus: after accumulation, a passage's score is
+     * multiplied by 1 + coord_bonus * (distinct_terms_matched - 1) /
+     * (num_query_terms - 1), so matching MORE of the query's distinct
+     * terms beats matching one corpus-frequent term repeatedly (the
+     * measured failure: ~19 heated-steering-wheel passages each matching
+     * "steering"+"wheel" drowning the one cruise-control passage that
+     * matched "buttons"+"steering"+"wheel"). 0 disables the bonus
+     * entirely -- which is what a zero-initialized or two-field
+     * designated initializer gets, preserving pre-bonus behavior. */
+    double coord_bonus;
 } BM25Params;
 
 #define BM25_DEFAULT_K1 1.2
 #define BM25_DEFAULT_B 0.75
+#define BM25_DEFAULT_COORD_BONUS 0.25
 
 /* Corpus-wide statistics BM25 needs before it can score anything: how many
  * passages exist in total (N) and their average length in tokens (avgdl).
@@ -62,10 +73,15 @@ double bm25_term_score(double idf, long term_frequency, long passage_length,
                         double avg_passage_length, BM25Params params);
 
 /* One passage's accumulated BM25 score -- one entry per distinct passage
- * that matched at least one query term so far. */
+ * that matched at least one query term so far. matched_terms counts how
+ * many distinct query terms have contributed (each
+ * bm25_result_set_add() call is one term's contribution -- a term
+ * touches a passage at most once per search, postings' primary key
+ * guarantees it); the coordination bonus reads it after accumulation. */
 typedef struct {
     int64_t passage_id;
     double score;
+    int matched_terms;
 } BM25ScoredPassage;
 
 /* Opaque hash index (passage_id -> its slot in BM25ResultSet.items[]),
@@ -114,6 +130,13 @@ void bm25_result_set_free(BM25ResultSet *set);
 int bm25_accumulate_term_scores(PgStore *store, int64_t term_id, BM25CorpusStats stats,
                                  BM25Params params, BM25ResultSet *results);
 
+/* bm25_accumulate_term_scores() with the term's score contribution
+ * multiplied by `weight` (1.0 = identical behavior; the unweighted
+ * function is now a wrapper over this). See bm25_search_weighted(). */
+int bm25_accumulate_term_scores_weighted(PgStore *store, int64_t term_id, BM25CorpusStats stats,
+                                          BM25Params params, double weight,
+                                          BM25ResultSet *results);
+
 /* Runs a full BM25 search: looks up each of `num_terms` query terms
  * (unrecognized terms are silently skipped -- they simply contribute no
  * score, same as any other term with zero matching passages), accumulates
@@ -128,6 +151,19 @@ int bm25_accumulate_term_scores(PgStore *store, int64_t term_id, BM25CorpusStats
  * with bm25_result_set_free(), or NULL on a database/allocation failure. */
 BM25ResultSet *bm25_search(PgStore *store, const char **query_terms, size_t num_terms, size_t top_k,
                             BM25CorpusStats stats, BM25Params params);
+
+/* bm25_search() with a per-term score weight. `term_weights` is parallel
+ * to `query_terms`; NULL means every term weighs 1.0 (making this
+ * exactly bm25_search(), which is now a wrapper over it). Exists so
+ * query expansion can be DISCOUNTED rather than equal: original question
+ * terms at 1.0, WordNet expansions at LEXIS_EXPANSION_WEIGHT, so an
+ * expansion can assist a passage but a passage matching only expansions
+ * cannot outrank one matching the question itself -- the failure the
+ * king-tut postmortem measured (see LIMITATIONS.md). Also applies
+ * params.coord_bonus (see BM25Params). */
+BM25ResultSet *bm25_search_weighted(PgStore *store, const char **query_terms,
+                                     const double *term_weights, size_t num_terms, size_t top_k,
+                                     BM25CorpusStats stats, BM25Params params);
 
 /* Shrinks an already-ranked `set` in place to the prefix worth sending to
  * a model, keeping results in rank order and stopping at the FIRST of

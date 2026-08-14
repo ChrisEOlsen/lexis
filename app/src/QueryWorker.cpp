@@ -142,7 +142,11 @@ bool runSearchPipeline(PgStore *store, const char *questionCstr, const std::vect
         queryTerms.append(terms->terms[i]);
     }
 
-    BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B};
+    /* Coordination bonus on: passages matching more of the query's
+     * distinct terms outrank a corpus-frequent topic matching fewer --
+     * the heated-steering-wheel-vs-cruise-control failure. No expansion
+     * weights here: the terms union is all original question terms. */
+    BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B, BM25_DEFAULT_COORD_BONUS};
     BM25CorpusStats stats = bm25_corpus_stats(store);
     BM25ResultSet *results =
         (stats.total_passages >= 0)

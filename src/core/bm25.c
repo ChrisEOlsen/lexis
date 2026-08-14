@@ -203,6 +203,7 @@ int bm25_result_set_add(BM25ResultSet *set, int64_t passage_id, double score) {
     size_t item_index;
     if (bm25_result_index_lookup(set->index, passage_id, &item_index)) {
         set->items[item_index].score += score;
+        set->items[item_index].matched_terms++;
         return 0;
     }
 
@@ -219,6 +220,7 @@ int bm25_result_set_add(BM25ResultSet *set, int64_t passage_id, double score) {
 
     set->items[set->count].passage_id = passage_id;
     set->items[set->count].score = score;
+    set->items[set->count].matched_terms = 1;
 
     if (bm25_result_index_insert(set->index, passage_id, set->count) != 0) {
         fprintf(stderr, "failed to grow index: bm25_result_set_add");
@@ -278,6 +280,12 @@ void bm25_result_set_free(BM25ResultSet *set) {
 
 int bm25_accumulate_term_scores(PgStore *store, int64_t term_id, BM25CorpusStats stats,
                                  BM25Params params, BM25ResultSet *results) {
+    return bm25_accumulate_term_scores_weighted(store, term_id, stats, params, 1.0, results);
+}
+
+int bm25_accumulate_term_scores_weighted(PgStore *store, int64_t term_id, BM25CorpusStats stats,
+                                          BM25Params params, double weight,
+                                          BM25ResultSet *results) {
     long n = bm25_document_frequency(store, term_id);
     if (n < 0) {
         return -1;
@@ -314,8 +322,8 @@ int bm25_accumulate_term_scores(PgStore *store, int64_t term_id, BM25CorpusStats
         long term_frequency = atol(PQgetvalue(res, i, 1));
         long passage_length = atol(PQgetvalue(res, i, 2));
 
-        double score = bm25_term_score(idf, term_frequency, passage_length, stats.avg_passage_length,
-                                        params);
+        double score = weight * bm25_term_score(idf, term_frequency, passage_length,
+                                                 stats.avg_passage_length, params);
 
         if (bm25_result_set_add(results, passage_id, score) != 0) {
             PQclear(res);
@@ -345,6 +353,12 @@ static int bm25_compare_score_desc(const void *a, const void *b) {
 
 BM25ResultSet *bm25_search(PgStore *store, const char **query_terms, size_t num_terms,
                             size_t top_k, BM25CorpusStats stats, BM25Params params) {
+    return bm25_search_weighted(store, query_terms, NULL, num_terms, top_k, stats, params);
+}
+
+BM25ResultSet *bm25_search_weighted(PgStore *store, const char **query_terms,
+                                     const double *term_weights, size_t num_terms,
+                                     size_t top_k, BM25CorpusStats stats, BM25Params params) {
     if (stats.total_passages < 0) {
         return NULL;
     }
@@ -361,9 +375,21 @@ BM25ResultSet *bm25_search(PgStore *store, const char **query_terms, size_t num_
             continue;
         }
 
-        if (bm25_accumulate_term_scores(store, term_id, stats, params, results) != 0) {
+        double weight = (term_weights != NULL) ? term_weights[i] : 1.0;
+        if (bm25_accumulate_term_scores_weighted(store, term_id, stats, params, weight,
+                                                  results) != 0) {
             bm25_result_set_free(results);
             return NULL;
+        }
+    }
+
+    /* Coordination bonus (see BM25Params.coord_bonus): applied after all
+     * terms have accumulated, before ranking. num_terms == 1 means every
+     * passage matched the same single term -- nothing to coordinate. */
+    if (params.coord_bonus > 0.0 && num_terms > 1) {
+        for (size_t i = 0; i < results->count; i++) {
+            double matched = (double)(results->items[i].matched_terms - 1);
+            results->items[i].score *= 1.0 + params.coord_bonus * matched / (double)(num_terms - 1);
         }
     }
 

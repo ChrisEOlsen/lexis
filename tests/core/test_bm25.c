@@ -207,6 +207,27 @@ static void test_result_set_add_accumulates_same_passage(void) {
     bm25_result_set_free(set);
 }
 
+static void test_result_set_add_tracks_matched_terms(void) {
+    BM25ResultSet *set = bm25_result_set_create();
+    TEST_ASSERT(set != NULL, "expected bm25_result_set_create to succeed");
+
+    /* Each add call is one distinct query term's contribution (postings'
+     * PK means a term touches a passage at most once per search), so the
+     * counter the coordination bonus reads is simply the add count. */
+    bm25_result_set_add(set, 7, 2.0);
+    TEST_ASSERT(set->items[0].matched_terms == 1,
+                "expected matched_terms 1 after first add, got %d", set->items[0].matched_terms);
+    bm25_result_set_add(set, 7, 3.0);
+    TEST_ASSERT(set->items[0].matched_terms == 2,
+                "expected matched_terms 2 after merge, got %d", set->items[0].matched_terms);
+    bm25_result_set_add(set, 9, 1.0);
+    TEST_ASSERT(set->items[1].matched_terms == 1,
+                "expected a fresh passage to start at matched_terms 1, got %d",
+                set->items[1].matched_terms);
+
+    bm25_result_set_free(set);
+}
+
 static void test_result_set_add_distinct_passages_stay_separate(void) {
     BM25ResultSet *set = bm25_result_set_create();
     TEST_ASSERT(set != NULL, "expected bm25_result_set_create to succeed");
@@ -464,6 +485,7 @@ int main(void) {
     test_result_set_create_starts_empty();
     test_result_set_add_first_entry();
     test_result_set_add_accumulates_same_passage();
+    test_result_set_add_tracks_matched_terms();
     test_result_set_add_distinct_passages_stay_separate();
     test_result_set_add_grows_past_initial_capacity();
     test_result_set_add_merges_correctly_across_index_growth();
