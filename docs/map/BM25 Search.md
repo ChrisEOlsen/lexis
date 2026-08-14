@@ -15,6 +15,8 @@ Per search:
 
 Callers differ in K: [[CLI]] takes top-5 straight; [[Query Worker]] over-fetches to a candidate ceiling then `bm25_result_set_trim()` cuts by passage count, token budget, and score-floor ratio.
 
-Known sharp edge (2026-08-13): duplicate search terms are **not deduped**, so a term selected twice by [[Query Formulation]]'s expansion double-counts its score contribution.
+Two scoring refinements (2026-08-14):
+- **Per-term weights** (`bm25_search_weighted()`): original question terms score at 1.0, [[Query Formulation]] expansions at 0.4 — an expansion can assist a passage but never let it outrank one matching the question itself. (Duplicate terms are also gone: the formulation parser dedups.)
+- **Coordination bonus** (`BM25Params.coord_bonus`, default 0.25): a passage's score scales up as it matches more *distinct* query terms, so one corpus-frequent topic matching two terms nineteen times can't drown the single passage matching three.
 
 **Reads:** [[Postgres Store]]. **Feeds:** [[Generation]].
