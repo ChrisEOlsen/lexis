@@ -30,6 +30,7 @@ extern "C" {
 #include "ingest.h"
 #include "pg_store.h"
 #include "query_formulation.h"
+#include "retrieval.h"
 #include "corpus_summary.h"
 #include "prompts.h"
 #include "tool_router.h"
@@ -116,94 +117,35 @@ bool runSearchPipeline(PgStore *store, const char *questionCstr, const std::vect
         *searchQueryOut = QString::fromUtf8(reformulated);
     }
 
-    // The UNION of the raw question's terms and the reformulated one's,
-    // not the reformulation alone. Reformulation resolves follow-ups like
-    // "what about that instead?" into something BM25 can work with, which
-    // is why it exists -- but it paraphrases, and a paraphrase can drop
-    // the one term the index is keyed on. Measured: "What are the license
-    // classes?" was rewritten to "What are the different types of driver
-    // licenses in New York State?", losing "class"; the raw question found
-    // the passages listing every class at ranks 1-2, the rewrite found
-    // none of them. Taking the union lets the rewrite only ever add.
-    TokenList *unionTerms =
-        query_formulation_terms_union(questionCstr, reformulated, stopwords, wordnet, lemmatizer);
-    if (unionTerms == nullptr) {
-        free(reformulated);
+    // The whole retrieval pipeline -- terms union, sense-filtered
+    // expansion, weighted+coordinated BM25, trim -- is ONE shared call
+    // (src/core/retrieval.c), the same one the CLI and eval run. This
+    // function only owns what is chat-specific: contextualization above,
+    // provenance capture, source citations, history-aware generation.
+    RetrievalPolicy policy = retrieval_default_policy();
+    RetrievalRun *run =
+        retrieval_run(store, questionCstr, reformulated, stopwords, wordnet, lemmatizer, &policy);
+    free(reformulated);
+    if (run == nullptr) {
         return false;
     }
-    if (unionTerms->count == 0) {
-        free(reformulated);
-        token_list_free(unionTerms);
+    if (run->terms->count == 0) {
+        retrieval_run_free(run);
         *answerOut = QObject::tr("I don't have enough to search for in that question -- could you rephrase it?");
         return true;
     }
 
-    // Sense-filtered WordNet expansion on the union -- the SAME
-    // machinery the CLI runs (see query_formulation.h's from_terms
-    // comment: one retrieval pipeline, not two). The prompt gets the
-    // reformulated question -- it's standalone, so the model can
-    // sense-check candidates without needing the chat history. Any
-    // failure along the way degrades to the plain union: expansion is
-    // an enhancement, never a precondition.
-    TokenList *terms = unionTerms;
-    size_t originalCount = unionTerms->count;
-    QueryFormulationCandidates *candidates =
-        query_formulation_gather_candidates_from_terms(unionTerms, wordnet);
-    if (candidates != nullptr && candidates->count > 0) {
-        char *prompt = query_formulation_build_prompt(reformulated, candidates);
-        char *response = (prompt != nullptr) ? local_llm_chat_completion(prompt) : nullptr;
-        TokenList *expanded =
-            query_formulation_parse_selected_terms(response, candidates, &originalCount);
-        free(prompt);
-        free(response);
-        if (expanded != nullptr) {
-            token_list_free(unionTerms);
-            terms = expanded;
-        }
-    }
-    query_formulation_candidates_free(candidates);
-    free(reformulated);
-
     // The final list IS the lexical query -- originals first, then any
-    // surviving expansions. Capture before the search consumes it.
-    char *joined_terms = ingest_join_words(terms, 0, terms->count);
+    // surviving expansions.
+    char *joined_terms = ingest_join_words(run->terms, 0, run->terms->count);
     if (joined_terms != nullptr) {
         *searchTermsOut = QString::fromUtf8(joined_terms);
         free(joined_terms);
     }
 
-    QVector<const char *> queryTerms;
-    QVector<double> termWeights;
-    queryTerms.reserve(static_cast<int>(terms->count));
-    termWeights.reserve(static_cast<int>(terms->count));
-    for (size_t i = 0; i < terms->count; i++) {
-        queryTerms.append(terms->terms[i]);
-        termWeights.append(i < originalCount ? 1.0 : LEXIS_EXPANSION_WEIGHT);
-    }
-
-    /* Coordination bonus on: passages matching more of the query's
-     * distinct terms outrank a corpus-frequent topic matching fewer --
-     * the heated-steering-wheel-vs-cruise-control failure. */
-    BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B, BM25_DEFAULT_COORD_BONUS};
-    BM25CorpusStats stats = bm25_corpus_stats(store);
-    BM25ResultSet *results =
-        (stats.total_passages >= 0)
-            ? bm25_search_weighted(store, queryTerms.data(), termWeights.data(), terms->count,
-                                    kCandidateCeiling, stats, params)
-            : nullptr;
-    token_list_free(terms);
-
-    if (results == nullptr) {
-        return false;
-    }
-    // Rank deep, send shallow: BM25 ranks up to kCandidateCeiling, then
-    // this cuts to the prefix actually worth putting in front of the
-    // model. Done here, once, before either the prompt or the provenance
-    // payload is built from `results` -- that is what keeps "what the
-    // model read" and "what the source inspector shows" the same list.
-    bm25_result_set_trim(store, results, kMaxPassages, kTokenBudget, kScoreFloorRatio);
+    BM25ResultSet *results = run->results;
     if (results->count == 0) {
-        bm25_result_set_free(results);
+        retrieval_run_free(run);
         *answerOut = QObject::tr("No matching passages found in this group for that question.");
         return true;
     }
@@ -238,7 +180,7 @@ bool runSearchPipeline(PgStore *store, const char *questionCstr, const std::vect
     // reformulation only ever existed to help retrieval, not to replace
     // what the user actually asked (see generation.h's own doc comment).
     char *answer = generation_generate_answer_with_history(questionCstr, store, results, turns.data(), turns.size());
-    bm25_result_set_free(results);
+    retrieval_run_free(run);
     if (answer == nullptr) {
         return false;
     }

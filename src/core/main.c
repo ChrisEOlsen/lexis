@@ -24,6 +24,7 @@
 #include "pg_store.h"
 #include "query_formulation.h"
 #include "query_log.h"
+#include "retrieval.h"
 #include "stopwords.h"
 #include "wordnet.h"
 
@@ -196,124 +197,48 @@ static int run_query(const char *question) {
     struct timespec pipeline_start, pipeline_end;
     clock_gettime(CLOCK_MONOTONIC, &pipeline_start);
 
-    /* Query formulation, decomposed into its own public sub-steps (rather
-     * than the query_formulation_formulate_query() convenience wrapper) so
-     * every intermediate artifact -- the prompt, the raw LLM response,
-     * whether the API-failure fallback fired -- is visible here for
-     * logging, with zero changes to query_formulation.c itself. */
-    struct timespec qf_start, qf_end;
-    clock_gettime(CLOCK_MONOTONIC, &qf_start);
-
-    QueryFormulationCandidates *candidates =
-        query_formulation_gather_candidates(question, stopwords, wordnet, lemmatizer);
-    if (candidates == NULL) {
-        fprintf(stderr, "lexis: query formulation failed\n");
-        exit_code = 1;
-        goto cleanup;
-    }
-
-    char *qf_prompt = NULL;
-    char *qf_response = NULL;
-    int used_fallback = 0;
-    TokenList *terms = NULL;
-    size_t original_count = 0;
-
-    if (candidates->count == 0) {
-        terms = token_list_create();
-    } else {
-        qf_prompt = query_formulation_build_prompt(question, candidates);
-        if (qf_prompt != NULL) {
-            qf_response = local_llm_chat_completion(qf_prompt);
-            used_fallback = (qf_response == NULL);
-        }
-        /* A NULL response degrades to originals-only inside the parser
-         * (cJSON_Parse safely treats NULL as unparseable) -- same
-         * graceful floor query_formulation_formulate_query() relies on. */
-        terms = query_formulation_parse_selected_terms(qf_response, candidates, &original_count);
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &qf_end);
-
-    if (terms == NULL) {
-        fprintf(stderr, "lexis: query formulation failed\n");
-        free(qf_prompt);
-        free(qf_response);
-        query_formulation_candidates_free(candidates);
+    /* The whole retrieval pipeline -- terms, sense-filtered expansion,
+     * weighted+coordinated BM25, trim -- is ONE shared call
+     * (src/core/retrieval.c), the same one the app's QueryWorker and
+     * eval.c run. This function only owns what is CLI-specific:
+     * printing, query_log observability (read from the run's artifacts,
+     * not re-derived), and single-turn generation. */
+    RetrievalPolicy policy = retrieval_default_policy();
+    RetrievalRun *run =
+        retrieval_run(store, question, NULL, stopwords, wordnet, lemmatizer, &policy);
+    if (run == NULL) {
+        fprintf(stderr, "lexis: retrieval failed\n");
         exit_code = 1;
         goto cleanup;
     }
 
     if (query_id != -1) {
-        char *selected_terms_str = ingest_join_words(terms, 0, terms->count);
+        char *selected_terms_str = ingest_join_words(run->terms, 0, run->terms->count);
         query_log_insert_query_formulation_run(
-            store, query_id, (int)candidates->count, qf_prompt, qf_response, used_fallback,
-            selected_terms_str != NULL ? selected_terms_str : "", elapsed_ms(qf_start, qf_end));
+            store, query_id, (int)run->original_count, run->expansion_prompt,
+            run->expansion_response, run->used_fallback,
+            selected_terms_str != NULL ? selected_terms_str : "", run->formulation_ms);
         free(selected_terms_str);
     }
 
-    free(qf_prompt);
-    free(qf_response);
-    query_formulation_candidates_free(candidates);
-
     printf("Search terms: ");
-    for (size_t i = 0; i < terms->count; i++) {
-        printf("%s%s", terms->terms[i], (i + 1 < terms->count) ? ", " : "");
+    for (size_t i = 0; i < run->terms->count; i++) {
+        printf("%s%s", run->terms->terms[i], (i + 1 < run->terms->count) ? ", " : "");
     }
     printf("\n\n");
 
-    if (terms->count == 0) {
+    if (run->terms->count == 0) {
         printf("Nothing to search for -- the question was entirely stopwords.\n");
-        token_list_free(terms);
+        retrieval_run_free(run);
         goto cleanup;
     }
 
     {
-        const char **query_terms = malloc(terms->count * sizeof(char *));
-        double *term_weights = malloc(terms->count * sizeof(double));
-        if (query_terms == NULL || term_weights == NULL) {
-            fprintf(stderr, "lexis: out of memory\n");
-            free(query_terms);
-            free(term_weights);
-            token_list_free(terms);
-            exit_code = 1;
-            goto cleanup;
-        }
-        for (size_t i = 0; i < terms->count; i++) {
-            query_terms[i] = terms->terms[i];
-            /* Originals lead the list (parse_selected_terms's contract);
-             * everything after original_count is a discounted expansion. */
-            term_weights[i] = (i < original_count) ? 1.0 : LEXIS_EXPANSION_WEIGHT;
-        }
-
-        struct timespec search_start, search_end;
-        clock_gettime(CLOCK_MONOTONIC, &search_start);
-        BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B, BM25_DEFAULT_COORD_BONUS};
-        BM25CorpusStats stats = bm25_corpus_stats(store);
-        BM25ResultSet *results =
-            (stats.total_passages >= 0)
-                ? bm25_search_weighted(store, query_terms, term_weights, terms->count,
-                                        LEXIS_SEARCH_CANDIDATE_CEILING, stats, params)
-                : NULL;
-        clock_gettime(CLOCK_MONOTONIC, &search_end);
-        free(query_terms);
-        free(term_weights);
-        token_list_free(terms);
-
-        if (results == NULL) {
-            fprintf(stderr, "lexis: search failed\n");
-            exit_code = 1;
-            goto cleanup;
-        }
-
-        /* Rank deep, send shallow -- the same shared policy the app's
-         * QueryWorker runs (see bm25.h's LEXIS_SEARCH_* comment). */
-        bm25_result_set_trim(store, results, LEXIS_SEARCH_MAX_PASSAGES, LEXIS_SEARCH_TOKEN_BUDGET,
-                             LEXIS_SEARCH_SCORE_FLOOR_RATIO);
+        BM25ResultSet *results = run->results;
 
         if (query_id != -1) {
             int64_t search_run_id = query_log_insert_search_run(
-                store, query_id, LEXIS_SEARCH_MAX_PASSAGES, (int)results->count,
-                elapsed_ms(search_start, search_end));
+                store, query_id, LEXIS_SEARCH_MAX_PASSAGES, (int)results->count, run->search_ms);
             if (search_run_id != -1) {
                 for (size_t i = 0; i < results->count; i++) {
                     query_log_insert_search_result(store, search_run_id, (int)i + 1,
@@ -326,7 +251,7 @@ static int run_query(const char *question) {
         if (results->count == 0) {
             printf("No matching passages found. Have you run '%s ingest <corpus_dir>' yet?\n",
                    "lexis");
-            bm25_result_set_free(results);
+            retrieval_run_free(run);
             goto cleanup;
         }
 
@@ -352,9 +277,12 @@ static int run_query(const char *question) {
         if (mode == LEXIS_MODE_TESTING && gen_prompt != NULL) {
             printf("--- Generation prompt ---\n%s\n--- End generation prompt ---\n\n", gen_prompt);
         }
-        char *answer = generation_generate_answer(question, store, results);
+        /* Zero history turns: the history-aware generator degrades to
+         * exactly the single-turn behavior (see generation.h) -- one
+         * generation entry point for the CLI and the app alike. */
+        char *answer = generation_generate_answer_with_history(question, store, results, NULL, 0);
         clock_gettime(CLOCK_MONOTONIC, &gen_end);
-        bm25_result_set_free(results);
+        retrieval_run_free(run);
 
         if (query_id != -1) {
             query_log_insert_generation_run(store, query_id, model_path, passages_included,

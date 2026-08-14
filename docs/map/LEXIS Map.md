@@ -18,7 +18,7 @@ LEXIS answers questions with **no vector embeddings**: lexical BM25 retrieval ov
 
 **CLI** (`./lexis query "..."`):
 [[CLI]] → [[Query Formulation]] (same expansion, minus chat history) → [[BM25 Search]] → [[Generation]]
-Since 2026-08-14 the two paths run ONE retrieval pipeline — same expansion machinery, same weights, same depth/trim policy (`LEXIS_SEARCH_*` in bm25.h).
+Since 2026-08-14 the two paths (and eval) run ONE retrieval pipeline — literally one function, `retrieval_run()` in [[Retrieval]]; caller differences are policy values, not code branches.
 
 ## Ingestion paths
 

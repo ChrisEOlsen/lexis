@@ -77,6 +77,7 @@ set(LEXIS_CORE_SRCS
     ${LEXIS_ROOT}/src/core/vendor/cJSON.c
     ${LEXIS_ROOT}/src/core/wordnet.c
     ${LEXIS_ROOT}/src/core/query_formulation.c
+    ${LEXIS_ROOT}/src/core/retrieval.c
     ${LEXIS_ROOT}/src/core/string_builder.c
     ${LEXIS_ROOT}/src/core/generation.c
     ${LEXIS_ROOT}/src/core/lemmatizer.c

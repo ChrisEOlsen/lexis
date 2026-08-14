@@ -67,7 +67,8 @@ either `make check` or `./lexis ...`.
 | `ingest.c` | Document-chunking/tokenizing/lemmatizing primitives (split into overlapping word windows, tokenize, stopword-filter, lemmatize, dedup+count terms). Used exclusively by `bulk_ingest.c`'s Phase 2 worker -- see "Ingestion" below. |
 | `bulk_ingest.c` | `lexis bulk-ingest <tsv>` -- the three-phase, deferred-term-resolution ingestion pipeline. The only ingestion path in this codebase. |
 | `bm25.c` | BM25 scoring: corpus stats, per-term document frequency/IDF, the result-set hash index, `bm25_search()`. |
-| `query_formulation.c` | Turns a question into search terms: tokenize, stopword-filter, lemmatize, look up WordNet candidates, ask the local LLM which candidates to include. |
+| `query_formulation.c` | Term/expansion primitives: tokenize/filter/lemmatize, WordNet candidate gathering, the sense-filter LLM prompt/parse, history-aware contextualization, terms union. |
+| `retrieval.c` | THE shared retrieval orchestrator: `retrieval_run()` (terms -> sense-filtered expansion -> weighted+coordinated BM25 -> trim), run identically by the CLI, the app's QueryWorker, and eval. Caller differences are `RetrievalPolicy` values; per-stage artifacts come back in `RetrievalRun` for query_log and the app's source inspector. |
 | `generation.c` | Builds the "answer using only this context" prompt from BM25 results and asks the local LLM for a final answer. |
 | `local_llm_client.c` | llama.cpp wrapper -- loads one GGUF model once, serves every chat-completion call (query formulation and generation both use it). |
 | `eval.c` | `lexis eval <queries_tsv> <qrels_tsv>` -- runs the real query-formulation + BM25 path against a labeled query set and reports MRR@10/Recall@10/Recall@100. |
