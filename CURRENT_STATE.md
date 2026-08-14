@@ -72,7 +72,7 @@ either `make check` or `./lexis ...`.
 | `local_llm_client.c` | llama.cpp wrapper -- loads one GGUF model once, serves every chat-completion call (query formulation and generation both use it). |
 | `eval.c` | `lexis eval <queries_tsv> <qrels_tsv>` -- runs the real query-formulation + BM25 path against a labeled query set and reports MRR@10/Recall@10/Recall@100. |
 | `query_log.c` | Optional pipeline observability (testing mode only) -- records every stage's inputs/outputs/timing to its own tables, keyed by `query_id`. |
-| `config.c` | Reads `config/lexis.conf`'s `mode = testing|production` setting. |
+| `config.c` | Reads `config/lexis.conf`: the `mode = testing|production` setting and `model_path` (the local GGUF model every binary loads; falls back to `LEXIS_DEFAULT_MODEL_PATH` in config.h). |
 | `main.c` | CLI dispatch (`bulk-ingest`/`query`/`eval`) and orchestration of the above. |
 
 `pg_store_get_or_create_term()`/`pg_store_get_or_create_terms()` (single
@@ -256,17 +256,13 @@ make check                    # build + run the full test suite
 make lexis                    # build the CLI binary
 ```
 
-**Corpus prep (currently manual, not yet scripted -- see "Known gaps"):**
-export the MS MARCO passage corpus (`BeIR/msmarco` on HuggingFace) as a
-tab-delimited, **RFC4180 CSV-quoted** `<pid><TAB><text>` file via duckdb:
-
-```sql
-INSTALL httpfs; LOAD httpfs;
-COPY (SELECT _id, text FROM 'hf://datasets/BeIR/msmarco/corpus/*.parquet')
-TO 'corpus_csv.tsv' (FORMAT CSV, DELIMITER '\t', HEADER false);
-```
-
-Plain (non-CSV) TSV is not safe here -- see "Ingestion" above.
+**Corpus prep:** `scripts/export_msmarco.sh` (requires `brew install
+duckdb`) exports the MS MARCO passage corpus (`BeIR/msmarco` on
+HuggingFace) as a tab-delimited, **RFC4180 CSV-quoted** `<pid><TAB><text>`
+file to `corpus_csv.tsv` at the repo root, and also fetches
+`data/eval/msmarco/qrels_dev.tsv` + `queries_dev.tsv` (the 6,980-query
+dev set) for `lexis eval`. Plain (non-CSV) TSV is not safe for the
+corpus -- see "Ingestion" above.
 
 **Ingest:**
 
@@ -298,10 +294,6 @@ first: `TRUNCATE postings, terms, passages RESTART IDENTITY CASCADE;`
 
 ## Known gaps
 
-- **Corpus export isn't scripted.** The duckdb `FORMAT CSV` export shown
-  above was run ad hoc and isn't captured anywhere in `scripts/`.
-  Re-deriving `corpus_csv.tsv` from scratch today means re-typing that
-  duckdb command by hand.
 - **`README.md`/`INGESTION.md`** describe the pre-Postgres, SQLite-backed
   system and are stale (see this file's intro).
 - Everything else known-and-accepted (thread-count uncertainty, WordNet

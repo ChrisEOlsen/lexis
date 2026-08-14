@@ -268,7 +268,19 @@ char *lemmatize(const Lemmatizer *lemmatizer, const WordNetTable *wordnet, const
          * rather than returning NULL for what should be a safe lookup. */
     }
 
-    /* 2. Suffix rules, validated against the real table. */
+    /* 2. The word as given is already a WordNet base form -- return it
+     * unchanged before any suffix rule can touch it, as real morphy
+     * does. Without this guard, base forms that merely look inflected
+     * get mangled whenever the stripped stem happens to validate
+     * cross-POS: "king" -> {"ing",""} -> "k" (a real WordNet noun --
+     * potassium), "ring" -> {"ing","e"} -> "re", "sing" -> "se".
+     * Must stay AFTER the exception list: "saw" is in WordNet as a noun
+     * but verb.exc still maps it to "see", and exceptions win. */
+    if (wordnet_lookup(wordnet, word) != NULL) {
+        return strdup(word);
+    }
+
+    /* 3. Suffix rules, validated against the real table. */
     char *candidate = try_rule_table(wordnet, word, NOUN_RULES,
                                       sizeof(NOUN_RULES) / sizeof(NOUN_RULES[0]));
     if (candidate == NULL) {
@@ -283,7 +295,7 @@ char *lemmatize(const Lemmatizer *lemmatizer, const WordNetTable *wordnet, const
         return candidate;
     }
 
-    /* 3. Nothing matched -- word is already a base form, or isn't a
-     * WordNet word at all (a proper noun, a made-up word, etc.). */
+    /* 4. Nothing matched -- not a WordNet word at all (a proper noun, a
+     * made-up word, etc.); base forms already returned at step 2. */
     return strdup(word);
 }

@@ -83,6 +83,74 @@ static void test_lemmatize_already_base_form_unchanged(void) {
     wordnet_table_free(wordnet);
 }
 
+static void test_lemmatize_base_form_ending_in_rule_suffix_unchanged(void) {
+    WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
+    Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
+    TEST_ASSERT(wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
+
+    /* Base-form words that merely LOOK inflected. "king" ends in "ing",
+     * and the verb rule {"ing", ""} strips it to "k" -- which validates,
+     * because "k" is a real WordNet noun (the letter/potassium/kelvin).
+     * Found in production: every singular "king" in the MS MARCO slice
+     * was indexed as "k" (1,719 postings), sinking the "king tut" query.
+     * Real morphy returns a word unchanged when it is already in the
+     * index; these assert that guard. Same class: "ring"->"r",
+     * "sing"->"s" (both letters are WordNet nouns too). */
+    char *result = lemmatize(lemmatizer, wordnet, "king");
+    TEST_ASSERT(result != NULL, "expected lemmatize to succeed");
+    TEST_ASSERT_STR_EQ(result, "king");
+    free(result);
+
+    result = lemmatize(lemmatizer, wordnet, "ring");
+    TEST_ASSERT(result != NULL, "expected lemmatize to succeed");
+    TEST_ASSERT_STR_EQ(result, "ring");
+    free(result);
+
+    result = lemmatize(lemmatizer, wordnet, "sing");
+    TEST_ASSERT(result != NULL, "expected lemmatize to succeed");
+    TEST_ASSERT_STR_EQ(result, "sing");
+    free(result);
+
+    lemmatizer_free(lemmatizer);
+    wordnet_table_free(wordnet);
+}
+
+static void test_lemmatize_plural_of_ing_base_still_stripped(void) {
+    WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
+    Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
+    TEST_ASSERT(wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
+
+    /* "kings" is genuinely inflected and must still strip to "king" --
+     * the unchanged-if-already-in-WordNet guard must not fire for words
+     * that are NOT in WordNet as given ("kings" isn't; only its base
+     * form is). */
+    char *result = lemmatize(lemmatizer, wordnet, "kings");
+    TEST_ASSERT(result != NULL, "expected lemmatize to succeed");
+    TEST_ASSERT_STR_EQ(result, "king");
+
+    free(result);
+    lemmatizer_free(lemmatizer);
+    wordnet_table_free(wordnet);
+}
+
+static void test_lemmatize_exception_beats_base_form_guard(void) {
+    WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
+    Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
+    TEST_ASSERT(wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
+
+    /* Ordering constraint on the guard above: "saw" IS in WordNet as a
+     * noun (the tool), but verb.exc maps "saw" -> "see". The exception
+     * list must keep winning, so the already-in-WordNet check has to sit
+     * AFTER the exception lookup, not before it. */
+    char *result = lemmatize(lemmatizer, wordnet, "saw");
+    TEST_ASSERT(result != NULL, "expected lemmatize to succeed");
+    TEST_ASSERT_STR_EQ(result, "see");
+
+    free(result);
+    lemmatizer_free(lemmatizer);
+    wordnet_table_free(wordnet);
+}
+
 static void test_lemmatize_word_not_in_wordnet_unchanged(void) {
     WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
@@ -115,6 +183,9 @@ int main(void) {
     test_lemmatize_irregular_exception();
     test_lemmatize_exception_with_spelling_variant();
     test_lemmatize_already_base_form_unchanged();
+    test_lemmatize_base_form_ending_in_rule_suffix_unchanged();
+    test_lemmatize_plural_of_ing_base_still_stripped();
+    test_lemmatize_exception_beats_base_form_guard();
     test_lemmatize_word_not_in_wordnet_unchanged();
     test_lemmatizer_load_missing_directory_returns_null();
     test_lemmatizer_free_null_is_safe();
