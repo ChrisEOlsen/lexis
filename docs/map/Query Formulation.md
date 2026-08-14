@@ -15,7 +15,7 @@ Source: `src/core/query_formulation.c`.
 
 Redesigned 2026-08-14 after the original "select every likely word" objective measured net-negative (MRR@10 0.142 vs 0.219 plain). Post-redesign: **0.222 / R@10 0.550 / R@100 0.776 — ahead of plain terms on every metric.** History in [[LIMITATIONS]].
 
-**Variant 2 — history-aware contextualization** (`query_formulation_contextualize_question()` + `query_formulation_terms_union()`). Used by [[Query Worker]]:
-- A plain LLM call rewrites follow-ups ("what about his father?") into standalone queries against chat history, then the raw and reformulated questions' terms are **unioned** — no WordNet expansion at all.
+**Variant 2 — history-aware contextualization** (`query_formulation_contextualize_question()` + `query_formulation_terms_union()`). Used by [[Query Worker]] *in front of* Variant 1:
+- A plain LLM call rewrites follow-ups ("what about his father?") into standalone queries against chat history, the raw and reformulated questions' terms are **unioned**, and since 2026-08-14 that union feeds the same sense-filtered expansion via `query_formulation_gather_candidates_from_terms()` — one retrieval pipeline for both entry points.
 
 **Next in the flow:** [[BM25 Search]].

@@ -9,7 +9,7 @@ tags: [entry]
 Source: `src/core/main.c`.
 
 Three subcommands:
-- `lexis query "<question>"` — the CLI prompt→output path: [[Query Formulation]] (the full WordNet+LLM expansion variant, unlike [[Query Worker]]'s) → [[BM25 Search]] (top-5) → [[Generation]]. Logs every stage via [[Query Log]] in testing mode.
+- `lexis query "<question>"` — the CLI prompt→output path: [[Query Formulation]] (the same sense-filtered expansion [[Query Worker]] runs, minus chat history) → [[BM25 Search]] (shared `LEXIS_SEARCH_*` policy: rank 40 deep, trim to ≤12 under a token budget) → [[Generation]]. Logs every stage via [[Query Log]] in testing mode.
 - `lexis bulk-ingest <tsv>` — [[Bulk Ingest]], the three-phase MS MARCO-scale pipeline.
 - `lexis eval <queries> <qrels>` — [[Eval Harness]] retrieval metrics.
 

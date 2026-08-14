@@ -12,12 +12,13 @@ LEXIS answers questions with **no vector embeddings**: lexical BM25 retrieval ov
 
 **Desktop app chat** (the primary path):
 [[Qt App UI]] → [[App Controller]] → [[Query Worker]] → [[Tool Router]] picks one of three:
-- SEARCH: [[Query Formulation]] (history-aware reformulation, plain terms — no WordNet expansion here) → [[BM25 Search]] → [[Generation]] → answer with source citations
+- SEARCH: [[Query Formulation]] (history-aware reformulation + the same sense-filtered WordNet expansion the CLI runs) → [[BM25 Search]] (weighted, coordinated) → [[Generation]] → answer with source citations
 - SUMMARY: [[Corpus Summary]] → answer from the cached group overview
 - CHAT: [[Local LLM Client]] directly → conversational answer, no retrieval
 
 **CLI** (`./lexis query "..."`):
-[[CLI]] → [[Query Formulation]] (full WordNet+LLM expansion variant) → [[BM25 Search]] → [[Generation]]
+[[CLI]] → [[Query Formulation]] (same expansion, minus chat history) → [[BM25 Search]] → [[Generation]]
+Since 2026-08-14 the two paths run ONE retrieval pipeline — same expansion machinery, same weights, same depth/trim policy (`LEXIS_SEARCH_*` in bm25.h).
 
 ## Ingestion paths
 
