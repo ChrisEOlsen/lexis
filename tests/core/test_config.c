@@ -107,6 +107,27 @@ static void test_last_model_path_line_wins(void) {
     free(path);
 }
 
+static void test_thinking_defaults_on(void) {
+    remove(TEST_CONFIG_PATH);
+    TEST_ASSERT(config_load_thinking(TEST_CONFIG_PATH) == 1,
+                "expected a missing config file to default thinking on");
+    write_config("mode=testing\n");
+    TEST_ASSERT(config_load_thinking(TEST_CONFIG_PATH) == 1,
+                "expected a config with no thinking line to default on");
+    write_config("thinking=bogus\n");
+    TEST_ASSERT(config_load_thinking(TEST_CONFIG_PATH) == 1,
+                "expected an unrecognized thinking value to default safely on");
+}
+
+static void test_thinking_off_honored(void) {
+    write_config("thinking=off\n");
+    TEST_ASSERT(config_load_thinking(TEST_CONFIG_PATH) == 0,
+                "expected explicit thinking=off to be honored");
+    write_config("  thinking = off  \n");
+    TEST_ASSERT(config_load_thinking(TEST_CONFIG_PATH) == 0,
+                "expected whitespace around thinking=off to be tolerated");
+}
+
 int main(void) {
     test_missing_file_defaults_to_testing();
     test_explicit_testing_mode();
@@ -120,6 +141,8 @@ int main(void) {
     test_empty_model_path_defaults();
     test_no_model_path_line_defaults();
     test_last_model_path_line_wins();
+    test_thinking_defaults_on();
+    test_thinking_off_honored();
     remove(TEST_CONFIG_PATH);
     return test_summary();
 }

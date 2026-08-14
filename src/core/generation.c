@@ -5,6 +5,7 @@
 
 #include "generation.h"
 
+#include "config.h"
 #include "local_llm_client.h"
 #include "prompts.h"
 #include "string_builder.h"
@@ -13,25 +14,43 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Whether user-facing answer generation runs the model's reasoning pass
+ * (config/lexis.conf `thinking = on|off`, default on -- see config.h).
+ * Read once per process, lazily: every long-lived caller (the app, the
+ * eval harnesses) already treats config as fixed for its lifetime, and
+ * the LLM call sites this gates are serialized by contract
+ * (local_llm_client.h), so there is no read race worth locking over.
+ * Thinking roughly TRIPLES answer latency (measured 28.2s vs 9.9s, one
+ * question) but rescued the crowded-topic disambiguation case that got
+ * it re-enabled -- see LIMITATIONS.md's generation.c row. */
+static int thinking_enabled(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        cached = config_load_thinking(LEXIS_CONFIG_PATH_DEFAULT);
+    }
+    return cached;
+}
+
 /* Every prompt in this file lives in prompts.h.
  *
  * The two user-facing answer generators below -- from retrieved passages
- * and from a group summary -- now run WITH the model's reasoning pass
- * enabled, via local_llm_chat_completion_multi_ex(..., force_thinking=1).
- * Passing prefill = NULL alone would not do it: that leaves the template's
- * enable_thinking override unset, and Gemma 4's template defaults it to
- * false on its own (see local_llm_client.c). Any reasoning the model emits
- * is stripped before the answer is returned.
+ * and from a group summary -- run the model's reasoning pass per
+ * config/lexis.conf's `thinking` setting (thinking_enabled() above,
+ * default on). Passing prefill = NULL alone would not turn it on: that
+ * leaves the template's enable_thinking override unset, and Gemma 4's
+ * template defaults it to false on its own (see local_llm_client.c). Any
+ * reasoning the model emits is stripped before the answer is returned.
  *
- * The rationale for disabling it was latency, on the theory that a
- * grounded answer needs no deliberation. That theory went untested until
- * a retrieved passage set where every candidate was legitimately on-topic
- * and the model, given no opportunity to weigh them, simply answered from
- * whichever it read first.
+ * Thinking was originally off for latency, on the theory that a grounded
+ * answer needs no deliberation; that failed on a retrieved passage set
+ * where every candidate was legitimately on-topic and the model, given no
+ * opportunity to weigh them, answered from whichever it read first.
+ * Whether that quality holds across a distribution (not one case) is what
+ * the config knob exists to measure -- see LIMITATIONS.md.
  *
- * The plain generation_generate_answer() is deliberately untouched -- it
- * stays as-is for main.c/eval.c, where changing generation behavior would
- * invalidate recorded eval runs. */
+ * The plain generation_generate_answer() below has no production caller
+ * since the CLI moved onto the with-history entry point (zero turns); it
+ * remains as tested API surface and the never-thinking reference path. */
 
 char *generation_build_prompt(const char *query_text, PgStore *store,
                                const BM25ResultSet *results) {
@@ -164,7 +183,7 @@ char *generation_generate_answer_with_history(const char *query_text, PgStore *s
 
     if (history_count == 0) {
         LocalLlmTurn turn = {.role = "user", .content = prompt};
-        char *answer = local_llm_chat_completion_multi_ex(&turn, 1, NULL, /*force_thinking=*/1);
+        char *answer = local_llm_chat_completion_multi_ex(&turn, 1, NULL, thinking_enabled());
         free(prompt);
         return answer;
     }
@@ -197,7 +216,7 @@ char *generation_generate_answer_with_history(const char *query_text, PgStore *s
     free(windowed);
     turns[windowed_count] = (LocalLlmTurn){.role = "user", .content = prompt};
 
-    char *answer = local_llm_chat_completion_multi_ex(turns, windowed_count + 1, NULL, /*force_thinking=*/1);
+    char *answer = local_llm_chat_completion_multi_ex(turns, windowed_count + 1, NULL, thinking_enabled());
     free(turns);
     free(prompt);
     return answer;
@@ -406,7 +425,7 @@ char *generation_generate_answer_from_summary(const char *query_text, const char
 
     if (history_count == 0) {
         LocalLlmTurn turn = {.role = "user", .content = prompt};
-        char *answer = local_llm_chat_completion_multi_ex(&turn, 1, NULL, /*force_thinking=*/1);
+        char *answer = local_llm_chat_completion_multi_ex(&turn, 1, NULL, thinking_enabled());
         free(prompt);
         return answer;
     }
@@ -439,7 +458,7 @@ char *generation_generate_answer_from_summary(const char *query_text, const char
     free(windowed);
     turns[windowed_count] = (LocalLlmTurn){.role = "user", .content = prompt};
 
-    char *answer = local_llm_chat_completion_multi_ex(turns, windowed_count + 1, NULL, /*force_thinking=*/1);
+    char *answer = local_llm_chat_completion_multi_ex(turns, windowed_count + 1, NULL, thinking_enabled());
     free(turns);
     free(prompt);
     return answer;

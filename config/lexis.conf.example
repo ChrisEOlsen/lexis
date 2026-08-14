@@ -19,3 +19,10 @@ mode=testing
 #   in include/config.h. scripts/download_model.sh reads this line to
 #   decide what to download.
 model_path=data/models/gemma-4-E4B-it-Q4_K_M.gguf
+
+# thinking = on | off
+#   Whether answer generation runs the model's reasoning pass (roughly
+#   3x answer latency when on; see LIMITATIONS.md's generation.c row).
+#   Only gates the user-facing answer steps -- routing, expansion, and
+#   summarization never think. Default if unset: on.
+thinking=on

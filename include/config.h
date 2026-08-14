@@ -53,4 +53,18 @@ LexisMode config_load_mode(const char *path);
  * allocation failure. */
 char *config_load_model_path(const char *path);
 
+/* The default config file location, relative to the project root every
+ * binary already requires as its working directory. Shared so modules
+ * that read a setting lazily (generation.c's thinking gate) name the
+ * same file the CLI and app load explicitly. */
+#define LEXIS_CONFIG_PATH_DEFAULT "config/lexis.conf"
+
+/* Reads the "thinking = on|off" line: whether the model's reasoning
+ * pass runs for user-facing answer generation (see generation.c -- the
+ * ONLY consumer; routing/expansion/summarization never think). Missing
+ * file, missing line, or an unrecognized value default to 1 (on) --
+ * preserving the measured-quality behavior; turning the ~3x answer
+ * latency saving on is an explicit opt-in via `thinking=off`. */
+int config_load_thinking(const char *path);
+
 #endif /* LEXIS_CONFIG_H */

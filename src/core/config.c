@@ -112,6 +112,19 @@ LexisMode config_load_mode(const char *path) {
     return mode;
 }
 
+int config_load_thinking(const char *path) {
+    char *text = read_file_quietly(path);
+    if (text == NULL) {
+        return 1;
+    }
+
+    const char *value = find_last_value(text, "thinking");
+    int thinking = (value == NULL || strcmp(value, "off") != 0) ? 1 : 0;
+
+    free(text);
+    return thinking;
+}
+
 char *config_load_model_path(const char *path) {
     char *text = read_file_quietly(path);
     char *result = NULL;
