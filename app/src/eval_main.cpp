@@ -35,6 +35,7 @@
 #include "QueryWorker.h"
 
 extern "C" {
+#include "config.h"
 #include "lemmatizer.h"
 #include "local_llm_client.h"
 #include "pg_store.h"
@@ -43,6 +44,7 @@ extern "C" {
 }
 
 #include <cstdio>
+#include <cstdlib>
 
 namespace {
 // Mirrors AppController's own constants -- see its kConnInfo comment on why
@@ -50,7 +52,7 @@ namespace {
 const char *kConnInfo = "host=127.0.0.1 port=5434 dbname=lexis user=lexis password=lexis_dev_only";
 const char *kStopwordsPath = "data/stopwords/english.txt";
 const char *kWordnetDir = "data/wordnet";
-const char *kModelPath = "data/models/gemma-4-E2B-it-Q4_K_M.gguf";
+const char *kConfigPath = "config/lexis.conf";
 
 // Same truncation AppController::sendChatMessage() applies when it titles a
 // new chat from its first question.
@@ -93,10 +95,13 @@ int main(int argc, char *argv[]) {
     }
 
     fprintf(stderr, "loading model...\n");
-    if (local_llm_client_init(kModelPath) != 0) {
+    char *modelPath = config_load_model_path(kConfigPath);
+    if (modelPath == nullptr || local_llm_client_init(modelPath) != 0) {
         fprintf(stderr, "model init failed\n");
+        free(modelPath);
         return 1;
     }
+    free(modelPath);
     StopwordSet *stopwords = stopword_set_load(kStopwordsPath);
     WordNetTable *wordnet = wordnet_table_load(kWordnetDir);
     Lemmatizer *lemmatizer = lemmatizer_load(kWordnetDir);

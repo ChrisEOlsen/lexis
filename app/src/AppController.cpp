@@ -7,8 +7,11 @@
 #include "QueryWorker.h"
 
 extern "C" {
+#include "config.h"
 #include "local_llm_client.h"
 }
+
+#include <cstdlib>
 
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -17,13 +20,15 @@ extern "C" {
 
 namespace {
 // Mirrors main.c's LEXIS_DB_CONNINFO/LEXIS_STOPWORDS_PATH/LEXIS_WORDNET_DIR/
-// LEXIS_MODEL_PATH exactly -- see that file's own comment on why the
-// conninfo is never printed (embeds a password). No config UI exists
-// yet for any of this to come from anywhere else.
+// LEXIS_CONFIG_PATH exactly -- see that file's own comment on why the
+// conninfo is never printed (embeds a password). The model path is no
+// longer mirrored here: it comes from config/lexis.conf via
+// config_load_model_path(), same as the CLI. No config UI exists yet
+// for any of the rest to come from anywhere else.
 const char *kConnInfo = "host=127.0.0.1 port=5434 dbname=lexis user=lexis password=lexis_dev_only";
 const char *kStopwordsPath = "data/stopwords/english.txt";
 const char *kWordnetDir = "data/wordnet";
-const char *kModelPath = "data/models/gemma-4-E2B-it-Q4_K_M.gguf"; // see main.c's LEXIS_MODEL_PATH comment
+const char *kConfigPath = "config/lexis.conf";
 } // namespace
 
 AppController::AppController(QObject *parent)
@@ -51,7 +56,10 @@ AppController::AppController(QObject *parent)
     // ModelLoader.h's own comment on why (~9-19s load time overlapping
     // with whatever the user does first, instead of stalling their
     // first question).
-    m_modelLoader = new ModelLoader(QString::fromUtf8(kModelPath), this);
+    char *modelPath = config_load_model_path(kConfigPath);
+    m_modelPath = QString::fromUtf8(modelPath);
+    free(modelPath);
+    m_modelLoader = new ModelLoader(m_modelPath, this);
     connect(m_modelLoader, &ModelLoader::modelLoadFinished, this, &AppController::onModelLoadFinished);
     connect(m_modelLoader, &QThread::finished, m_modelLoader, &QObject::deleteLater);
     m_modelLoader->start();
@@ -387,7 +395,7 @@ void AppController::onModelLoadFinished(bool ok) {
     m_modelReady = ok;
     emit modelReadyChanged();
     if (!ok) {
-        emit notify(tr("Could not load the local model from %1.").arg(QString::fromUtf8(kModelPath)));
+        emit notify(tr("Could not load the local model from %1.").arg(m_modelPath));
     }
 }
 

@@ -70,13 +70,13 @@ static char *trim(char *s) {
     return s;
 }
 
-LexisMode config_load_mode(const char *path) {
-    char *text = read_file_quietly(path);
-    if (text == NULL) {
-        return LEXIS_MODE_TESTING;
-    }
-
-    LexisMode mode = LEXIS_MODE_TESTING;
+/* Walks `text` (destructively -- strtok_r/trim mutate it in place) and
+ * returns the value of the last "key = value" line matching `key`, or
+ * NULL if no such line exists. The returned pointer aliases `text`, so
+ * it is only valid until `text` is freed. Last occurrence wins, matching
+ * how the original mode parser behaved when a key was repeated. */
+static const char *find_last_value(char *text, const char *key) {
+    const char *found = NULL;
     char *saveptr;
     char *line = strtok_r(text, "\n", &saveptr);
     while (line != NULL) {
@@ -85,17 +85,51 @@ LexisMode config_load_mode(const char *path) {
             char *equals = strchr(trimmed, '=');
             if (equals != NULL) {
                 *equals = '\0';
-                char *key = trim(trimmed);
+                char *candidate_key = trim(trimmed);
                 char *value = trim(equals + 1);
-                if (strcmp(key, "mode") == 0) {
-                    mode = (strcmp(value, "production") == 0) ? LEXIS_MODE_PRODUCTION
-                                                               : LEXIS_MODE_TESTING;
+                if (strcmp(candidate_key, key) == 0) {
+                    found = value;
                 }
             }
         }
         line = strtok_r(NULL, "\n", &saveptr);
     }
+    return found;
+}
+
+LexisMode config_load_mode(const char *path) {
+    char *text = read_file_quietly(path);
+    if (text == NULL) {
+        return LEXIS_MODE_TESTING;
+    }
+
+    const char *value = find_last_value(text, "mode");
+    LexisMode mode = (value != NULL && strcmp(value, "production") == 0)
+                         ? LEXIS_MODE_PRODUCTION
+                         : LEXIS_MODE_TESTING;
 
     free(text);
     return mode;
+}
+
+char *config_load_model_path(const char *path) {
+    char *text = read_file_quietly(path);
+    char *result = NULL;
+
+    if (text != NULL) {
+        const char *value = find_last_value(text, "model_path");
+        if (value != NULL && value[0] != '\0') {
+            result = strdup(value);
+            if (result == NULL) {
+                free(text);
+                return NULL; /* allocation failure, not "use the default" */
+            }
+        }
+        free(text);
+    }
+
+    if (result == NULL) {
+        result = strdup(LEXIS_DEFAULT_MODEL_PATH);
+    }
+    return result;
 }

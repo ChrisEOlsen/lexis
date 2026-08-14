@@ -27,6 +27,7 @@
 #include <time.h>
 
 #include "bm25.h"
+#include "config.h"
 #include "generation.h"
 #include "lemmatizer.h"
 #include "local_llm_client.h"
@@ -73,10 +74,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (local_llm_client_init("data/models/gemma-4-E2B-it-Q4_K_M.gguf") != 0) {
+    char *model_path = config_load_model_path("config/lexis.conf");
+    if (model_path == NULL || local_llm_client_init(model_path) != 0) {
         fprintf(stderr, "model init failed\n");
+        free(model_path);
         return 1;
     }
+    free(model_path);
     PgStore *store = pg_store_open("host=127.0.0.1 port=5434 dbname=lexis user=lexis password=lexis_dev_only");
     if (store == NULL || pg_store_use_corpus(store, corpus_id) != 0) {
         fprintf(stderr, "cannot open corpus\n");

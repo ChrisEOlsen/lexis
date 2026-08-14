@@ -176,6 +176,7 @@ private:
     QString m_statusText;
     bool m_modelReady;
     bool m_chatBusy;
+    QString m_modelPath; // from config/lexis.conf, resolved once in the constructor
 
     StopwordSet *m_stopwords;
     WordNetTable *m_wordnet;

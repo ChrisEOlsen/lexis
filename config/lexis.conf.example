@@ -1,7 +1,7 @@
 # Pipeline configuration template (spec sections 5.2.1, 6).
-# Copy to lexis.conf and fill in: chunk size/overlap for ingestion,
-# small/large model names for OpenRouter calls, and the Unix socket path
-# shared between the C core and the Python sidecar.
+# Copy to lexis.conf and fill in. Settings not yet wired up (chunk
+# size/overlap for ingestion, the Unix socket path for the deferred
+# Python sidecar) are tracked in LIMITATIONS.md.
 
 # mode = testing | production
 #   testing (default if unset): full pipeline observability logging
@@ -12,3 +12,10 @@
 #     LIMITATIONS.md) but non-zero, so production traffic can opt out
 #     rather than pay it.
 mode=testing
+
+# model_path = <path to .gguf, relative to the project root>
+#   The local GGUF model every binary (CLI, app, eval harness) loads via
+#   llama.cpp. Optional: if unset, falls back to LEXIS_DEFAULT_MODEL_PATH
+#   in include/config.h. scripts/download_model.sh reads this line to
+#   decide what to download.
+model_path=data/models/gemma-4-E4B-it-Q4_K_M.gguf

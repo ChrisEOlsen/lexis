@@ -53,30 +53,13 @@
 #define LEXIS_STOPWORDS_PATH "data/stopwords/english.txt"
 #define LEXIS_WORDNET_DIR "data/wordnet"
 #define LEXIS_CONFIG_PATH "config/lexis.conf"
-/* Local GGUF model, loaded once at startup (see local_llm_client.c) and
- * reused for query formulation, tool routing, and generation -- replaces
- * the OpenRouter API per the project's move to a locally hosted model.
- * See SPEED.md/LIMITATIONS.md for why this specific model/quantization
- * was chosen (8GB RAM budget, shared with Postgres).
- *
- * Settled on Gemma-4-E2B after trying, in order: Llama-3.2-3B (no
- * tool-routing support in mind at the time) -> Qwen3.5-4B (reverted --
- * a genuine "thinking" model, unprompted <think>...</think> before
- * every answer, real latency cost) -> Qwen3.5-2B (thinking suppressed
- * via a prefill hack, see local_llm_chat_completion_multi()'s `prefill`
- * parameter; measured 86.7% on a 30-question SEARCH/READ tool-routing
- * test) -> Gemma-4-E2B (native tool-calling model; its chat template
- * turned out to be real Jinja2 -- too sophisticated for
- * llama_chat_apply_template()'s built-in matcher -- which is why
- * src/core/jinja_chat_template.cpp/minja exist at all; its template
- * defaults `enable_thinking` to false on its own, no prefill hack
- * needed for this one; measured 96.7% on the identical 30-question
- * test, including a perfect 15/15 on the specific-question half). The
- * CLI doesn't use tool routing (that's app-only, see
- * app/src/QueryWorker.cpp), but shares this same model/path since only
- * one model is loaded process-wide (see local_llm_client.c). */
-#define LEXIS_MODEL_PATH "data/models/gemma-4-E2B-it-Q4_K_M.gguf"
-#define LEXIS_MODEL_LABEL "Gemma-4-E2B-it-Q4_K_M (local)"
+/* The local GGUF model path now comes from config/lexis.conf's
+ * `model_path` (config_load_model_path(), falling back to
+ * LEXIS_DEFAULT_MODEL_PATH) -- see config.h for the full history of how
+ * the model itself was chosen. Loaded once per process (see
+ * local_llm_client.c) and reused for query formulation and generation;
+ * tool routing is app-only (app/src/QueryWorker.cpp) but shares the
+ * same model/path since only one model is loaded process-wide. */
 #define LEXIS_CHUNK_SIZE 200
 #define LEXIS_CHUNK_OVERLAP 40
 /* Thread count for bulk_ingest.c's Phase 2 worker pool. 6 measured at
@@ -194,8 +177,11 @@ static int run_query(const char *question) {
         fprintf(stderr, "lexis: warning: pipeline logging unavailable, continuing without it\n");
     }
 
-    if (local_llm_client_init(LEXIS_MODEL_PATH) != 0) {
-        fprintf(stderr, "lexis: failed to load local model from %s\n", LEXIS_MODEL_PATH);
+    char *model_path = config_load_model_path(LEXIS_CONFIG_PATH);
+    if (model_path == NULL || local_llm_client_init(model_path) != 0) {
+        fprintf(stderr, "lexis: failed to load local model from %s\n",
+                model_path != NULL ? model_path : "(out of memory)");
+        free(model_path);
         pg_store_close(store);
         stopword_set_free(stopwords);
         wordnet_table_free(wordnet);
@@ -359,7 +345,7 @@ static int run_query(const char *question) {
         bm25_result_set_free(results);
 
         if (query_id != -1) {
-            query_log_insert_generation_run(store, query_id, LEXIS_MODEL_LABEL, passages_included,
+            query_log_insert_generation_run(store, query_id, model_path, passages_included,
                                              passages_skipped, gen_prompt, answer, answer != NULL,
                                              elapsed_ms(gen_start, gen_end));
         }
@@ -383,6 +369,7 @@ cleanup:
                                 pipeline_succeeded);
     }
     local_llm_client_cleanup();
+    free(model_path);
     pg_store_close(store);
     stopword_set_free(stopwords);
     wordnet_table_free(wordnet);
@@ -422,13 +409,19 @@ static int run_eval(const char *queries_path, const char *qrels_path, int use_ll
      * model-load cost thousands of times over (see LIMITATIONS.md).
      * Without it, query_formulation_terms_only() never calls the model
      * at all -- skip paying that load cost for nothing. */
-    if (use_llm_expansion && local_llm_client_init(LEXIS_MODEL_PATH) != 0) {
-        fprintf(stderr, "lexis: failed to load local model from %s\n", LEXIS_MODEL_PATH);
-        pg_store_close(store);
-        stopword_set_free(stopwords);
-        wordnet_table_free(wordnet);
-        lemmatizer_free(lemmatizer);
-        return 1;
+    if (use_llm_expansion) {
+        char *model_path = config_load_model_path(LEXIS_CONFIG_PATH);
+        if (model_path == NULL || local_llm_client_init(model_path) != 0) {
+            fprintf(stderr, "lexis: failed to load local model from %s\n",
+                    model_path != NULL ? model_path : "(out of memory)");
+            free(model_path);
+            pg_store_close(store);
+            stopword_set_free(stopwords);
+            wordnet_table_free(wordnet);
+            lemmatizer_free(lemmatizer);
+            return 1;
+        }
+        free(model_path); /* only needed for init + the error message */
     }
 
     struct timespec start, end;
