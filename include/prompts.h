@@ -108,7 +108,11 @@
     "- SEARCH: asks for a specific fact, number, definition or detail that "   \
     "could be answered by finding one relevant passage (e.g. \"what is the "   \
     "minimum age for X?\", \"how many pounds is the weight limit for Y?\", "   \
-    "\"what does it say about Z?\").\n"                                        \
+    "\"what does it say about Z?\"). A request for tips, hints, advice, "      \
+    "recommendations or instructions about a named topic is also SEARCH -- "   \
+    "the topic is the specific detail, however casually the request is "       \
+    "worded (e.g. \"any hints for using voice commands?\", \"any tips "        \
+    "about how to keep the air inside fresh?\", \"advice on towing?\").\n"     \
     "- SUMMARY: asks what the collection is, what it covers, or what it is "   \
     "for -- anything about the documents as a whole rather than one detail "   \
     "in them (e.g. \"what is this about?\", \"what are these documents?\", "   \
@@ -203,8 +207,9 @@
     LEXIS_PROMPT_RULE_NO_ASK_FOR_DOCS                                         \
     "Never ask which product, vehicle, model or version the user means -- "   \
     "the collection is already loaded and is the only subject. If the "       \
-    "message does need information from the documents after all, say you can " \
-    "look it up and invite them to ask.\n\nMessage: "
+    "message does need information from the documents after all, reply "      \
+    "like this example: \"Happy to help -- ask me anything about the "        \
+    "documents and I'll look it up.\"\n\nMessage: "
 
 /* -- Answer generation ------------------------------------------------- */
 
@@ -261,20 +266,31 @@
 
 /* -- Query formulation ------------------------------------------------- */
 
-/* Picks which WordNet-derived candidate terms are worth adding to a BM25
- * query. Caller appends the original question, then this file's
- * _CANDIDATES block, then the per-term candidate lists. */
+/* Sense-filters WordNet-derived expansion candidates for a BM25 query.
+ * The model's job is VETO, not selection: the caller searches the
+ * original question terms unconditionally (enforced in
+ * query_formulation_parse_selected_terms(), not just prompted), so the
+ * only live decision here is which related words match the sense the
+ * question intends. The previous "select every word likely to appear in
+ * a relevant document" objective was measured hurting retrieval --
+ * generic sense-correct expansions outscored rare question terms, and
+ * hyponyms (since removed from the prompt entirely) enumerated the
+ * answer space -- see LIMITATIONS.md. Caller appends the original
+ * question, then the _CANDIDATES block, then the per-term lists. */
 #define LEXIS_PROMPT_QUERY_TERMS_HEAD                                        \
-    "You are helping build a search query for a keyword-based (BM25) "       \
-    "search engine.\n\n"
+    "You are refining optional expansion words for a keyword-based (BM25) " \
+    "search query. The question's own terms will always be searched; your " \
+    "only job is deciding which related words genuinely fit the question." \
+    "\n\n"
 
 #define LEXIS_PROMPT_QUERY_TERMS_CANDIDATES                                    \
-    "\"\n\nFor each query term below, candidate related words are listed: "     \
-    "synonyms (same meaning), hypernyms (broader terms), and hyponyms "        \
-    "(narrower terms). Select every word likely to appear in a document "      \
-    "relevant to the original question, including the original term itself "   \
-    "when it is a good search term. Respond with ONLY a JSON array of "        \
-    "strings -- no other text.\n\n"
+    "\"\n\nFor each query term below, related words are listed: synonyms "     \
+    "(same meaning) and hypernyms (broader terms). Select ONLY related "       \
+    "words that (1) match the meaning the question uses -- discard words "     \
+    "that belong to a different sense of the term -- and (2) would likely "    \
+    "appear in a passage answering this exact question. Prefer few, "          \
+    "precise words; selecting none is often the right answer. Respond "        \
+    "with ONLY a JSON array of strings -- no other text.\n\n"
 
 /* Rewrites a follow-up into a standalone question so BM25 has real terms to
  * work with -- "what about that instead?" retrieves nothing on its own. The

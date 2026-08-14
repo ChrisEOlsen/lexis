@@ -2,8 +2,7 @@
  * Tool routing for the interactive chat pipeline: decides, per user
  * message, whether to run the BM25 search-and-generate pipeline, answer
  * from the group's cached summary, or answer conversationally with no
- * retrieval at all. See
- * NOTES.md/the "Tool-routed chat" plan for the full design -- this is
+ * retrieval at all. This is
  * deliberately a single one-shot decision, not a multi-step tool loop,
  * and no tool takes a model-supplied argument (SUMMARY always means the
  * active group as a whole).
