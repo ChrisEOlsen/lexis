@@ -69,7 +69,6 @@
  * earlier thread-count experiments on this 8 physical/logical-core
  * machine. Not auto-detected from core count yet; see LIMITATIONS.md. */
 #define LEXIS_INGEST_THREADS 6
-#define LEXIS_TOP_K 5
 
 static long elapsed_ms(struct timespec start, struct timespec end) {
     long seconds = end.tv_sec - start.tv_sec;
@@ -292,8 +291,8 @@ static int run_query(const char *question) {
         BM25CorpusStats stats = bm25_corpus_stats(store);
         BM25ResultSet *results =
             (stats.total_passages >= 0)
-                ? bm25_search_weighted(store, query_terms, term_weights, terms->count, LEXIS_TOP_K,
-                                        stats, params)
+                ? bm25_search_weighted(store, query_terms, term_weights, terms->count,
+                                        LEXIS_SEARCH_CANDIDATE_CEILING, stats, params)
                 : NULL;
         clock_gettime(CLOCK_MONOTONIC, &search_end);
         free(query_terms);
@@ -306,9 +305,14 @@ static int run_query(const char *question) {
             goto cleanup;
         }
 
+        /* Rank deep, send shallow -- the same shared policy the app's
+         * QueryWorker runs (see bm25.h's LEXIS_SEARCH_* comment). */
+        bm25_result_set_trim(store, results, LEXIS_SEARCH_MAX_PASSAGES, LEXIS_SEARCH_TOKEN_BUDGET,
+                             LEXIS_SEARCH_SCORE_FLOOR_RATIO);
+
         if (query_id != -1) {
             int64_t search_run_id = query_log_insert_search_run(
-                store, query_id, LEXIS_TOP_K, (int)results->count,
+                store, query_id, LEXIS_SEARCH_MAX_PASSAGES, (int)results->count,
                 elapsed_ms(search_start, search_end));
             if (search_run_id != -1) {
                 for (size_t i = 0; i < results->count; i++) {

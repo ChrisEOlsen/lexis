@@ -44,33 +44,16 @@ extern "C" {
 #include <vector>
 
 namespace {
-// Retrieval depth is chosen per query now, not fixed. The CLI's own
-// LEXIS_TOP_K (main.c) is deliberately left at 5: it feeds the MS MARCO
-// eval harness, where a changed retrieval depth would silently invalidate
-// comparisons against previously recorded runs. The two are allowed to
-// differ; see LIMITATIONS.md.
-//
-// kCandidateCeiling is how deep to ask BM25 to rank, NOT how much reaches
-// the model -- bm25_result_set_trim() cuts that down.
-constexpr size_t kCandidateCeiling = 40;
-
-// The three limits, in the order they usually bind. Values come from
-// measurement against a real corpus rather than taste:
-//
-//  - kMaxPassages 12: depth 5 and 10 both produced correct answers to a
-//    "list every X" question, depth 20 fused a same-named label from an
-//    unrelated section into the answer, and depth 30 collapsed it. The
-//    usable window ends well before the context window does.
-//  - kTokenBudget 1500: roughly where depth 12 lands at this chunk size,
-//    and it leaves the bulk of LOCAL_LLM_N_CTX for conversation history,
-//    which generation.c windows against whatever the prompt leaves free.
-//  - kScoreFloorRatio 0.6: on the measured queries this cuts exactly the
-//    flat noise tail (a query scoring 5.87 down to 2.6 gets cut after
-//    rank 4) while leaving genuinely competitive runs intact (a query
-//    scoring 8.80 down to 5.27 keeps ~10).
-constexpr size_t kMaxPassages = 12;
-constexpr int kTokenBudget = 1500;
-constexpr double kScoreFloorRatio = 0.6;
+// Retrieval depth/trim policy now lives in bm25.h (LEXIS_SEARCH_*),
+// shared with the CLI's run_query() -- one pipeline, defined once. The
+// measurement history behind the values (depth 12 vs 5/20/30, the token
+// budget vs LOCAL_LLM_N_CTX, the 0.6 floor cutting exactly the flat
+// noise tail) is recorded at the definitions and in SPEED.md. These
+// aliases keep this file's call sites readable.
+constexpr size_t kCandidateCeiling = LEXIS_SEARCH_CANDIDATE_CEILING;
+constexpr size_t kMaxPassages = LEXIS_SEARCH_MAX_PASSAGES;
+constexpr int kTokenBudget = LEXIS_SEARCH_TOKEN_BUDGET;
+constexpr double kScoreFloorRatio = LEXIS_SEARCH_SCORE_FLOOR_RATIO;
 
 // Persisted provenance for one answer: which tool ran, and what it
 // retrieved. Stored as a JSON *object*, not the bare array this used to
@@ -142,20 +125,47 @@ bool runSearchPipeline(PgStore *store, const char *questionCstr, const std::vect
     // licenses in New York State?", losing "class"; the raw question found
     // the passages listing every class at ranks 1-2, the rewrite found
     // none of them. Taking the union lets the rewrite only ever add.
-    TokenList *terms =
+    TokenList *unionTerms =
         query_formulation_terms_union(questionCstr, reformulated, stopwords, wordnet, lemmatizer);
-    free(reformulated);
-    if (terms == nullptr) {
+    if (unionTerms == nullptr) {
+        free(reformulated);
         return false;
     }
-    if (terms->count == 0) {
-        token_list_free(terms);
+    if (unionTerms->count == 0) {
+        free(reformulated);
+        token_list_free(unionTerms);
         *answerOut = QObject::tr("I don't have enough to search for in that question -- could you rephrase it?");
         return true;
     }
 
-    // The union list IS the lexical query -- capture it before the
-    // search consumes and frees `terms`.
+    // Sense-filtered WordNet expansion on the union -- the SAME
+    // machinery the CLI runs (see query_formulation.h's from_terms
+    // comment: one retrieval pipeline, not two). The prompt gets the
+    // reformulated question -- it's standalone, so the model can
+    // sense-check candidates without needing the chat history. Any
+    // failure along the way degrades to the plain union: expansion is
+    // an enhancement, never a precondition.
+    TokenList *terms = unionTerms;
+    size_t originalCount = unionTerms->count;
+    QueryFormulationCandidates *candidates =
+        query_formulation_gather_candidates_from_terms(unionTerms, wordnet);
+    if (candidates != nullptr && candidates->count > 0) {
+        char *prompt = query_formulation_build_prompt(reformulated, candidates);
+        char *response = (prompt != nullptr) ? local_llm_chat_completion(prompt) : nullptr;
+        TokenList *expanded =
+            query_formulation_parse_selected_terms(response, candidates, &originalCount);
+        free(prompt);
+        free(response);
+        if (expanded != nullptr) {
+            token_list_free(unionTerms);
+            terms = expanded;
+        }
+    }
+    query_formulation_candidates_free(candidates);
+    free(reformulated);
+
+    // The final list IS the lexical query -- originals first, then any
+    // surviving expansions. Capture before the search consumes it.
     char *joined_terms = ingest_join_words(terms, 0, terms->count);
     if (joined_terms != nullptr) {
         *searchTermsOut = QString::fromUtf8(joined_terms);
@@ -163,20 +173,23 @@ bool runSearchPipeline(PgStore *store, const char *questionCstr, const std::vect
     }
 
     QVector<const char *> queryTerms;
+    QVector<double> termWeights;
     queryTerms.reserve(static_cast<int>(terms->count));
+    termWeights.reserve(static_cast<int>(terms->count));
     for (size_t i = 0; i < terms->count; i++) {
         queryTerms.append(terms->terms[i]);
+        termWeights.append(i < originalCount ? 1.0 : LEXIS_EXPANSION_WEIGHT);
     }
 
     /* Coordination bonus on: passages matching more of the query's
      * distinct terms outrank a corpus-frequent topic matching fewer --
-     * the heated-steering-wheel-vs-cruise-control failure. No expansion
-     * weights here: the terms union is all original question terms. */
+     * the heated-steering-wheel-vs-cruise-control failure. */
     BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B, BM25_DEFAULT_COORD_BONUS};
     BM25CorpusStats stats = bm25_corpus_stats(store);
     BM25ResultSet *results =
         (stats.total_passages >= 0)
-            ? bm25_search(store, queryTerms.data(), terms->count, kCandidateCeiling, stats, params)
+            ? bm25_search_weighted(store, queryTerms.data(), termWeights.data(), terms->count,
+                                    kCandidateCeiling, stats, params)
             : nullptr;
     token_list_free(terms);
 

@@ -57,6 +57,43 @@ void query_formulation_candidates_free(QueryFormulationCandidates *candidates) {
     free(candidates);
 }
 
+QueryFormulationCandidates *query_formulation_gather_candidates_from_terms(
+    const TokenList *terms, const WordNetTable *wordnet) {
+    QueryFormulationCandidates *result = malloc(sizeof(QueryFormulationCandidates));
+    if (result == NULL) {
+        return NULL;
+    }
+    result->count = 0;
+    result->terms = NULL;
+
+    /* terms->count == 0 is a valid outcome, not a failure -- guard the
+     * malloc explicitly rather than calling malloc(0), which is
+     * implementation-defined and could return NULL, getting misread as
+     * an allocation failure below. */
+    if (terms->count == 0) {
+        return result;
+    }
+
+    result->terms = malloc(terms->count * sizeof(QueryFormulationTermCandidates));
+    if (result->terms == NULL) {
+        free(result);
+        return NULL;
+    }
+
+    for (size_t i = 0; i < terms->count; i++) {
+        char *term = strdup(terms->terms[i]);
+        if (term == NULL) {
+            query_formulation_candidates_free(result);
+            return NULL;
+        }
+        result->terms[i].term = term;
+        result->terms[i].candidates = wordnet_lookup(wordnet, term);
+        result->count++;
+    }
+
+    return result;
+}
+
 QueryFormulationCandidates *query_formulation_gather_candidates(
     const char *query_text, const StopwordSet *stopwords, const WordNetTable *wordnet,
     const Lemmatizer *lemmatizer) {
@@ -66,48 +103,30 @@ QueryFormulationCandidates *query_formulation_gather_candidates(
     }
     stopwords_filter(terms, stopwords);
 
-    QueryFormulationCandidates *result = malloc(sizeof(QueryFormulationCandidates));
-    if (result == NULL) {
+    /* Lemmatize before lookup ("called" -> "call") so candidates come
+     * from the right WordNet entry, and so the eventual BM25 search term
+     * matches what bulk_ingest.c's Phase 2 worker stores in the index
+     * (also lemmatized). */
+    TokenList *lemmas = token_list_create();
+    if (lemmas == NULL) {
         token_list_free(terms);
         return NULL;
     }
-    result->count = 0;
-    result->terms = NULL;
-
-    /* terms->count == 0 (a query that was entirely stopwords) is a valid
-     * outcome, not a failure -- guard the malloc explicitly rather than
-     * calling malloc(0), which is implementation-defined and could
-     * return NULL, getting misread as an allocation failure below. */
-    if (terms->count == 0) {
-        token_list_free(terms);
-        return result;
-    }
-
-    result->terms = malloc(terms->count * sizeof(QueryFormulationTermCandidates));
-    if (result->terms == NULL) {
-        free(result);
-        token_list_free(terms);
-        return NULL;
-    }
-
     for (size_t i = 0; i < terms->count; i++) {
-        /* Lemmatize before lookup ("called" -> "call") so candidates
-         * come from the right WordNet entry, and before storing `term`
-         * itself so the eventual BM25 search term matches what
-         * bulk_ingest.c's Phase 2 worker stores in the index (also
-         * lemmatized). */
         char *lemma = lemmatize(lemmatizer, wordnet, terms->terms[i]);
-        if (lemma == NULL) {
-            query_formulation_candidates_free(result);
+        if (lemma == NULL || token_list_append(lemmas, lemma) != 0) {
+            free(lemma);
+            token_list_free(lemmas);
             token_list_free(terms);
             return NULL;
         }
-        result->terms[i].term = lemma;
-        result->terms[i].candidates = wordnet_lookup(wordnet, lemma);
-        result->count++;
+        free(lemma);
     }
-
     token_list_free(terms);
+
+    QueryFormulationCandidates *result =
+        query_formulation_gather_candidates_from_terms(lemmas, wordnet);
+    token_list_free(lemmas);
     return result;
 }
 

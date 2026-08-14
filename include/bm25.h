@@ -196,4 +196,15 @@ BM25ResultSet *bm25_search_weighted(PgStore *store, const char **query_terms,
 void bm25_result_set_trim(PgStore *store, BM25ResultSet *set, size_t max_passages, int token_budget,
                            double score_floor_ratio);
 
+/* Shared retrieval depth/trim policy -- ONE pipeline, used identically
+ * by the app's QueryWorker and the CLI's run_query(). Rank deep (the
+ * ceiling), send shallow (trim to the first of: passage cap, token
+ * budget, score floor). Values measured via scripts/depth_ab* -- depth
+ * 12 beat 5 head-to-head on answer quality, the floor ratio cuts
+ * exactly the off-topic tail on the measured queries. See SPEED.md. */
+#define LEXIS_SEARCH_CANDIDATE_CEILING 40
+#define LEXIS_SEARCH_MAX_PASSAGES 12
+#define LEXIS_SEARCH_TOKEN_BUDGET 1500
+#define LEXIS_SEARCH_SCORE_FLOOR_RATIO 0.6
+
 #endif /* LEXIS_BM25_H */

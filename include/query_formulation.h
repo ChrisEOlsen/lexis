@@ -57,6 +57,16 @@ typedef struct {
  * term (e.g. "called" -> "call") via `lemmatizer`, and looks up each
  * lemma in `wordnet` for candidate synonyms/hypernyms/hyponyms. Returns
  * NULL on allocation failure. */
+/* Builds candidates from an ALREADY tokenized/filtered/lemmatized term
+ * list -- each term looked up in WordNet as given. This is the shared
+ * entry into the expansion machinery: the CLI reaches it through
+ * query_formulation_gather_candidates() (which does the text
+ * processing first), the app's QueryWorker feeds it the raw+rewritten
+ * question terms union directly. One retrieval pipeline, not two.
+ * Returns NULL on allocation failure. */
+QueryFormulationCandidates *query_formulation_gather_candidates_from_terms(
+    const TokenList *terms, const WordNetTable *wordnet);
+
 QueryFormulationCandidates *query_formulation_gather_candidates(
     const char *query_text, const StopwordSet *stopwords, const WordNetTable *wordnet,
     const Lemmatizer *lemmatizer);

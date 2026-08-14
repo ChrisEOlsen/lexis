@@ -301,6 +301,31 @@ static void test_parse_selected_terms_ignores_non_string_items(void) {
     stopword_set_free(stopwords);
 }
 
+static void test_gather_candidates_from_terms(void) {
+    WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
+    TEST_ASSERT(wordnet != NULL, "expected setup to succeed");
+
+    /* The shared entry the app's QueryWorker uses: terms in as given (no
+     * tokenization/lemmatization), candidates out. "dog" is a real
+     * WordNet word; "zzyzzva" is not and must carry NULL candidates
+     * while still appearing as a term. */
+    TokenList *terms = token_list_create();
+    token_list_append(terms, "dog");
+    token_list_append(terms, "zzyzzva");
+    QueryFormulationCandidates *candidates =
+        query_formulation_gather_candidates_from_terms(terms, wordnet);
+    TEST_ASSERT(candidates != NULL, "expected gather from terms to succeed");
+    TEST_ASSERT(candidates->count == 2, "expected 2 terms, got %zu", candidates->count);
+    TEST_ASSERT_STR_EQ(candidates->terms[0].term, "dog");
+    TEST_ASSERT(candidates->terms[0].candidates != NULL, "expected dog to have WordNet candidates");
+    TEST_ASSERT(candidates->terms[1].candidates == NULL,
+                "expected a non-WordNet word to carry NULL candidates");
+
+    query_formulation_candidates_free(candidates);
+    token_list_free(terms);
+    wordnet_table_free(wordnet);
+}
+
 static void test_parse_selected_terms_rejects_uninvented_and_dedups(void) {
     StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
     WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
@@ -400,6 +425,7 @@ int main(void) {
     test_parse_selected_terms_non_array_falls_back();
     test_parse_selected_terms_empty_array_falls_back();
     test_parse_selected_terms_ignores_non_string_items();
+    test_gather_candidates_from_terms();
     test_parse_selected_terms_rejects_uninvented_and_dedups();
     test_parse_selected_terms_lowercases_expansions();
     test_formulate_query_falls_back_without_local_model();
