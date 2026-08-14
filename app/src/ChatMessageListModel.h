@@ -27,6 +27,13 @@ struct ChatMessage {
     // nothing and a CHAT that retrieved nothing both have an empty list,
     // and the source inspector has to tell them apart.
     QString tool;
+    // SEARCH-path retrieval provenance for the source inspector: the
+    // reformulated standalone question (empty when the rewrite matched
+    // the user's wording) and the space-joined term union BM25 actually
+    // searched. Both empty for user messages, CHAT/SUMMARY answers, and
+    // rows stored before these were recorded.
+    QString searchQuery;
+    QString searchTerms;
     // true only for a message just appended live via addMessage() (this
     // process, this run); false for anything loaded from history via
     // setMessages(). Lets the message delegate tell "just arrived,
@@ -48,6 +55,8 @@ public:
         IsUserRole,
         SourcesRole,
         ToolRole,
+        SearchQueryRole,
+        SearchTermsRole,
         IsFreshRole,
     };
 
@@ -58,7 +67,8 @@ public:
     QHash<int, QByteArray> roleNames() const override;
 
     void addMessage(const QString &text, bool isUser, const QVariantList &sources = QVariantList(),
-                    const QString &tool = QString());
+                    const QString &tool = QString(), const QString &searchQuery = QString(),
+                    const QString &searchTerms = QString());
 
     // Replaces the whole list at once (begin/endResetModel, not per-row
     // inserts) -- for loading a chat session's full history on switch,

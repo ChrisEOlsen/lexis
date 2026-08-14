@@ -68,7 +68,15 @@ signals:
     // text to show and persist -- never empty on ok == true (a "nothing
     // to search for" or "no matching passages" outcome is a real answer
     // string here, not a sentinel the caller has to special-case).
-    void queryFinished(bool ok, QString answer, QVariantList sources, QString tool);
+    //
+    // `searchQuery`/`searchTerms` are the SEARCH path's retrieval
+    // provenance for the source inspector: the reformulated standalone
+    // question (empty when the rewrite came back identical to what the
+    // user typed -- showing two identical strings reads as a bug) and
+    // the space-joined term union BM25 actually ran. Both empty for
+    // CHAT/SUMMARY, which have no lexical query at all.
+    void queryFinished(bool ok, QString answer, QVariantList sources, QString tool,
+                       QString searchQuery, QString searchTerms);
 
 protected:
     void run() override;

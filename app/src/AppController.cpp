@@ -242,6 +242,8 @@ void AppController::selectChatSession(qint64 sessionId) {
     for (const ChatHistoryEntry &entry : history) {
         QVariantList sources;
         QString tool;
+        QString searchQuery;
+        QString searchTerms;
         if (!entry.sourcesJson.isEmpty()) {
             QJsonDocument doc = QJsonDocument::fromJson(entry.sourcesJson.toUtf8());
             // Two accepted shapes, deliberately. The current one is an
@@ -256,12 +258,18 @@ void AppController::selectChatSession(qint64 sessionId) {
                 const QJsonObject root = doc.object();
                 tool = root.value(QStringLiteral("tool")).toString();
                 sources = root.value(QStringLiteral("passages")).toArray().toVariantList();
+                // Absent on CHAT/SUMMARY rows and anything stored before
+                // these fields existed -- .toString() yields empty, which
+                // is the QML hide condition.
+                searchQuery = root.value(QStringLiteral("searchQuery")).toString();
+                searchTerms = root.value(QStringLiteral("searchTerms")).toString();
             } else if (doc.isArray()) {
                 sources = doc.array().toVariantList();
                 tool = QStringLiteral("search");
             }
         }
-        messages.append(ChatMessage{entry.text, entry.isUser, sources, tool, /*isFresh=*/false});
+        messages.append(ChatMessage{entry.text, entry.isUser, sources, tool, searchQuery, searchTerms,
+                                    /*isFresh=*/false});
     }
     m_chatModel->setMessages(messages);
 
@@ -399,7 +407,8 @@ void AppController::onModelLoadFinished(bool ok) {
     }
 }
 
-void AppController::onQueryFinished(bool ok, QString answer, QVariantList sources, QString tool) {
+void AppController::onQueryFinished(bool ok, QString answer, QVariantList sources, QString tool,
+                                    QString searchQuery, QString searchTerms) {
     m_activeQueryWorker = nullptr; // cleaned up by the QThread::finished->deleteLater() connection
     m_chatBusy = false;
     emit chatBusyChanged();
@@ -414,7 +423,7 @@ void AppController::onQueryFinished(bool ok, QString answer, QVariantList source
     // chat_messages by QueryWorker), not a sentinel this slot has to
     // special-case into a synthesized message of its own; doing that
     // here would desync what's shown live from what's actually stored.
-    m_chatModel->addMessage(answer, false, sources, tool);
+    m_chatModel->addMessage(answer, false, sources, tool, searchQuery, searchTerms);
 }
 
 void AppController::refreshCorpusModel() {

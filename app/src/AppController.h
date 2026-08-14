@@ -146,7 +146,8 @@ private slots:
     void onIngestFinished(bool ok, qint64 totalPassages, QStringList skipped, QStringList malformed,
                            QStringList noTextFound);
     void onModelLoadFinished(bool ok);
-    void onQueryFinished(bool ok, QString answer, QVariantList sources, QString tool);
+    void onQueryFinished(bool ok, QString answer, QVariantList sources, QString tool,
+                         QString searchQuery, QString searchTerms);
 
 private:
     void refreshCorpusModel();

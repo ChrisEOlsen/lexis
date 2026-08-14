@@ -24,6 +24,10 @@ QVariant ChatMessageListModel::data(const QModelIndex &index, int role) const {
         return message.sources;
     case ToolRole:
         return message.tool;
+    case SearchQueryRole:
+        return message.searchQuery;
+    case SearchTermsRole:
+        return message.searchTerms;
     case IsFreshRole:
         return message.isFresh;
     default:
@@ -37,15 +41,18 @@ QHash<int, QByteArray> ChatMessageListModel::roleNames() const {
         {IsUserRole, "isUser"},
         {SourcesRole, "sources"},
         {ToolRole, "tool"},
+        {SearchQueryRole, "searchQuery"},
+        {SearchTermsRole, "searchTerms"},
         {IsFreshRole, "isFresh"},
     };
 }
 
 void ChatMessageListModel::addMessage(const QString &text, bool isUser, const QVariantList &sources,
-                                      const QString &tool) {
+                                      const QString &tool, const QString &searchQuery,
+                                      const QString &searchTerms) {
     int row = m_messages.size();
     beginInsertRows(QModelIndex(), row, row);
-    m_messages.append({text, isUser, sources, tool, /*isFresh=*/true});
+    m_messages.append({text, isUser, sources, tool, searchQuery, searchTerms, /*isFresh=*/true});
     endInsertRows();
 }
 

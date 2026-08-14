@@ -53,11 +53,19 @@ Item {
     property string inspectAnswer: ""
     property string inspectTool: ""
     property var inspectSources: []
+    // SEARCH-path provenance: the AI-rewritten standalone question (empty
+    // when it matched the user's wording) and the lexical terms BM25
+    // actually searched. Empty for CHAT/SUMMARY and pre-tracking rows,
+    // which hides their section below.
+    property string inspectSearchQuery: ""
+    property string inspectSearchTerms: ""
 
     function openSourceInspector(messageModel) {
         root.inspectAnswer = messageModel.text
         root.inspectTool = messageModel.tool
         root.inspectSources = messageModel.sources
+        root.inspectSearchQuery = messageModel.searchQuery
+        root.inspectSearchTerms = messageModel.searchTerms
         sourceInspector.open()
     }
 
@@ -722,6 +730,49 @@ Item {
                         textFormat: Text.MarkdownText
                         wrapMode: Text.WordWrap
                         onLinkActivated: link => Qt.openUrlExternally(link)
+                    }
+                }
+
+                // -- How it searched --
+                Label {
+                    visible: root.inspectSearchTerms.length > 0
+                    Layout.topMargin: Theme.spacingM
+                    text: qsTr("SEARCH QUERY")
+                    font.pixelSize: Theme.fontSizeCaption
+                    font.letterSpacing: 0.6
+                    color: sourceInspector.palette.placeholderText
+                }
+
+                Rectangle {
+                    visible: root.inspectSearchTerms.length > 0
+                    Layout.fillWidth: true
+                    implicitHeight: searchQueryColumn.implicitHeight + 2 * Theme.spacingM
+                    radius: Theme.radiusM
+                    color: Qt.lighter(sourceInspector.palette.window, Theme.layerRaised)
+
+                    ColumnLayout {
+                        id: searchQueryColumn
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingM
+                        spacing: Theme.spacingS
+
+                        Label {
+                            visible: root.inspectSearchQuery.length > 0
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            text: qsTr("Rewritten question: %1").arg(root.inspectSearchQuery)
+                            color: sourceInspector.palette.placeholderText
+                        }
+
+                        // The literal lexical query -- machine vocabulary,
+                        // so monospace, not prose styling.
+                        Label {
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            text: root.inspectSearchTerms
+                            font.family: "Menlo"
+                            font.pixelSize: Theme.fontSizeCaption
+                        }
                     }
                 }
 

@@ -151,7 +151,8 @@ int main(int argc, char *argv[]) {
         // the ordering safe.
         QObject::connect(
             &worker, &QueryWorker::queryFinished, &app,
-            [&](bool okIn, QString answerIn, QVariantList sourcesIn, QString toolIn) {
+            [&](bool okIn, QString answerIn, QVariantList sourcesIn, QString toolIn,
+                QString /*searchQueryIn*/, QString /*searchTermsIn*/) {
                 ok = okIn;
                 answer = answerIn;
                 sources = sourcesIn;

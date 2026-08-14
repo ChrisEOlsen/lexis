@@ -27,6 +27,7 @@
 extern "C" {
 #include "bm25.h"
 #include "generation.h"
+#include "ingest.h"
 #include "pg_store.h"
 #include "query_formulation.h"
 #include "corpus_summary.h"
@@ -80,10 +81,20 @@ constexpr double kScoreFloorRatio = 0.6;
 // chat_messages.sources is JSONB, so this needs no migration. Readers
 // must still accept the legacy bare-array shape; see
 // AppController::selectChatSession().
-QString provenanceToJson(const QString &tool, const QVariantList &sources) {
+QString provenanceToJson(const QString &tool, const QVariantList &sources,
+                          const QString &searchQuery, const QString &searchTerms) {
     QJsonObject root;
     root[QStringLiteral("tool")] = tool;
     root[QStringLiteral("passages")] = QJsonArray::fromVariantList(sources);
+    // Written only when non-empty: CHAT/SUMMARY rows stay in the exact
+    // shape they had before these fields existed, and the reload path's
+    // missing-key -> empty-string behavior is the QML hide condition.
+    if (!searchQuery.isEmpty()) {
+        root[QStringLiteral("searchQuery")] = searchQuery;
+    }
+    if (!searchTerms.isEmpty()) {
+        root[QStringLiteral("searchTerms")] = searchTerms;
+    }
     return QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Compact));
 }
 
@@ -109,10 +120,17 @@ QString toolName(ToolChoice tool) {
 // comment on why `answer` is never empty on success.
 bool runSearchPipeline(PgStore *store, const char *questionCstr, const std::vector<LocalLlmTurn> &turns,
                         const StopwordSet *stopwords, const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
-                        QString *answerOut, QVariantList *sourcesOut) {
+                        QString *answerOut, QVariantList *sourcesOut, QString *searchQueryOut,
+                        QString *searchTermsOut) {
     char *reformulated = query_formulation_contextualize_question(questionCstr, turns.data(), turns.size());
     if (reformulated == nullptr) {
         return false;
+    }
+    // Provenance for the source inspector. The rewrite is only worth
+    // showing when it actually changed something -- for a standalone
+    // question the model usually echoes it back verbatim.
+    if (strcmp(reformulated, questionCstr) != 0) {
+        *searchQueryOut = QString::fromUtf8(reformulated);
     }
 
     // The UNION of the raw question's terms and the reformulated one's,
@@ -134,6 +152,14 @@ bool runSearchPipeline(PgStore *store, const char *questionCstr, const std::vect
         token_list_free(terms);
         *answerOut = QObject::tr("I don't have enough to search for in that question -- could you rephrase it?");
         return true;
+    }
+
+    // The union list IS the lexical query -- capture it before the
+    // search consumes and frees `terms`.
+    char *joined_terms = ingest_join_words(terms, 0, terms->count);
+    if (joined_terms != nullptr) {
+        *searchTermsOut = QString::fromUtf8(joined_terms);
+        free(joined_terms);
     }
 
     QVector<const char *> queryTerms;
@@ -340,12 +366,12 @@ QueryWorker::QueryWorker(QString conninfo, qint64 corpusId, qint64 sessionId, QS
 void QueryWorker::run() {
     PgStore *store = pg_store_open(m_conninfo.toUtf8().constData());
     if (store == nullptr) {
-        emit queryFinished(false, QString(), QVariantList(), QString());
+        emit queryFinished(false, QString(), QVariantList(), QString(), QString(), QString());
         return;
     }
     if (pg_store_use_corpus(store, m_corpusId) != 0) {
         pg_store_close(store);
-        emit queryFinished(false, QString(), QVariantList(), QString());
+        emit queryFinished(false, QString(), QVariantList(), QString(), QString(), QString());
         return;
     }
 
@@ -395,6 +421,8 @@ void QueryWorker::run() {
 
     QString answerText;
     QVariantList sources;
+    QString searchQuery;
+    QString searchTerms;
     bool ok = false;
     switch (tool) {
     case TOOL_SUMMARIZE_CORPUS:
@@ -406,7 +434,8 @@ void QueryWorker::run() {
         ok = runConversePipeline(questionCstr, turns, &answerText);
         break;
     case TOOL_SEARCH_PASSAGES:
-        ok = runSearchPipeline(store, questionCstr, turns, m_stopwords, m_wordnet, m_lemmatizer, &answerText, &sources);
+        ok = runSearchPipeline(store, questionCstr, turns, m_stopwords, m_wordnet, m_lemmatizer, &answerText,
+                                &sources, &searchQuery, &searchTerms);
         break;
     }
 
@@ -414,7 +443,7 @@ void QueryWorker::run() {
 
     if (!ok) {
         pg_store_close(store);
-        emit queryFinished(false, QString(), QVariantList(), QString());
+        emit queryFinished(false, QString(), QVariantList(), QString(), QString(), QString());
         return;
     }
 
@@ -422,10 +451,10 @@ void QueryWorker::run() {
     // what the UI reports, so "nothing was retrieved" has to be recorded
     // rather than left as a NULL that reads identically to a legacy row.
     const QString tool_name = toolName(tool);
-    const QString provenanceJson = provenanceToJson(tool_name, sources);
+    const QString provenanceJson = provenanceToJson(tool_name, sources, searchQuery, searchTerms);
     pg_store_append_chat_message(store, m_sessionId, 0, answerText.toUtf8().constData(),
                                   provenanceJson.toUtf8().constData());
     pg_store_close(store);
 
-    emit queryFinished(true, answerText, sources, tool_name);
+    emit queryFinished(true, answerText, sources, tool_name, searchQuery, searchTerms);
 }
