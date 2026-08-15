@@ -27,6 +27,8 @@
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
 #include <QString>
 #include <QStringList>
 #include <QTextStream>
@@ -166,9 +168,20 @@ int main(int argc, char *argv[]) {
         worker.wait();
         const double seconds = timer.elapsed() / 1000.0;
 
-        printf("%d\t%s\t%lld\t%.2f\t%d\t%s\t%s\n", i, tool.isEmpty() ? "-" : qPrintable(tool),
+        // Column 8: the passage texts the model actually read, as a
+        // flattened JSON array. Lets any judge/metric score old runs
+        // (grounding, gold-sent attribution) without re-running the
+        // pipeline. Empty array for CHAT and legacy consumers ignore
+        // columns past 7.
+        QJsonArray passageTexts;
+        for (const QVariant &sourceVar : sources) {
+            passageTexts.append(sourceVar.toMap().value(QStringLiteral("text")).toString());
+        }
+        const QString passagesJson =
+            QString::fromUtf8(QJsonDocument(passageTexts).toJson(QJsonDocument::Compact));
+        printf("%d\t%s\t%lld\t%.2f\t%d\t%s\t%s\t%s\n", i, tool.isEmpty() ? "-" : qPrintable(tool),
                static_cast<long long>(sources.size()), seconds, ok ? 1 : 0, qPrintable(flatten(question)),
-               qPrintable(flatten(answer)));
+               qPrintable(flatten(answer)), qPrintable(flatten(passagesJson)));
         fflush(stdout);
 
         if (!persist) {

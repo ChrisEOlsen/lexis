@@ -34,16 +34,34 @@ the Tier 3 targets:
   rate is lower, but certifying the >=93% correctness target needs
   automated grounding attribution.
 
-What this run could NOT answer: the retrieval-vs-generation split.
-pipeline_eval_score.py's docstring promises a "gold_sent" measure
-(did a passage supporting the reference answer reach the model?) but
-it was never implemented, and the run TSV doesn't carry passage
-identities. Two ways to get the split, either fine: implement
-gold_sent against a --persist run's stored provenance (sources JSON
-now carries passage text), or run the RAGBench judge (step 5-adjacent)
-whose adherence metric answers the same question and is comparable to
-published numbers. Do one of these BEFORE choosing between reranker /
-document expansion -- attribution is the whole point of this run.
+ATTRIBUTION DONE (2026-08-15, second run with passages saved --
+lexis_eval column 8 -- scored by scripts/grounding_score.py: gold_sent
+via shingle containment against the dataset's per-question gold
+documents, answer support via a DeBERTa-v3 NLI judge; RAGBench's own
+judge is unpublished, so this is a same-family stand-in, and NLI
+support is conservative for multi-passage synthesis):
+
+- gold_sent: 831/905 = 91.8% (target >=95%, just under). The 74
+  misses split 40 total (no gold shingle arrived at all -- vocabulary/
+  pool problem; only document expansion or embeddings reach these) vs
+  34 partial (some gold chunks arrived -- chunk-boundary/ranking/trim
+  territory; a reranker and chunk tuning can reach these).
+- supported answers (NLI >= 0.5): 852/886 = 96.2% -- ~3.8%
+  unsupported-answer rate.
+- The 134 low-coverage answers decompose: 45 retrieval-miss, 89 with
+  gold present -- and of those 89, only THREE are judged unsupported.
+  The other ~86 are coverage-metric artifacts (grounded answers
+  phrased differently than the reference), not failures.
+- Refusals (19): 11 retrieval-miss, 8 gold-arrived-but-refused.
+- Bottom line: genuine failures ~56 retrieval + ~11 generation of 905
+  (~7.4%) -> estimated true correctness ~92-93%, at the Tier 3 target
+  within measurement error. Retrieval outnumbers generation failures
+  ~5:1: retrieval is the bottleneck, generation is nearly solved.
+
+Ops note for re-runs: run the NLI judge on MPS with fixed-length
+padding (grounding_score.py does both) -- the first attempt ran on CPU
+with variable padding and crawled for 1.5h+; fixed, the full 8,267
+pairs take ~35 min end to end.
 
 ### Original run plan (kept for re-runs)
 
