@@ -12,7 +12,40 @@ Prerequisites for everything below: `make pg-start`, the model on disk
 (`scripts/download_model.sh`), binaries built (`make lexis`, cmake build
 in `app/`).
 
-## 1. The 913-question DelucionQA overnight run
+## 1. The 913-question DelucionQA run -- DONE 2026-08-15
+
+Ran in 100 minutes (thinking=off), zero crashes. Headline numbers vs
+the Tier 3 targets:
+
+- Routing: 99.1% SEARCH (905/913) -- target >=98% MET. The 8
+  non-SEARCH: 6 CHAT misroutes all shaped "can I <use vehicle
+  feature>?" ("how can I adjust the volume?", "can I make a phone call
+  using Uconnect?"), which trips the router's "questions about YOUR
+  capabilities" rule; 2 SUMMARY ("What is the Owner's Manuals?"),
+  arguably defensible. The "can I" pattern is the next router-prompt
+  fix if 0.7% matters.
+- Pipeline failures: 0. Refusal-shaped answers: 19 (2.1%) -- target 0
+  NOT met; these are answerable per the dataset, so each is a
+  retrieval or formulation miss worth reading.
+- Latency: mean 6.6s, median 6.2s, max 23.2s -- target <=10s MET.
+- Coverage: mean 54.8%; 155 answers (17%) under 25% coverage -- the
+  candidate-failure pile. Too many to hand-read; the known limits of
+  lexical coverage (undercounts paraphrase) mean the real failure
+  rate is lower, but certifying the >=93% correctness target needs
+  automated grounding attribution.
+
+What this run could NOT answer: the retrieval-vs-generation split.
+pipeline_eval_score.py's docstring promises a "gold_sent" measure
+(did a passage supporting the reference answer reach the model?) but
+it was never implemented, and the run TSV doesn't carry passage
+identities. Two ways to get the split, either fine: implement
+gold_sent against a --persist run's stored provenance (sources JSON
+now carries passage text), or run the RAGBench judge (step 5-adjacent)
+whose adherence metric answers the same question and is comparable to
+published numbers. Do one of these BEFORE choosing between reranker /
+document expansion -- attribution is the whole point of this run.
+
+### Original run plan (kept for re-runs)
 
 Every unique DelucionQA question through the real app pipeline
 (QueryWorker: routing -> reformulation -> BM25 -> generation), against
