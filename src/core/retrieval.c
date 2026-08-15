@@ -10,9 +10,42 @@
 
 #include "local_llm_client.h"
 #include "query_formulation.h"
+#include "config.h"
+#include "reranker.h"
+#include "synonym_table.h"
 
 #include <stdlib.h>
 #include <time.h>
+
+/* The learned synonym table, loaded once per process, lazily -- same
+ * pattern as generation.c's thinking gate. Missing file = NULL = no
+ * learned candidates, quietly (the table is optional shipped data). */
+static const SynonymTable *learned_synonyms(void) {
+    static SynonymTable *table = NULL;
+    static int attempted = 0;
+    if (!attempted) {
+        attempted = 1;
+        table = synonym_table_load(LEXIS_SYNONYMS_PATH_DEFAULT);
+    }
+    return table;
+}
+
+/* The optional embedding reranker, initialized once per process from
+ * config `reranker_model_path` -- same lazy pattern as the synonym
+ * table above. No config line = never initialized = pure BM25 order. */
+static int reranker_ready(void) {
+    static int attempted = 0;
+    static int ready = 0;
+    if (!attempted) {
+        attempted = 1;
+        char *path = config_load_reranker_model_path(LEXIS_CONFIG_PATH_DEFAULT);
+        if (path != NULL) {
+            ready = (reranker_init(path) == 0);
+            free(path);
+        }
+    }
+    return ready;
+}
 
 static long elapsed_ms(struct timespec start, struct timespec end) {
     long seconds = end.tv_sec - start.tv_sec;
@@ -102,7 +135,7 @@ RetrievalRun *retrieval_run(PgStore *store, const char *question, const char *re
     if (policy->use_expansion) {
         const char *prompt_question = (rewritten_question != NULL) ? rewritten_question : question;
         QueryFormulationCandidates *candidates =
-            query_formulation_gather_candidates_from_terms(base, wordnet);
+            query_formulation_gather_candidates_from_terms(base, wordnet, learned_synonyms());
         if (candidates != NULL && candidates->count > 0) {
             run->expansion_prompt = query_formulation_build_prompt(prompt_question, candidates);
             if (run->expansion_prompt != NULL) {
@@ -157,12 +190,28 @@ RetrievalRun *retrieval_run(PgStore *store, const char *question, const char *re
         return NULL;
     }
 
-    /* 4. Rank deep, send shallow -- trim to what is worth putting in
+    /* 4. Optional meaning-based reorder of the whole candidate list,
+     * BEFORE the trim -- the point is exactly to rescue passages BM25
+     * ranked below the cutoff. The question embedded is the standalone
+     * one when a rewrite exists. On any reranker failure the BM25 order
+     * stands untouched. */
+    int reranked = 0;
+    if (reranker_ready()) {
+        const char *embed_question = (rewritten_question != NULL) ? rewritten_question : question;
+        reranked = (reranker_rescore(store, embed_question, run->results) == 0);
+    }
+
+    /* 5. Rank deep, send shallow -- trim to what is worth putting in
      * front of the model, per policy. Done here, once, so "what the
-     * model reads" and "what any observer shows" are the same list. */
+     * model reads" and "what any observer shows" are the same list.
+     * The score floor is a BM25-scale heuristic; fused reciprocal-rank
+     * scores live on a different scale, so it is disabled when the
+     * reranker actually ran (the passage cap and token budget still
+     * bound the prompt). */
     if (policy->max_passages > 0) {
+        double floor_ratio = reranked ? 0.0 : policy->score_floor_ratio;
         bm25_result_set_trim(store, run->results, policy->max_passages, policy->token_budget,
-                             policy->score_floor_ratio);
+                             floor_ratio);
     }
     clock_gettime(CLOCK_MONOTONIC, &search_end);
     run->search_ms = elapsed_ms(search_start, search_end);

@@ -175,7 +175,13 @@ static LocalLlmTurn *window_history(const LocalLlmTurn *history, size_t history_
 }
 
 char *generation_generate_answer_with_history(const char *query_text, PgStore *store, const BM25ResultSet *results,
-                                               const LocalLlmTurn *history, size_t history_count) {
+                                               const LocalLlmTurn *history, size_t history_count,
+                                               int thinking_override) {
+    /* thinking_override: -1 = follow config/lexis.conf's `thinking`
+     * setting; 0/1 force it off/on for this one call. The refusal-retry
+     * path forces it ON: the measured case thinking rescued was exactly
+     * a model declining/misreading passages it already had. */
+    int think = (thinking_override < 0) ? thinking_enabled() : thinking_override;
     char *prompt = generation_build_prompt(query_text, store, results);
     if (prompt == NULL) {
         return NULL;
@@ -183,7 +189,7 @@ char *generation_generate_answer_with_history(const char *query_text, PgStore *s
 
     if (history_count == 0) {
         LocalLlmTurn turn = {.role = "user", .content = prompt};
-        char *answer = local_llm_chat_completion_multi_ex(&turn, 1, NULL, thinking_enabled());
+        char *answer = local_llm_chat_completion_multi_ex(&turn, 1, NULL, think);
         free(prompt);
         return answer;
     }
@@ -216,7 +222,7 @@ char *generation_generate_answer_with_history(const char *query_text, PgStore *s
     free(windowed);
     turns[windowed_count] = (LocalLlmTurn){.role = "user", .content = prompt};
 
-    char *answer = local_llm_chat_completion_multi_ex(turns, windowed_count + 1, NULL, thinking_enabled());
+    char *answer = local_llm_chat_completion_multi_ex(turns, windowed_count + 1, NULL, think);
     free(turns);
     free(prompt);
     return answer;

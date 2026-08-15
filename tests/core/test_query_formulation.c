@@ -313,7 +313,7 @@ static void test_gather_candidates_from_terms(void) {
     token_list_append(terms, "dog");
     token_list_append(terms, "zzyzzva");
     QueryFormulationCandidates *candidates =
-        query_formulation_gather_candidates_from_terms(terms, wordnet);
+        query_formulation_gather_candidates_from_terms(terms, wordnet, NULL);
     TEST_ASSERT(candidates != NULL, "expected gather from terms to succeed");
     TEST_ASSERT(candidates->count == 2, "expected 2 terms, got %zu", candidates->count);
     TEST_ASSERT_STR_EQ(candidates->terms[0].term, "dog");

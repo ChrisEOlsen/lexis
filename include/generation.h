@@ -47,8 +47,11 @@ char *generation_generate_answer(const char *query_text, PgStore *store,
  * generation_generate_answer()'s plain single-turn behavior when
  * `history_count == 0`. Same failure contract: NULL if prompt-building
  * or generation itself fails. */
+/* thinking_override: -1 follows the config `thinking` setting; 0/1
+ * force the reasoning pass off/on for this call (the refusal retry
+ * forces on). */
 char *generation_generate_answer_with_history(const char *query_text, PgStore *store, const BM25ResultSet *results,
-                                               const LocalLlmTurn *history, size_t history_count);
+                                               const LocalLlmTurn *history, size_t history_count, int thinking_override);
 
 /* "Read the whole group" counterpart: instead of BM25 passages, the
  * context block is every document currently in the active corpus (via

@@ -112,6 +112,17 @@ LexisMode config_load_mode(const char *path) {
     return mode;
 }
 
+char *config_load_reranker_model_path(const char *path) {
+    char *text = read_file_quietly(path);
+    if (text == NULL) {
+        return NULL;
+    }
+    const char *value = find_last_value(text, "reranker_model_path");
+    char *result = (value != NULL && value[0] != '\0') ? strdup(value) : NULL;
+    free(text);
+    return result;
+}
+
 int config_load_thinking(const char *path) {
     char *text = read_file_quietly(path);
     if (text == NULL) {

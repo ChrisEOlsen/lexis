@@ -129,7 +129,7 @@ int main(int argc, char **argv) {
             free(prompt);
 
             double started = now_s();
-            char *answer = generation_generate_answer_with_history(line, store, results, NULL, 0);
+            char *answer = generation_generate_answer_with_history(line, store, results, NULL, 0, -1);
             double elapsed = now_s() - started;
 
             printf("%ld\t%zu\t%zu\t", index, max_passages, results->count);

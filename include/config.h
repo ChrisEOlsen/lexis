@@ -67,4 +67,11 @@ char *config_load_model_path(const char *path);
  * latency saving on is an explicit opt-in via `thinking=off`. */
 int config_load_thinking(const char *path);
 
+/* Reads the "reranker_model_path = <path to .gguf>" line: the optional
+ * embedding model that reorders BM25 candidates by meaning (see
+ * reranker.h). Returns a malloc'd string the caller owns, or NULL when
+ * the line/file is missing -- NULL means the reranker is OFF, which is
+ * the default; there is no baked-in fallback model path. */
+char *config_load_reranker_model_path(const char *path);
+
 #endif /* LEXIS_CONFIG_H */

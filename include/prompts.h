@@ -127,7 +127,11 @@
     "you have access to, or whether you can reach anything outside the "       \
     "documents (e.g. \"what are you?\", \"what can you do?\", \"can you "       \
     "search the web?\", \"can you check online for X?\", \"can you email "      \
-    "this?\").\n\n"                                                            \
+    "this?\"). BUT \"can I ...\" or \"how can I ...\" about using, "           \
+    "operating or adjusting something the documents describe is the USER "     \
+    "asking about the subject matter, not about you -- that is SEARCH "        \
+    "(e.g. \"can I make a phone call using the Uconnect system?\", \"how "     \
+    "can I adjust the volume?\", \"can I zoom the camera image?\").\n\n"       \
     "Rules. A message that refers to the documents in any way -- \"the "       \
     "documents\", \"the corpus\", \"this file\", a filename -- is SEARCH or "  \
     "SUMMARY, never CHAT: the documents exist and are available, so such a "   \
@@ -285,7 +289,8 @@
 
 #define LEXIS_PROMPT_QUERY_TERMS_CANDIDATES                                    \
     "\"\n\nFor each query term below, related words are listed: synonyms "     \
-    "(same meaning) and hypernyms (broader terms). Select ONLY related "       \
+    "(same meaning), hypernyms (broader terms), and words used in "           \
+    "similar contexts. Select ONLY related "       \
     "words that (1) match the meaning the question uses -- discard words "     \
     "that belong to a different sense of the term -- and (2) would likely "    \
     "appear in a passage answering this exact question. Prefer few, "          \

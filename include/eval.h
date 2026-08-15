@@ -39,7 +39,7 @@ typedef struct {
     /* Macro-averaged nDCG@10 with linear gains (trec_eval's ndcg_cut
      * convention, which BEIR reports through pytrec_eval) -- the
      * headline metric of the BEIR zero-shot retrieval benchmark, so
-     * LEXIS results on BeIR/* corpora line up against published BM25/
+     * LEXIS results on BeIR corpora line up against published BM25/
      * dense-retriever tables. Uses the qrels' graded score as the gain
      * (binary qrels make gain choice irrelevant). */
     double ndcg_at_10;

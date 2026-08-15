@@ -97,6 +97,48 @@ QString toolName(ToolChoice tool) {
     return QStringLiteral("search");
 }
 
+// A refusal-shaped answer -- the model declining rather than answering.
+// Mirrors scripts/*_score.py's REFUSAL_MARKERS. Used to trigger the one
+// retry below; a false positive only costs one extra attempt.
+bool answerLooksLikeRefusal(const QString &answer) {
+    static const char *markers[] = {
+        "don't have enough", "do not have enough", "not enough information",
+        "does not contain",  "doesn't contain",    "no matching passages",
+        "could you rephrase",
+    };
+    const QString lowered = answer.toLower();
+    for (const char *marker : markers) {
+        if (lowered.contains(QLatin1String(marker))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Source citations for the UI, fetched before generation so a passage
+// that fails to load simply doesn't appear rather than aborting.
+QVariantList collectSources(PgStore *store, const BM25ResultSet *results) {
+    QVariantList sources;
+    for (size_t i = 0; i < results->count; i++) {
+        PgStorePassage *passage = pg_store_get_passage(store, results->items[i].passage_id);
+        if (passage == nullptr) {
+            continue;
+        }
+        QVariantMap source;
+        source[QStringLiteral("documentName")] = QString::fromUtf8(passage->document_name);
+        source[QStringLiteral("chunkId")] = passage->chunk_id;
+        source[QStringLiteral("score")] = results->items[i].score;
+        // The passage text itself, not just its id -- the source
+        // inspector shows what this answer was actually built from, not
+        // whatever the database holds at display time.
+        source[QStringLiteral("text")] = QString::fromUtf8(passage->text);
+        source[QStringLiteral("tokenCount")] = passage->token_count;
+        sources.append(source);
+        pg_store_passage_free(passage);
+    }
+    return sources;
+}
+
 // SEARCH path -- today's pipeline, extracted unchanged from before the
 // tool router existed. Returns false (ok=false) only on a real failure;
 // a "nothing to search for"/"no matching passages" outcome is a real,
@@ -125,66 +167,73 @@ bool runSearchPipeline(PgStore *store, const char *questionCstr, const std::vect
     RetrievalPolicy policy = retrieval_default_policy();
     RetrievalRun *run =
         retrieval_run(store, questionCstr, reformulated, stopwords, wordnet, lemmatizer, &policy);
-    free(reformulated);
     if (run == nullptr) {
+        free(reformulated);
         return false;
     }
     if (run->terms->count == 0) {
+        free(reformulated);
         retrieval_run_free(run);
         *answerOut = QObject::tr("I don't have enough to search for in that question -- could you rephrase it?");
         return true;
     }
-
-    // The final list IS the lexical query -- originals first, then any
-    // surviving expansions.
-    char *joined_terms = ingest_join_words(run->terms, 0, run->terms->count);
-    if (joined_terms != nullptr) {
-        *searchTermsOut = QString::fromUtf8(joined_terms);
-        free(joined_terms);
-    }
-
-    BM25ResultSet *results = run->results;
-    if (results->count == 0) {
+    if (run->results->count == 0) {
+        free(reformulated);
         retrieval_run_free(run);
         *answerOut = QObject::tr("No matching passages found in this group for that question.");
         return true;
     }
 
-    // Source citations, gathered the same way run_query() does --
-    // fetched before generation so a passage that fails to load (rare,
-    // but possible if the DB changed underneath a stale result set)
-    // simply doesn't appear as a source, rather than aborting the query.
-    QVariantList sources;
-    for (size_t i = 0; i < results->count; i++) {
-        PgStorePassage *passage = pg_store_get_passage(store, results->items[i].passage_id);
-        if (passage == nullptr) {
-            continue;
-        }
-        QVariantMap source;
-        source[QStringLiteral("documentName")] = QString::fromUtf8(passage->document_name);
-        source[QStringLiteral("chunkId")] = passage->chunk_id;
-        source[QStringLiteral("score")] = results->items[i].score;
-        // The passage text itself, not just its id. The UI's source
-        // inspector shows the actual retrieved text -- a chunk id alone
-        // tells the user nothing about what the answer was grounded in,
-        // and re-reading the passage from the database at display time
-        // would show whatever is there *now* rather than what this answer
-        // was actually built from.
-        source[QStringLiteral("text")] = QString::fromUtf8(passage->text);
-        source[QStringLiteral("tokenCount")] = passage->token_count;
-        sources.append(source);
-        pg_store_passage_free(passage);
-    }
-
     // The *original* question, not the reformulated search query -- the
     // reformulation only ever existed to help retrieval, not to replace
     // what the user actually asked (see generation.h's own doc comment).
-    char *answer = generation_generate_answer_with_history(questionCstr, store, results, turns.data(), turns.size());
+    char *answer = generation_generate_answer_with_history(questionCstr, store, run->results,
+                                                            turns.data(), turns.size(), -1);
+
+    // Refusal retry, once. Measured on the 913-run: 8 of 19 refusals
+    // happened with the gold passage already in context (the model
+    // declined material it had), and several more with it just below the
+    // score-floor cutoff. The retry attacks both at once: retrieve again
+    // with the floor off (fills the full passage budget), regenerate
+    // with the reasoning pass forced ON (the one case thinking measurably
+    // rescued was exactly a model misreading passages it already had).
+    // Cost lands only on the ~2% of queries that refuse.
+    if (answer != nullptr && answerLooksLikeRefusal(QString::fromUtf8(answer))) {
+        RetrievalPolicy retryPolicy = retrieval_default_policy();
+        retryPolicy.score_floor_ratio = 0.0;
+        RetrievalRun *retryRun =
+            retrieval_run(store, questionCstr, reformulated, stopwords, wordnet, lemmatizer, &retryPolicy);
+        if (retryRun != nullptr && retryRun->results != nullptr && retryRun->results->count > 0) {
+            char *retryAnswer = generation_generate_answer_with_history(
+                questionCstr, store, retryRun->results, turns.data(), turns.size(), /*thinking=*/1);
+            if (retryAnswer != nullptr && !answerLooksLikeRefusal(QString::fromUtf8(retryAnswer))) {
+                free(answer);
+                answer = retryAnswer;
+                retrieval_run_free(run);
+                run = retryRun;
+                retryRun = nullptr;
+            } else {
+                free(retryAnswer);
+            }
+        }
+        retrieval_run_free(retryRun); /* NULL-safe; no-op when adopted */
+    }
+    free(reformulated);
+
+    // Provenance and citations from whichever run produced the final
+    // answer -- what the model read and what the inspector shows must be
+    // the same list.
+    char *joined_terms = ingest_join_words(run->terms, 0, run->terms->count);
+    if (joined_terms != nullptr) {
+        *searchTermsOut = QString::fromUtf8(joined_terms);
+        free(joined_terms);
+    }
+    QVariantList sources = collectSources(store, run->results);
     retrieval_run_free(run);
+
     if (answer == nullptr) {
         return false;
     }
-
     *answerOut = QString::fromUtf8(answer);
     free(answer);
     *sourcesOut = sources;

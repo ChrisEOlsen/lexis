@@ -26,3 +26,9 @@ model_path=data/models/gemma-4-E4B-it-Q4_K_M.gguf
 #   Only gates the user-facing answer steps -- routing, expansion, and
 #   summarization never think. Default if unset: on.
 thinking=on
+
+# reranker_model_path = <path to an embedding .gguf, relative to the
+#   project root>
+#   Optional meaning-based reranker: reorders BM25's candidates by
+#   embedding similarity before the trim (see reranker.h). Unset = off.
+reranker_model_path=data/models/bge-small-en-v1.5-f16.gguf

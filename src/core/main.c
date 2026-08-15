@@ -295,7 +295,7 @@ static int run_query(const char *question) {
         /* Zero history turns: the history-aware generator degrades to
          * exactly the single-turn behavior (see generation.h) -- one
          * generation entry point for the CLI and the app alike. */
-        char *answer = generation_generate_answer_with_history(question, store, results, NULL, 0);
+        char *answer = generation_generate_answer_with_history(question, store, results, NULL, 0, -1);
         clock_gettime(CLOCK_MONOTONIC, &gen_end);
         retrieval_run_free(run);
 

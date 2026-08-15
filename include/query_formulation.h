@@ -20,6 +20,7 @@
 #include "lemmatizer.h"
 #include "local_llm_client.h"
 #include "stopwords.h"
+#include "synonym_table.h"
 #include "tokenizer.h"
 #include "wordnet.h"
 
@@ -37,6 +38,11 @@
 typedef struct {
     char *term;
     const WordNetLookupResult *candidates;
+    /* Learned-synonym neighbors for this term (see synonym_table.h), or
+     * NULL. Owned by this struct, unlike `candidates` (which aliases the
+     * WordNet table). Offered in the expansion prompt alongside WordNet
+     * candidates and subject to the same sense filter and weights. */
+    TokenList *learned;
 } QueryFormulationTermCandidates;
 
 /* BM25 weight for expansion terms (everything after original_count in
@@ -65,7 +71,7 @@ typedef struct {
  * question terms union directly. One retrieval pipeline, not two.
  * Returns NULL on allocation failure. */
 QueryFormulationCandidates *query_formulation_gather_candidates_from_terms(
-    const TokenList *terms, const WordNetTable *wordnet);
+    const TokenList *terms, const WordNetTable *wordnet, const SynonymTable *learned);
 
 QueryFormulationCandidates *query_formulation_gather_candidates(
     const char *query_text, const StopwordSet *stopwords, const WordNetTable *wordnet,

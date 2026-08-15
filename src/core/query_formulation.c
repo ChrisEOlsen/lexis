@@ -52,13 +52,14 @@ void query_formulation_candidates_free(QueryFormulationCandidates *candidates) {
 
     for (size_t i = 0; i < candidates->count; i++) {
         free(candidates->terms[i].term);
+        token_list_free(candidates->terms[i].learned);
     }
     free(candidates->terms);
     free(candidates);
 }
 
 QueryFormulationCandidates *query_formulation_gather_candidates_from_terms(
-    const TokenList *terms, const WordNetTable *wordnet) {
+    const TokenList *terms, const WordNetTable *wordnet, const SynonymTable *learned) {
     QueryFormulationCandidates *result = malloc(sizeof(QueryFormulationCandidates));
     if (result == NULL) {
         return NULL;
@@ -88,6 +89,28 @@ QueryFormulationCandidates *query_formulation_gather_candidates_from_terms(
         }
         result->terms[i].term = term;
         result->terms[i].candidates = wordnet_lookup(wordnet, term);
+        /* Learned neighbors, copied (the table owns its lists, this
+         * struct owns its own) -- NULL table or no entry both mean "no
+         * learned candidates", which every consumer handles. */
+        result->terms[i].learned = NULL;
+        const TokenList *neighbors = synonym_table_lookup(learned, term);
+        if (neighbors != NULL && neighbors->count > 0) {
+            TokenList *copy = token_list_create();
+            if (copy == NULL) {
+                result->count++; /* term itself is valid; free path handles it */
+                query_formulation_candidates_free(result);
+                return NULL;
+            }
+            for (size_t n = 0; n < neighbors->count; n++) {
+                if (token_list_append(copy, neighbors->terms[n]) != 0) {
+                    token_list_free(copy);
+                    result->count++;
+                    query_formulation_candidates_free(result);
+                    return NULL;
+                }
+            }
+            result->terms[i].learned = copy;
+        }
         result->count++;
     }
 
@@ -125,7 +148,7 @@ QueryFormulationCandidates *query_formulation_gather_candidates(
     token_list_free(terms);
 
     QueryFormulationCandidates *result =
-        query_formulation_gather_candidates_from_terms(lemmas, wordnet);
+        query_formulation_gather_candidates_from_terms(lemmas, wordnet, NULL);
     token_list_free(lemmas);
     return result;
 }
@@ -161,7 +184,13 @@ char *query_formulation_build_prompt(const char *query_text,
         }
 
         if (term->candidates == NULL) {
-            if (string_builder_append(&builder, "  (not found in WordNet -- no related words)\n") != 0) {
+            if (term->learned != NULL && term->learned->count > 0) {
+                if (string_builder_append(&builder, "  related (words used in similar contexts): ") != 0 ||
+                    append_capped_word_list(&builder, term->learned) != 0 ||
+                    string_builder_append(&builder, "\n") != 0) {
+                    goto fail;
+                }
+            } else if (string_builder_append(&builder, "  (no related words known)\n") != 0) {
                 goto fail;
             }
         } else {
@@ -175,6 +204,13 @@ char *query_formulation_build_prompt(const char *query_text,
             if (term->candidates->hypernyms->count > 0) {
                 if (string_builder_append(&builder, "  hypernyms: ") != 0 ||
                     append_capped_word_list(&builder, term->candidates->hypernyms) != 0 ||
+                    string_builder_append(&builder, "\n") != 0) {
+                    goto fail;
+                }
+            }
+            if (term->learned != NULL && term->learned->count > 0) {
+                if (string_builder_append(&builder, "  related (words used in similar contexts): ") != 0 ||
+                    append_capped_word_list(&builder, term->learned) != 0 ||
                     string_builder_append(&builder, "\n") != 0) {
                     goto fail;
                 }
@@ -215,6 +251,14 @@ static int token_list_contains(const TokenList *list, const char *word) {
  * longer offers them. */
 static int is_offered_candidate(const QueryFormulationCandidates *candidates, const char *word) {
     for (size_t i = 0; i < candidates->count; i++) {
+        const TokenList *learned = candidates->terms[i].learned;
+        if (learned != NULL) {
+            for (size_t j = 0; j < learned->count; j++) {
+                if (strcasecmp(learned->terms[j], word) == 0) {
+                    return 1;
+                }
+            }
+        }
         const WordNetLookupResult *entry = candidates->terms[i].candidates;
         if (entry == NULL) {
             continue;
