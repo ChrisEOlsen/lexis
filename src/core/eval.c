@@ -14,6 +14,7 @@
 #include "query_formulation.h"
 #include "retrieval.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -190,21 +191,55 @@ static long load_qrels_tsv(const char *path, EvalQrel **out_qrels) {
  * positive score -- a borrowed-pointer array into `qrels`'s own owned
  * strings, freed by the caller as just the array, not its contents.
  * Returns NULL (with *out_count == 0) on allocation failure. */
+/* Also returns each relevant doc's graded qrels score through
+ * `scores_out` (parallel to the returned array, caller frees) -- the
+ * gain nDCG@10 needs; MRR/recall ignore it. */
 static const char **collect_relevant_ids(const EvalQrel *qrels, size_t qrels_count,
-                                          const char *query_id, size_t *out_count) {
-    const char **relevant = malloc(sizeof(char *) * (qrels_count > 0 ? qrels_count : 1));
-    if (relevant == NULL) {
+                                          const char *query_id, int **scores_out,
+                                          size_t *out_count) {
+    size_t capacity = qrels_count > 0 ? qrels_count : 1;
+    const char **relevant = malloc(sizeof(char *) * capacity);
+    int *scores = malloc(sizeof(int) * capacity);
+    if (relevant == NULL || scores == NULL) {
+        free(relevant);
+        free(scores);
+        *scores_out = NULL;
         *out_count = 0;
         return NULL;
     }
     size_t n = 0;
     for (size_t i = 0; i < qrels_count; i++) {
         if (qrels[i].score > 0 && strcmp(qrels[i].query_id, query_id) == 0) {
-            relevant[n++] = qrels[i].corpus_id;
+            relevant[n] = qrels[i].corpus_id;
+            scores[n] = qrels[i].score;
+            n++;
         }
     }
+    *scores_out = scores;
     *out_count = n;
     return relevant;
+}
+
+/* Ideal DCG@10: the relevant docs' gains, best-first, discounted into
+ * the top ten ranks. Insertion-sorts a copy -- qrels per query are a
+ * handful of rows, not worth qsort ceremony. */
+static double ideal_dcg_10(const int *scores, size_t count) {
+    int top[10] = {0};
+    for (size_t i = 0; i < count; i++) {
+        int gain = scores[i];
+        for (size_t slot = 0; slot < 10; slot++) {
+            if (gain > top[slot]) {
+                int displaced = top[slot];
+                top[slot] = gain;
+                gain = displaced;
+            }
+        }
+    }
+    double idcg = 0.0;
+    for (size_t slot = 0; slot < 10 && top[slot] > 0; slot++) {
+        idcg += (double)top[slot] / log2((double)slot + 2.0);
+    }
+    return idcg;
 }
 
 static void eval_cleanup(const char **relevant_ids, EvalQrel *qrels, long qrels_count,
@@ -217,7 +252,10 @@ static void eval_cleanup(const char **relevant_ids, EvalQrel *qrels, long qrels_
 EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNetTable *wordnet,
                       const Lemmatizer *lemmatizer, const char *queries_tsv_path,
                       const char *qrels_tsv_path, int use_llm_expansion) {
-    EvalMetrics failure = {0.0, 0.0, 0.0, -1, 0};
+    /* Designated, not positional: adding a metric field must never
+     * silently shift the -1 sentinel out of queries_evaluated (it did
+     * once, when ndcg_at_10 landed). */
+    EvalMetrics failure = {.queries_evaluated = -1};
 
     EvalQuery *queries = NULL;
     long query_count = load_queries_tsv(queries_tsv_path, &queries);
@@ -253,6 +291,7 @@ EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNet
     double sum_reciprocal_rank = 0.0;
     double sum_recall_10 = 0.0;
     double sum_recall_100 = 0.0;
+    double sum_ndcg_10 = 0.0;
     long evaluated = 0;
     long skipped = 0;
 
@@ -274,8 +313,9 @@ EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNet
         const char *query_text = queries[qi].query_text;
 
         size_t relevant_count = 0;
+        int *relevant_scores = NULL;
         const char **relevant_ids =
-            collect_relevant_ids(qrels, (size_t)qrels_count, query_id, &relevant_count);
+            collect_relevant_ids(qrels, (size_t)qrels_count, query_id, &relevant_scores, &relevant_count);
         if (relevant_ids == NULL) {
             eval_cleanup(NULL, qrels, qrels_count, queries, query_count);
             return failure;
@@ -284,6 +324,7 @@ EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNet
             /* No qrels judgments for this query -- nothing to score
              * against, not a failure. */
             free(relevant_ids);
+            free(relevant_scores);
             skipped++;
             continue;
         }
@@ -292,6 +333,7 @@ EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNet
             retrieval_run(store, query_text, NULL, stopwords, wordnet, lemmatizer, &policy);
         if (run == NULL) {
             fprintf(stderr, "eval_run: retrieval failed on query %s\n", query_id);
+            free(relevant_scores);
             eval_cleanup(relevant_ids, qrels, qrels_count, queries, query_count);
             return failure;
         }
@@ -300,6 +342,7 @@ EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNet
         double reciprocal_rank = 0.0;
         double recall_10 = 0.0;
         double recall_100 = 0.0;
+        double dcg_10 = 0.0;
 
         if (terms->count > 0) {
             BM25ResultSet *results = run->results; /* alias: owned by `run` */
@@ -365,6 +408,7 @@ EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNet
                         if (rank < top_10_limit && !relevant_counted_10[r]) {
                             relevant_counted_10[r] = 1;
                             found_at_10++;
+                            dcg_10 += (double)relevant_scores[r] / log2((double)rank + 2.0);
                             if (reciprocal_rank == 0.0) {
                                 reciprocal_rank = 1.0 / (double)(rank + 1);
                             }
@@ -386,12 +430,16 @@ EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNet
             }
         }
 
+        double idcg = ideal_dcg_10(relevant_scores, relevant_count);
+
         retrieval_run_free(run);
         free(relevant_ids);
+        free(relevant_scores);
 
         sum_reciprocal_rank += reciprocal_rank;
         sum_recall_10 += recall_10;
         sum_recall_100 += recall_100;
+        sum_ndcg_10 += (idcg > 0.0) ? dcg_10 / idcg : 0.0;
         evaluated++;
 
         if (evaluated % 50 == 0 || qi == query_count - 1) {
@@ -418,5 +466,6 @@ EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNet
     metrics.mrr_at_10 = evaluated > 0 ? sum_reciprocal_rank / (double)evaluated : 0.0;
     metrics.recall_at_10 = evaluated > 0 ? sum_recall_10 / (double)evaluated : 0.0;
     metrics.recall_at_100 = evaluated > 0 ? sum_recall_100 / (double)evaluated : 0.0;
+    metrics.ndcg_at_10 = evaluated > 0 ? sum_ndcg_10 / (double)evaluated : 0.0;
     return metrics;
 }

@@ -380,6 +380,7 @@ static int run_eval(const char *queries_path, const char *qrels_path, int use_ll
         printf("Queries evaluated: %ld (skipped %ld with no qrels judgments)\n",
                metrics.queries_evaluated, metrics.queries_skipped);
         printf("MRR@10:      %.4f\n", metrics.mrr_at_10);
+        printf("nDCG@10:     %.4f\n", metrics.ndcg_at_10);
         printf("Recall@10:   %.4f\n", metrics.recall_at_10);
         printf("Recall@100:  %.4f\n", metrics.recall_at_100);
         printf("Total time:  %.1f minutes\n", (double)ms / 60000.0);

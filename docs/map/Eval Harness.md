@@ -14,6 +14,7 @@ Source: `src/core/eval.c` (CLI `lexis eval <queries_tsv> <qrels_tsv>`); `app/src
 Current numbers (2026-08-14, 70 dev queries whose gold passage is inside the ingested 200K slice, post-[[Lemmatizer]]-fix, post-formulation-redesign):
 - Plain terms (+coord bonus): MRR@10 0.218 / R@10 0.536 / R@100 0.776
 - Sense-filtered weighted expansion: **0.222 / 0.550 / 0.776** — expansion now ahead on every metric (it was 0.142 / 0.414 / 0.690 before the redesign).
-- DelucionQA starter run (real app pipeline, re-ingested corpus): 30/30 routed SEARCH, 0 refusals, coverage mean 53.7%, mean 29.3s/answer.
+- DelucionQA starter run (real app pipeline, re-ingested corpus): 30/30 routed SEARCH, 0 refusals, coverage mean 53.7%, mean 29.3s/answer (8.3s with `thinking=off`).
+- BEIR (nDCG@10, vs published tables — see TESTING.md): SciFact **0.6395** (published BM25 0.665, ANCE 0.507, BGE 0.743), NFCorpus **0.2834** (published BM25 0.325, ANCE 0.237) — classical-BM25 band, above first-gen dense, below modern embedders.
 
 **Uses:** [[Query Formulation]], [[BM25 Search]], [[Postgres Store]], [[Config]].

@@ -74,6 +74,34 @@ Both configurations, so expansion's value is re-verified at full scale:
   that with expansion ahead of plain = the lexical core is pulling its
   weight.
 
+## Done: BEIR comparison against published retriever scores (2026-08-14)
+
+The "compare against traditional RAG without running a baseline
+locally" measurement: two small BEIR corpora (exported by
+`scripts/export_beir.sh`, scored by `lexis eval`'s nDCG@10 -- linear
+gains, trec_eval convention, matching what BEIR reports through
+pytrec_eval), lined up against published zero-shot nDCG@10 tables.
+
+| nDCG@10        | SciFact | NFCorpus |
+|----------------|---------|----------|
+| DPR (dense, 2020)        | 0.318 | 0.189 |
+| ANCE (dense, 2021)       | 0.507 | 0.237 |
+| TAS-B (dense, 2021)      | 0.643 | 0.319 |
+| published BM25 (anserini) | 0.665 | 0.325 |
+| **LEXIS (expansion)**    | **0.6395** | **0.2834** |
+| **LEXIS (plain terms)**  | **0.6354** | **0.2802** |
+| ColBERTv2 (late-int.)    | 0.693 | 0.338 |
+| BGE-Base (modern embed.) | 0.743 | 0.360 |
+
+Reading: LEXIS lands in the classical-BM25 band (0.03-0.04 below
+anserini's tuning -- plausibly chunking 200/40 over whole-doc indexing,
+WordNet lemmatization vs Porter stemming, k1/b defaults), decisively
+above the first-generation dense retrievers, at TAS-B's level on
+SciFact, and 0.05-0.10 below modern embedding models. Expansion is
+mildly positive on both. Run it again after retrieval changes:
+`scripts/export_beir.sh <ds> test` then ingest + eval; ~15 min total
+for both corpora on the M5.
+
 ## 4. The embeddings decision -- from data, not priors
 
 Hybrid retrieval (an embedding model via llama.cpp, an ingest-time
