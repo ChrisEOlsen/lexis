@@ -64,6 +64,14 @@ int reranker_init(const char *model_path) {
     }
     g_vocab = llama_model_get_vocab(g_model);
     g_n_embd = llama_model_n_embd(g_model);
+    /* Metal contexts left alive at process exit crash in dyld teardown
+     * (observed: a binary that loads this model, prints results, then
+     * exits dies AFTER its last line of output -- which made the test
+     * suite's runner read a passing binary as failed). The chat model
+     * avoids this because its callers run local_llm_client_cleanup();
+     * this module is loaded lazily by whoever retrieves first, so it
+     * cleans itself up. */
+    atexit(reranker_cleanup);
     return 0;
 }
 
