@@ -121,9 +121,24 @@ static int run_bulk_ingest(const char *tsv_path) {
     pg_store_close(probe_store);
 
     struct timespec start, end;
+    /* Experiment overrides for retrieval tuning sweeps (see TESTING.md).
+     * Unset = the shipped defaults; a huge LEXIS_CHUNK_SIZE ingests each
+     * document as one passage (how published BEIR baselines index
+     * short-document corpora). */
+    size_t chunk_size = LEXIS_CHUNK_SIZE;
+    size_t chunk_overlap = LEXIS_CHUNK_OVERLAP;
+    const char *chunk_env = getenv("LEXIS_CHUNK_SIZE");
+    const char *overlap_env = getenv("LEXIS_CHUNK_OVERLAP");
+    if (chunk_env != NULL && atol(chunk_env) > 0) {
+        chunk_size = (size_t)atol(chunk_env);
+    }
+    if (overlap_env != NULL && atol(overlap_env) >= 0) {
+        chunk_overlap = (size_t)atol(overlap_env);
+    }
+
     clock_gettime(CLOCK_MONOTONIC, &start);
     long passages = bulk_ingest_tsv(LEXIS_DB_CONNINFO, NULL, stopwords, wordnet, lemmatizer, tsv_path,
-                                     LEXIS_CHUNK_SIZE, LEXIS_CHUNK_OVERLAP, LEXIS_INGEST_THREADS);
+                                     chunk_size, chunk_overlap, LEXIS_INGEST_THREADS);
     clock_gettime(CLOCK_MONOTONIC, &end);
 
     int exit_code = 0;

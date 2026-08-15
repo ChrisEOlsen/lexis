@@ -102,6 +102,32 @@ mildly positive on both. Run it again after retrieval changes:
 `scripts/export_beir.sh <ds> test` then ingest + eval; ~15 min total
 for both corpora on the M5.
 
+## Done: lexical hygiene sweep (2026-08-15)
+
+Chunking and BM25 k1/b swept on the two BEIR corpora via env knobs
+(LEXIS_CHUNK_SIZE/LEXIS_CHUNK_OVERLAP on `lexis bulk-ingest`,
+LEXIS_BM25_K1/LEXIS_BM25_B on retrieval_default_policy()). Findings:
+
+- k1/b: the shipped 1.2/0.75 beat or tied anserini's 0.9/0.4 on both
+  corpora. No change.
+- Chunking is corpus-dependent: whole-document indexing (huge
+  LEXIS_CHUNK_SIZE) is worth +0.017 nDCG@10 on NFCorpus (0.3061 vs
+  0.2895) and slightly NEGATIVE on SciFact (0.629-0.631 vs 0.6353).
+  The app default stays 200/40 (long documents must chunk under the
+  1500-token trim budget); benchmark corpora with abstract-sized
+  documents should ingest whole-doc via the env knob.
+- Found and fixed along the way: BM25's ranking sort had no tie-break,
+  so equal scores ordered by qsort whim -- NFCorpus results wobbled
+  ~0.02 between identical configurations. Ties now break on
+  passage_id; all six re-runs above reproduce exactly.
+- Where this leaves the gap to published BM25: SciFact 0.6353 vs
+  0.665, NFCorpus 0.3061 vs 0.325. The remaining delta is
+  analyzer-level -- Porter stemming (published baselines) vs WordNet
+  lemmatization (ours), stopword list differences, and single-field
+  indexing vs weighted title fields. A Porter-stemmer experiment is
+  the next hygiene candidate; it touches index AND query vocabulary,
+  so it needs re-ingest and its own sweep.
+
 ## 4. The embeddings decision -- from data, not priors
 
 Hybrid retrieval (an embedding model via llama.cpp, an ingest-time

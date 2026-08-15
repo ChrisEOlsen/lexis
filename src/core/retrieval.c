@@ -31,6 +31,19 @@ RetrievalPolicy retrieval_default_policy(void) {
     policy.bm25.b = BM25_DEFAULT_B;
     policy.bm25.coord_bonus = BM25_DEFAULT_COORD_BONUS;
     policy.corpus_stats = NULL;
+
+    /* Experiment overrides for tuning sweeps (see TESTING.md) -- unset
+     * means the shipped defaults above. Kept in the default-policy
+     * constructor, not scattered through callers, so a sweep tunes every
+     * driver (CLI, app, eval) identically. */
+    const char *k1_env = getenv("LEXIS_BM25_K1");
+    const char *b_env = getenv("LEXIS_BM25_B");
+    if (k1_env != NULL && atof(k1_env) > 0.0) {
+        policy.bm25.k1 = atof(k1_env);
+    }
+    if (b_env != NULL && atof(b_env) >= 0.0) {
+        policy.bm25.b = atof(b_env);
+    }
     return policy;
 }
 

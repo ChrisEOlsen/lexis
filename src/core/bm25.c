@@ -340,13 +340,26 @@ int bm25_accumulate_term_scores_weighted(PgStore *store, int64_t term_id, BM25Co
  * truncate or overflow for doubles, giving wrong ordering for close or
  * very large/small scores. */
 static int bm25_compare_score_desc(const void *a, const void *b) {
-    double score_a = ((const BM25ScoredPassage *)a)->score;
-    double score_b = ((const BM25ScoredPassage *)b)->score;
-    if (score_a < score_b) {
+    const BM25ScoredPassage *pa = (const BM25ScoredPassage *)a;
+    const BM25ScoredPassage *pb = (const BM25ScoredPassage *)b;
+    if (pa->score < pb->score) {
         return 1;
     }
-    if (score_a > score_b) {
+    if (pa->score > pb->score) {
         return -1;
+    }
+    /* Tie-break on passage_id so equal scores rank deterministically --
+     * qsort is not stable, and score ties are common on short queries
+     * (measured: NFCorpus nDCG@10 wobbled ~0.02 between identical runs
+     * purely from tie ordering). Ranking is now reproducible for a given
+     * ingest; re-ingesting still reassigns ids across parallel workers,
+     * so cross-ingest tie order (and tie-heavy metrics with it) can
+     * still shift -- see TESTING.md's sweep notes. */
+    if (pa->passage_id < pb->passage_id) {
+        return -1;
+    }
+    if (pa->passage_id > pb->passage_id) {
+        return 1;
     }
     return 0;
 }
