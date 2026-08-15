@@ -1,199 +1,150 @@
-# Testing Strategy
+# TESTING.md -- the LEXIS testing plan
 
-The shelved measurement plan, in execution order. Each step gates the
-next: the point is to make the embeddings decision (step 4) from real
-failure data, not from anecdotes. Written 2026-08-14, right after the
-formulation redesign landed (sense-filtered expansion + weighted BM25 +
-coordination bonus -- see LIMITATIONS.md for the numbers each change
-was verified against). Update this file as steps complete; like
-CURRENT_STATE.md, a stale entry here is a bug.
+Everything about measuring this project, in one place: the harnesses
+that exist, the numbers we have, the run that is queued, and the
+targets. Like CURRENT_STATE.md, a stale entry here is a bug. Rewritten
+2026-08-15 after the four quality fixes landed (reranker, refusal
+retry, learned synonyms, router fix); the old step-by-step plan this
+file used to hold is complete except where listed under "Still to run".
 
-Prerequisites for everything below: `make pg-start`, the model on disk
-(`scripts/download_model.sh`), binaries built (`make lexis`, cmake build
-in `app/`).
+## 1. The harnesses
 
-## 1. The 913-question DelucionQA run -- DONE 2026-08-15
+**Unit/integration suite** -- `make check`. 15 binaries against the
+lexis_test database. Run after every code change; the suite exits on
+the first failing binary. Gotcha learned the hard way: a binary that
+prints "N passed, 0 failed" and then exits nonzero (e.g. a crash in
+process teardown) reads as a failure and silently stops the suite --
+count the binaries if the output looks short.
 
-Ran in 100 minutes (thinking=off), zero crashes. Headline numbers vs
-the Tier 3 targets:
+**Routing check** -- a questions file through `lexis_eval` and read the
+tool column. 12-question set: the router prompt's own examples, the
+formerly-misrouted casual phrasings ("any tips about..."), the "can I
+use X" class, plus CHAT/SUMMARY controls. Re-run whenever
+LEXIS_PROMPT_TOOL_ROUTER_HEAD is reworded, per its own header comment.
 
-- Routing: 99.1% SEARCH (905/913) -- target >=98% MET. The 8
-  non-SEARCH: 6 CHAT misroutes all shaped "can I <use vehicle
-  feature>?" ("how can I adjust the volume?", "can I make a phone call
-  using Uconnect?"), which trips the router's "questions about YOUR
-  capabilities" rule; 2 SUMMARY ("What is the Owner's Manuals?"),
-  arguably defensible. The "can I" pattern is the next router-prompt
-  fix if 0.7% matters.
-- Pipeline failures: 0. Refusal-shaped answers: 19 (2.1%) -- target 0
-  NOT met; these are answerable per the dataset, so each is a
-  retrieval or formulation miss worth reading.
-- Latency: mean 6.6s, median 6.2s, max 23.2s -- target <=10s MET.
-- Coverage: mean 54.8%; 155 answers (17%) under 25% coverage -- the
-  candidate-failure pile. Too many to hand-read; the known limits of
-  lexical coverage (undercounts paraphrase) mean the real failure
-  rate is lower, but certifying the >=93% correctness target needs
-  automated grounding attribution.
+**Starter set (30 questions, ~5 min)** -- the quick end-to-end check:
+`./app/build/lexis_eval 2 <starter_questions> > run.tsv` then
+`scripts/pipeline_eval_score.py`. Real app pipeline: routing, rewrite,
+expansion, reranker, generation, provenance.
 
-ATTRIBUTION DONE (2026-08-15, second run with passages saved --
-lexis_eval column 8 -- scored by scripts/grounding_score.py: gold_sent
-via shingle containment against the dataset's per-question gold
-documents, answer support via a DeBERTa-v3 NLI judge; RAGBench's own
-judge is unpublished, so this is a same-family stand-in, and NLI
-support is conservative for multi-passage synthesis):
+**Full DelucionQA (913 questions, ~2.5-3h)** -- same harness, all
+unique questions, chained with both scorers:
+1. `./app/build/lexis_eval 2 data/eval/delucionqa/questions_913.txt > run.tsv`
+   (column 8 carries the passages the model read)
+2. `scripts/pipeline_eval_score.py <raw> <passages_tsv> run.tsv <stopwords>`
+   -- routing distribution, refusals, latency, lexical coverage
+3. `.venv/bin/python scripts/grounding_score.py <raw> run.tsv <stopwords> <out>`
+   -- gold_sent (did the right passage reach the model; shingle
+   containment vs the dataset's per-question gold documents) and
+   NLI-judged answer support. MUST run on MPS with fixed-length
+   padding (the script does both); CPU/variable padding crawls for
+   hours. ~35 min for the full run.
 
-- gold_sent: 831/905 = 91.8% (target >=95%, just under). The 74
-  misses split 40 total (no gold shingle arrived at all -- vocabulary/
-  pool problem; only document expansion or embeddings reach these) vs
-  34 partial (some gold chunks arrived -- chunk-boundary/ranking/trim
-  territory; a reranker and chunk tuning can reach these).
-- supported answers (NLI >= 0.5): 852/886 = 96.2% -- ~3.8%
-  unsupported-answer rate.
-- The 134 low-coverage answers decompose: 45 retrieval-miss, 89 with
-  gold present -- and of those 89, only THREE are judged unsupported.
-  The other ~86 are coverage-metric artifacts (grounded answers
-  phrased differently than the reference), not failures.
-- Refusals (19): 11 retrieval-miss, 8 gold-arrived-but-refused.
-- Bottom line: genuine failures ~56 retrieval + ~11 generation of 905
-  (~7.4%) -> estimated true correctness ~92-93%, at the Tier 3 target
-  within measurement error. Retrieval outnumbers generation failures
-  ~5:1: retrieval is the bottleneck, generation is nearly solved.
+**BEIR retrieval benchmarks (~15 min both corpora)** -- the
+compare-to-published-numbers harness. `scripts/export_beir.sh <ds> test`
+exports any BeIR/* dataset; swap it into the public schema (truncate +
+`./lexis bulk-ingest`), then `./lexis eval <queries> <qrels>
+[--no-llm-expansion]`. Reports nDCG@10 (linear-gain trec_eval
+convention, matching what BEIR publishes) alongside MRR/Recall.
+Remember to restore the public schema afterward (the 200K MS MARCO
+slice: `head -200000 corpus_csv.tsv`, ~22s to re-ingest).
 
-Ops note for re-runs: run the NLI judge on MPS with fixed-length
-padding (grounding_score.py does both) -- the first attempt ran on CPU
-with variable padding and crawled for 1.5h+; fixed, the full 8,267
-pairs take ~35 min end to end.
+**MS MARCO in-slice eval (70 queries, ~2 min)** -- the fast retrieval
+A/B during development: the dev queries whose gold passage is inside
+the 200K slice. Regenerate the subset with awk from qrels_dev.tsv (see
+memory of past runs or rebuild: filter queries_dev.tsv to query-ids
+whose qrels corpus-id appears in the slice).
 
-### Original run plan (kept for re-runs)
+**Tuning sweeps** -- env knobs, no rebuilds: LEXIS_CHUNK_SIZE /
+LEXIS_CHUNK_OVERLAP (bulk-ingest), LEXIS_BM25_K1 / LEXIS_BM25_B
+(retrieval policy). Findings so far: shipped k1/b 1.2/0.75 won; chunking
+is corpus-dependent (whole-doc helps NFCorpus +0.017, hurts SciFact);
+ranking is deterministic per ingest since the passage_id tie-break.
 
-Every unique DelucionQA question through the real app pipeline
-(QueryWorker: routing -> reformulation -> BM25 -> generation), against
-the re-ingested corpus (id 2, built by `scripts/ingest_group.c` with
-the fixed lemmatizer).
+**Config toggles that change what a run measures**: `thinking=on|off`
+(generation reasoning; off = 3.9x faster, measured quality-neutral on
+the starter set), `reranker_model_path` (present = reranker on;
+comment it out for a no-reranker arm). Both read once per process --
+restart the app/harness after flipping.
 
-```
-# questions file: every unique question, extracted the same way
-# scripts/phase0_run.sh step 1 does (from data/eval/delucionqa/raw/)
-./app/build/lexis_eval 2 <questions_file> > run_913.tsv
-```
+## 2. Current numbers (2026-08-15, BEFORE the four fixes' full run)
 
-Score with `scripts/pipeline_eval_score.py <raw_dir> <passages_tsv>
-run_913.tsv data/stopwords/english.txt` (passages_tsv is a psql dump of
-corpus_2's passages -- see phase0_run.sh step 2 for the exact query).
+913-question baseline (thinking=off, pre-reranker/retry/synonyms):
+- Routing: 99.1% SEARCH (6 CHAT misroutes, all "can I <use feature>")
+- gold_sent: 91.8% -- the 74 misses split 40 vocabulary/pool vs 34
+  partial-arrival (chunk/ranking)
+- Answers supported (NLI >= 0.5): 96.2%
+- Refusals: 19 (11 retrieval, 8 model-refused-with-gold-present)
+- Genuine failures ~7.4%, split ~5:1 retrieval:generation
+- Latency: 6.6s mean
+- Of 134 low-coverage answers, only 3 actually unsupported -- lexical
+  coverage flags paraphrase, treat it as a screen, not a grade.
 
-- Expected duration: ~29s/question x 913 ≈ **7.5 hours** -- genuinely
-  overnight. The 30-question starter subset (already run: 30/30 routed
-  SEARCH, 0 refusals, ~90% correct by reading) took 15 minutes.
-- What to read out of it: the **failure distribution** -- routing
-  misses vs retrieval misses (gold passage never reached the model) vs
-  generation errors (gold passage present, answer still wrong). This
-  distribution is the evidence step 4 consumes.
+Reranker gate (SciFact, plain terms): nDCG@10 0.6353 -> 0.6859,
+Recall@10 0.7508 -> 0.8086. Above published anserini BM25 (0.665), at
+BM25+CE level (0.688), just under ColBERTv2 (0.693).
 
-## 2. Full 8.84M-row MS MARCO ingest
+BEIR standings (pre-reranker): SciFact 0.6395 / NFCorpus 0.2834 with
+expansion. Published anchors: BM25 0.665/0.325, DPR 0.318/0.189, ANCE
+0.507/0.237, TAS-B 0.643/0.319, ColBERTv2 0.693/0.338, BGE-Base
+0.743/0.360.
 
-The corpus export already exists (`scripts/export_msmarco.sh` ->
-`corpus_csv.tsv`); the full ingest has never been run -- the `lexis`
-database's public schema holds a 200K-row slice.
+## 3. QUEUED: the 913 v2 comparison run (waiting for go)
 
-```
-# public schema only -- does NOT touch corpus_* schemas (DelucionQA
-# lives in corpus_2 and survives this untouched)
-psql -h 127.0.0.1 -p 5434 -U lexis -d lexis \
-  -c "TRUNCATE postings, terms, passages RESTART IDENTITY CASCADE;"
-./lexis bulk-ingest corpus_csv.tsv
-```
+One chained command (run it overnight; ~3.5h total): 913 through the
+upgraded pipeline -> coverage scoring -> grounding attribution, all
+artifacts to data/eval/delucionqa/*_v2*. Compare against section 2's
+baseline, number by number:
 
-- Expected duration: **~16 minutes** at the measured post-lemmatizer-fix
-  rate (9,062 passages/sec on this M5).
-- Note: this obsoletes the 70-query in-slice eval subset -- at full
-  corpus, all 6,980 dev queries have their gold passages present, so
-  the full eval below replaces it as the reference measurement.
+| Metric | Baseline | Fix that targets it | Success looks like |
+|---|---|---|---|
+| Routing misroutes | 8 | router prompt fix | <= 2 |
+| gold_sent | 91.8% | reranker (34 partial-arrival misses) + synonyms (40 vocab misses) | >= 95% |
+| Refusals | 19 | refusal retry | <= 8 |
+| Supported answers | 96.2% | (should hold) | >= 96% |
+| Mean latency | 6.6s | reranker adds ~0.5-1s; retry only on refusals | <= 8s |
+| Genuine failure rate | ~7.4% | all four | <= 4-5% |
 
-## 3. Full 6,980-query MS MARCO eval
+Also rerun NFCorpus with the reranker for the second BEIR point, and
+re-verify the routing check file (12/12).
 
-Both configurations, so expansion's value is re-verified at full scale:
+## 4. Still to run (the roadmap tests)
 
-```
-./lexis eval data/eval/msmarco/queries_dev.tsv data/eval/msmarco/qrels_dev.tsv --no-llm-expansion
-./lexis eval data/eval/msmarco/queries_dev.tsv data/eval/msmarco/qrels_dev.tsv
-```
+1. **Full MS MARCO**: 8.84M-row ingest (~16 min; TRUNCATE public schema
+   first -- corpus_* schemas are untouched) then the 6,980-query eval.
+   First number directly comparable to published full-corpus baselines
+   (BM25 MRR@10 ~0.187; dense 0.33+). With the reranker this is also
+   the "lexical+rerank vs dense at scale" datapoint.
+2. **RAGBench published-row lookup**: pull the delucionqa adherence
+   table from the RAGBench paper (arXiv 2407.11005 -- full PDF, the
+   abstract page doesn't carry tables) and put our NLI-judged
+   supported-rate next to their ada-002 pipeline's, with the
+   same-family-judge caveat stated.
+3. **The embeddings/hybrid decision**: gated on the v2 run's remaining
+   vocabulary-miss count. If the synonym table + reranker leave
+   meaning-vs-words failures in low single digits, hybrid retrieval
+   stays unbuilt; if not, the reranker's embedding model is already
+   in-process -- indexing passage embeddings at ingest (cheap,
+   milliseconds per chunk) becomes the next experiment.
 
-- Expected duration: the no-expansion run is minutes; the expansion run
-  makes one LLM call per query -- extrapolating the 70-query timing,
-  on the order of **2-3 hours**.
-- This is the first number directly comparable to published baselines:
-  classical BM25 on MS MARCO dev is MRR@10 ≈ 0.18-0.19. At or above
-  that with expansion ahead of plain = the lexical core is pulling its
-  weight.
+## 5. Targets scoreboard
 
-## Done: BEIR comparison against published retriever scores (2026-08-14)
+Tier 1 -- lexical parity with published BM25: SciFact >= 0.665 (MET
+with reranker: 0.686), NFCorpus >= 0.325 (pending re-run), MS MARCO
+full >= 0.19 (pending).
+Tier 2 -- deployed-RAG parity on retrieval: SciFact >= 0.69 (0.686,
+within noise), NFCorpus >= 0.34 (pending).
+Tier 3 -- the product numbers on DelucionQA: gold_sent >= 95%,
+correctness >= 93%, routing >= 98% (MET), refusals-on-answerable 0,
+mean latency <= 10s (MET).
 
-The "compare against traditional RAG without running a baseline
-locally" measurement: two small BEIR corpora (exported by
-`scripts/export_beir.sh`, scored by `lexis eval`'s nDCG@10 -- linear
-gains, trec_eval convention, matching what BEIR reports through
-pytrec_eval), lined up against published zero-shot nDCG@10 tables.
+## 6. Ops notes
 
-| nDCG@10        | SciFact | NFCorpus |
-|----------------|---------|----------|
-| DPR (dense, 2020)        | 0.318 | 0.189 |
-| ANCE (dense, 2021)       | 0.507 | 0.237 |
-| TAS-B (dense, 2021)      | 0.643 | 0.319 |
-| published BM25 (anserini) | 0.665 | 0.325 |
-| **LEXIS (expansion)**    | **0.6395** | **0.2834** |
-| **LEXIS (plain terms)**  | **0.6354** | **0.2802** |
-| ColBERTv2 (late-int.)    | 0.693 | 0.338 |
-| BGE-Base (modern embed.) | 0.743 | 0.360 |
-
-Reading: LEXIS lands in the classical-BM25 band (0.03-0.04 below
-anserini's tuning -- plausibly chunking 200/40 over whole-doc indexing,
-WordNet lemmatization vs Porter stemming, k1/b defaults), decisively
-above the first-generation dense retrievers, at TAS-B's level on
-SciFact, and 0.05-0.10 below modern embedding models. Expansion is
-mildly positive on both. Run it again after retrieval changes:
-`scripts/export_beir.sh <ds> test` then ingest + eval; ~15 min total
-for both corpora on the M5.
-
-## Done: lexical hygiene sweep (2026-08-15)
-
-Chunking and BM25 k1/b swept on the two BEIR corpora via env knobs
-(LEXIS_CHUNK_SIZE/LEXIS_CHUNK_OVERLAP on `lexis bulk-ingest`,
-LEXIS_BM25_K1/LEXIS_BM25_B on retrieval_default_policy()). Findings:
-
-- k1/b: the shipped 1.2/0.75 beat or tied anserini's 0.9/0.4 on both
-  corpora. No change.
-- Chunking is corpus-dependent: whole-document indexing (huge
-  LEXIS_CHUNK_SIZE) is worth +0.017 nDCG@10 on NFCorpus (0.3061 vs
-  0.2895) and slightly NEGATIVE on SciFact (0.629-0.631 vs 0.6353).
-  The app default stays 200/40 (long documents must chunk under the
-  1500-token trim budget); benchmark corpora with abstract-sized
-  documents should ingest whole-doc via the env knob.
-- Found and fixed along the way: BM25's ranking sort had no tie-break,
-  so equal scores ordered by qsort whim -- NFCorpus results wobbled
-  ~0.02 between identical configurations. Ties now break on
-  passage_id; all six re-runs above reproduce exactly.
-- Where this leaves the gap to published BM25: SciFact 0.6353 vs
-  0.665, NFCorpus 0.3061 vs 0.325. The remaining delta is
-  analyzer-level -- Porter stemming (published baselines) vs WordNet
-  lemmatization (ours), stopword list differences, and single-field
-  indexing vs weighted title fields. A Porter-stemmer experiment is
-  the next hygiene candidate; it touches index AND query vocabulary,
-  so it needs re-ingest and its own sweep.
-
-## 4. The embeddings decision -- from data, not priors
-
-Hybrid retrieval (an embedding model via llama.cpp, an ingest-time
-embedding pass, pgvector or brute-force cosine, score fusion) is the
-only fix for the one failure mechanism nothing above addresses: a query
-term that matches meaning but not words (zero postings for "functions",
-answer passage says "controls"). It is also a substantial subsystem and
-a philosophical break with this project's "no vector embeddings"
-identity -- so it must be justified by the step 1 failure distribution:
-
-- Retrieval misses in low single digits percent -> not justified; the
-  coordination bonus and expansion already cover the proportionate
-  share.
-- Retrieval misses at 10%+ and predominantly meaning-vs-words shaped ->
-  that is the evidence hybrid retrieval needs before it gets built.
-
-Whichever way it goes, record the decision and its evidence in
-LIMITATIONS.md.
+- The public schema holds ONE corpus at a time; benchmark runs swap it.
+  App groups (corpus_* schemas) are never touched by that swap.
+- Model files live in data/models/ (gitignored): gemma-4-E4B chat model
+  (download_model.sh reads lexis.conf) + bge-small-en-v1.5-f16 reranker.
+- The Python venv (.venv, gitignored) serves the judge scripts:
+  transformers/torch/sentencepiece. Judges run on MPS.
+- Long runs: write progress to a FILE you can tail (piping through
+  `tail` buffers everything until the end -- learned twice in one day).
