@@ -89,7 +89,21 @@ expansion. Published anchors: BM25 0.665/0.325, DPR 0.318/0.189, ANCE
 0.507/0.237, TAS-B 0.643/0.319, ColBERTv2 0.693/0.338, BGE-Base
 0.743/0.360.
 
-## 3. QUEUED: the 913 v2 comparison run (waiting for go)
+## 3. DONE 2026-08-16: the 913 v2 comparison run
+
+Results (run 2h11m, thinking=off, all four fixes active):
+misroutes 8 -> 3 (zero CHAT misroutes left; 3 borderline SUMMARY),
+gold_sent 91.8% -> 97.3% (target met), refusals 19 -> 9, supported
+96.2% -> 98.9%, genuine failures ~7.4% -> ~2.7% (20 retrieval + 5
+gold-present refusals of 910). Of 120 low-coverage answers, ZERO are
+unsupported -- all remaining "weak" answers are paraphrase artifacts.
+Vocabulary-miss bucket 40 -> 16: synonyms+reranker recovered over
+half at zero ingest cost, weakening the hybrid-embeddings case (sec.
+4.3) to ~2.2% of questions. Latency 6.6s -> 8.6s mean (reranker +
+thinking-on retries; 0.6s over the 8s target -- acceptable, revisit
+via TODO.md speculative decoding). Artifacts: *_v2 files.
+
+### Original comparison plan (kept for context)
 
 One chained command (run it overnight; ~3.5h total): 913 through the
 upgraded pipeline -> coverage scoring -> grounding attribution, all
