@@ -16,7 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define TEST_CONNINFO "host=127.0.0.1 port=5434 dbname=lexis_test user=lexis password=lexis_dev_only"
+#define TEST_CONNINFO test_conninfo()
 #define STOPWORD_FILE "data/stopwords/english.txt"
 #define WORDNET_DIR "data/wordnet"
 #define TEST_TSV_PATH "build/test_bulk_ingest.tsv"

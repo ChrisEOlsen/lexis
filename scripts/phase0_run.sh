@@ -18,7 +18,10 @@ PG_INC="$($PG_CONFIG --includedir)"
 PG_LIB="$($PG_CONFIG --libdir)"
 LLAMA_DIR=/opt/homebrew/Cellar/llama.cpp/10180
 GGML_DIR=/opt/homebrew/Cellar/ggml/0.18.0
-CONNINFO="host=127.0.0.1 port=5434 dbname=lexis user=lexis password=lexis_dev_only"
+# Connection string comes from the untracked config file (embeds the
+# password -- see config/lexis.conf.example).
+CONNINFO="$(sed -n 's/^db_conninfo[[:space:]]*=[[:space:]]*//p' config/lexis.conf | tail -1)"
+[ -n "$CONNINFO" ] || { echo "set db_conninfo in config/lexis.conf" >&2; exit 1; }
 
 echo "1/4 extracting unique questions"
 python3 - "$EVAL_DIR/raw" "$WORK/questions.txt" <<'PY'
@@ -39,8 +42,7 @@ print(f"    {len(ordered)} unique questions")
 PY
 
 echo "2/4 dumping ingested passages"
-PGPASSWORD=lexis_dev_only /opt/homebrew/opt/postgresql@18/bin/psql \
-  -h 127.0.0.1 -p 5434 -U lexis -d lexis -tAF$'\t' \
+/opt/homebrew/opt/postgresql@18/bin/psql "$CONNINFO" -tAF$'\t' \
   -c "set search_path to corpus_${CORPUS_ID}, public;
       select id, document_name, chunk_id, replace(replace(text, chr(9), ' '), chr(10), ' ') from passages;" \
   > "$WORK/passages.tsv"

@@ -21,6 +21,12 @@ quality on our test sets was the same with it off, so the shipped
 setting is `off`. Only affects final answers -- routing and synonym
 selection never use it.
 
+**`db_conninfo`** -- the PostgreSQL connection string (host, port,
+database, user, password). Required; there is no built-in default,
+because the password belongs on your machine, not in the repo. This is
+why `config/lexis.conf` itself is untracked and only the example file
+is in git.
+
 **`mode`** -- `testing` or `production`. Testing logs every pipeline
 step (prompts, responses, timings) to the database for debugging;
 production skips that logging.

@@ -74,4 +74,13 @@ int config_load_thinking(const char *path);
  * the default; there is no baked-in fallback model path. */
 char *config_load_reranker_model_path(const char *path);
 
+/* Reads the "db_conninfo = <libpq connection string>" line -- where the
+ * index and chat history live. Returns a malloc'd string the caller
+ * owns, or NULL when the line/file is missing. There is deliberately NO
+ * baked-in fallback: the connection string embeds a password, and a
+ * default here would put a working credential back into the public
+ * repo (the exact thing this key exists to remove). Callers fail with
+ * a message pointing at config/lexis.conf. */
+char *config_load_db_conninfo(const char *path);
+
 #endif /* LEXIS_CONFIG_H */

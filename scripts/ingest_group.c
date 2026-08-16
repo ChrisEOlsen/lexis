@@ -22,13 +22,13 @@
 #include <string.h>
 
 #include "bulk_ingest.h"
+#include "config.h"
 #include "ingest.h"
 #include "lemmatizer.h"
 #include "pg_store.h"
 #include "stopwords.h"
 #include "wordnet.h"
 
-#define CONNINFO "host=127.0.0.1 port=5434 dbname=lexis user=lexis password=lexis_dev_only"
 #define MAX_DOCS 256
 
 static int compare_names(const void *a, const void *b) {
@@ -42,6 +42,12 @@ int main(int argc, char **argv) {
     }
     const char *display_name = argv[1];
     const char *dir_path = argv[2];
+
+    char *conninfo = config_load_db_conninfo(LEXIS_CONFIG_PATH_DEFAULT);
+    if (conninfo == NULL) {
+        fprintf(stderr, "no database configured -- set db_conninfo in config/lexis.conf\n");
+        return 1;
+    }
 
     /* Collect *.txt names first, sorted for a deterministic ingest order. */
     DIR *dir = opendir(dir_path);
@@ -84,7 +90,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    PgStore *store = pg_store_open(CONNINFO);
+    PgStore *store = pg_store_open(conninfo);
     if (store == NULL) {
         fprintf(stderr, "cannot connect -- is Postgres running (make pg-start)?\n");
         return 1;
@@ -98,7 +104,7 @@ int main(int argc, char **argv) {
     }
     free(schema_name);
 
-    long total = bulk_ingest_rebuild_corpus(CONNINFO, corpus_id, (const char *const *)names,
+    long total = bulk_ingest_rebuild_corpus(conninfo, corpus_id, (const char *const *)names,
                                             (const char *const *)texts, count, stopwords, wordnet,
                                             lemmatizer, 200, 40, 6);
     if (total < 0) {

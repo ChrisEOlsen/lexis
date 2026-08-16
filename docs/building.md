@@ -25,11 +25,17 @@ any existing Postgres on 5432):
 sed -i '' 's/^#port = 5432/port = 5434/' /opt/homebrew/var/postgresql@18/postgresql.conf
 
 make pg-start
+# choose your own password here...
 /opt/homebrew/opt/postgresql@18/bin/psql -p 5434 -d postgres \
-  -c "CREATE ROLE lexis LOGIN PASSWORD 'lexis_dev_only';"
+  -c "CREATE ROLE lexis LOGIN PASSWORD 'your-password-here';"
 /opt/homebrew/opt/postgresql@18/bin/createdb -p 5434 -O lexis lexis
 /opt/homebrew/opt/postgresql@18/bin/createdb -p 5434 -O lexis lexis_test
 ```
+
+...and put the same password in `config/lexis.conf`'s `db_conninfo`
+line (see the next step). That file stays on your machine -- it is
+never committed. If the test suite should use a different connection,
+set the `LEXIS_TEST_CONNINFO` environment variable.
 
 `make pg-stop` shuts it down. Tables are created automatically on
 first use.

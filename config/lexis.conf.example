@@ -32,3 +32,10 @@ thinking=on
 #   Optional meaning-based reranker: reorders BM25's candidates by
 #   embedding similarity before the trim (see reranker.h). Unset = off.
 reranker_model_path=data/models/bge-small-en-v1.5-f16.gguf
+
+# db_conninfo = <libpq connection string>
+#   Where the index and chat history live. REQUIRED. Use the password
+#   you chose when creating the `lexis` role (docs/building.md). This
+#   example file is tracked in git; your real config/lexis.conf is not,
+#   so the password never enters version control.
+db_conninfo=host=127.0.0.1 port=5434 dbname=lexis user=lexis password=CHANGE_ME

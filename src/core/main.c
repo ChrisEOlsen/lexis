@@ -46,9 +46,13 @@
  * auto-start on login. Separate from, and deliberately never touches,
  * this machine's pre-existing postgresql@14 instance on the default
  * port 5432 (unrelated projects' real data). */
-#define LEXIS_DB_CONNINFO "host=127.0.0.1 port=5434 dbname=lexis user=lexis password=lexis_dev_only"
-/* Display-only label -- never print LEXIS_DB_CONNINFO itself, it embeds
- * the dev password. */
+/* The connection string comes from config/lexis.conf's db_conninfo
+ * (loaded once in main() into g_db_conninfo below) -- it embeds the
+ * database password, which is why that file is untracked and why there
+ * is no hardcoded fallback here. */
+static const char *g_db_conninfo = NULL;
+/* Display-only label -- never print the conninfo itself, it embeds
+ * the password. */
 #define LEXIS_DB_LABEL "127.0.0.1:5434/lexis (native)"
 #define LEXIS_STOPWORDS_PATH "data/stopwords/english.txt"
 #define LEXIS_WORDNET_DIR "data/wordnet"
@@ -109,7 +113,7 @@ static int run_bulk_ingest(const char *tsv_path) {
      * before spawning bulk_ingest_tsv()'s worker threads, rather than
      * having every worker independently discover the database is
      * unreachable. */
-    PgStore *probe_store = pg_store_open(LEXIS_DB_CONNINFO);
+    PgStore *probe_store = pg_store_open(g_db_conninfo);
     if (probe_store == NULL) {
         fprintf(stderr, "lexis: failed to open index at %s\n", LEXIS_DB_LABEL);
         stopword_set_free(stopwords);
@@ -136,7 +140,7 @@ static int run_bulk_ingest(const char *tsv_path) {
     }
 
     clock_gettime(CLOCK_MONOTONIC, &start);
-    long passages = bulk_ingest_tsv(LEXIS_DB_CONNINFO, NULL, stopwords, wordnet, lemmatizer, tsv_path,
+    long passages = bulk_ingest_tsv(g_db_conninfo, NULL, stopwords, wordnet, lemmatizer, tsv_path,
                                      chunk_size, chunk_overlap, LEXIS_INGEST_THREADS);
     clock_gettime(CLOCK_MONOTONIC, &end);
 
@@ -171,7 +175,7 @@ static int run_query(const char *question) {
         return 1;
     }
 
-    PgStore *store = pg_store_open(LEXIS_DB_CONNINFO);
+    PgStore *store = pg_store_open(g_db_conninfo);
     if (store == NULL) {
         fprintf(stderr, "lexis: failed to open index at %s\n", LEXIS_DB_LABEL);
         stopword_set_free(stopwords);
@@ -345,7 +349,7 @@ static int run_eval(const char *queries_path, const char *qrels_path, int use_ll
         return 1;
     }
 
-    PgStore *store = pg_store_open(LEXIS_DB_CONNINFO);
+    PgStore *store = pg_store_open(g_db_conninfo);
     if (store == NULL) {
         fprintf(stderr, "lexis: failed to open index at %s\n", LEXIS_DB_LABEL);
         stopword_set_free(stopwords);
@@ -411,6 +415,15 @@ static int run_eval(const char *queries_path, const char *qrels_path, int use_ll
 int main(int argc, char **argv) {
     if (argc < 3) {
         print_usage(argv[0]);
+        return 1;
+    }
+
+    g_db_conninfo = config_load_db_conninfo(LEXIS_CONFIG_PATH);
+    if (g_db_conninfo == NULL) {
+        fprintf(stderr,
+                "lexis: no database connection configured -- set db_conninfo in %s\n"
+                "(copy config/lexis.conf.example and fill in your password)\n",
+                LEXIS_CONFIG_PATH);
         return 1;
     }
 

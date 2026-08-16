@@ -15,7 +15,7 @@
  * equality. Expected values computed independently via Python's math.log. */
 #define IDF_EPSILON 1e-9
 
-#define TEST_CONNINFO "host=127.0.0.1 port=5434 dbname=lexis_test user=lexis password=lexis_dev_only"
+#define TEST_CONNINFO test_conninfo()
 
 static PgStore *open_fresh_store(void) {
     PgStore *store = pg_store_open(TEST_CONNINFO);

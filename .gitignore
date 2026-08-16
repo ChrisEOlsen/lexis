@@ -50,3 +50,6 @@ venv/
 
 # Internal working notes -- local only, never committed
 /dev/
+
+# Real config embeds the database password -- example file is tracked instead
+/config/lexis.conf

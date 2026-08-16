@@ -26,6 +26,7 @@
 #include <string.h>
 
 #include "bm25.h"
+#include "config.h"
 #include "lemmatizer.h"
 #include "pg_store.h"
 #include "query_formulation.h"
@@ -49,7 +50,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    PgStore *store = pg_store_open("host=127.0.0.1 port=5434 dbname=lexis user=lexis password=lexis_dev_only");
+    char *db_conninfo = config_load_db_conninfo("config/lexis.conf");
+    if (db_conninfo == NULL) {
+        fprintf(stderr, "no database configured -- set db_conninfo in config/lexis.conf\n");
+        return 1;
+    }
+    PgStore *store = pg_store_open(db_conninfo);
     if (store == NULL || pg_store_use_corpus(store, corpus_id) != 0) {
         fprintf(stderr, "cannot open corpus %lld\n", (long long)corpus_id);
         return 1;

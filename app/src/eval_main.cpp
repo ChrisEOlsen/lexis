@@ -49,9 +49,8 @@ extern "C" {
 #include <cstdlib>
 
 namespace {
-// Mirrors AppController's own constants -- see its kConnInfo comment on why
-// the conninfo is never printed.
-const char *kConnInfo = "host=127.0.0.1 port=5434 dbname=lexis user=lexis password=lexis_dev_only";
+// Mirrors AppController's own constants. The conninfo comes from
+// config/lexis.conf and is never printed (embeds the password).
 const char *kStopwordsPath = "data/stopwords/english.txt";
 const char *kWordnetDir = "data/wordnet";
 const char *kConfigPath = "config/lexis.conf";
@@ -96,6 +95,14 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    char *conninfoRaw = config_load_db_conninfo(kConfigPath);
+    if (conninfoRaw == nullptr) {
+        fprintf(stderr, "no database configured -- set db_conninfo in %s\n", kConfigPath);
+        return 1;
+    }
+    const QString connInfo = QString::fromUtf8(conninfoRaw);
+    free(conninfoRaw);
+
     fprintf(stderr, "loading model...\n");
     char *modelPath = config_load_model_path(kConfigPath);
     if (modelPath == nullptr || local_llm_client_init(modelPath) != 0) {
@@ -112,7 +119,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    PgStore *store = pg_store_open(kConnInfo);
+    PgStore *store = pg_store_open(connInfo.toUtf8().constData());
     if (store == nullptr) {
         fprintf(stderr, "cannot connect to the database\n");
         return 1;
@@ -146,7 +153,7 @@ int main(int argc, char *argv[]) {
         QVariantList sources;
         QString tool;
 
-        QueryWorker worker(QString::fromUtf8(kConnInfo), corpusId, sessionId, question, stopwords, wordnet,
+        QueryWorker worker(connInfo, corpusId, sessionId, question, stopwords, wordnet,
                             lemmatizer);
         // DirectConnection: the lambda runs on the worker thread. There is no
         // event loop here to pump a queued connection, and wait() below makes

@@ -10,6 +10,19 @@
 #define LEXIS_TEST_UTILS_H
 
 #include <stdio.h>
+#include <stdlib.h>
+
+/* The lexis_test database connection. The default below is the
+ * conventional local dev setup documented in docs/building.md -- a
+ * localhost-only throwaway database. A machine using its own password
+ * overrides via the LEXIS_TEST_CONNINFO environment variable; nothing
+ * here is a credential for any real data. */
+static inline const char *test_conninfo(void) {
+    const char *env = getenv("LEXIS_TEST_CONNINFO");
+    return (env != NULL && env[0] != '\0')
+               ? env
+               : "host=127.0.0.1 port=5434 dbname=lexis_test user=lexis password=lexis_dev_only";
+}
 #include <string.h>
 
 static int test_utils_run = 0;

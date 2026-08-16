@@ -19,13 +19,11 @@ extern "C" {
 #include <QUrl>
 
 namespace {
-// Mirrors main.c's LEXIS_DB_CONNINFO/LEXIS_STOPWORDS_PATH/LEXIS_WORDNET_DIR/
-// LEXIS_CONFIG_PATH exactly -- see that file's own comment on why the
-// conninfo is never printed (embeds a password). The model path is no
-// longer mirrored here: it comes from config/lexis.conf via
-// config_load_model_path(), same as the CLI. No config UI exists yet
-// for any of the rest to come from anywhere else.
-const char *kConnInfo = "host=127.0.0.1 port=5434 dbname=lexis user=lexis password=lexis_dev_only";
+// Mirrors main.c's LEXIS_STOPWORDS_PATH/LEXIS_WORDNET_DIR/
+// LEXIS_CONFIG_PATH exactly. The database conninfo and the model path
+// come from config/lexis.conf (the conninfo embeds a password, which is
+// why that file is untracked and never printed). No config UI exists
+// yet for the rest to come from anywhere else.
 const char *kStopwordsPath = "data/stopwords/english.txt";
 const char *kWordnetDir = "data/wordnet";
 const char *kConfigPath = "config/lexis.conf";
@@ -38,8 +36,16 @@ AppController::AppController(QObject *parent)
       m_activeQueryWorker(nullptr), m_activeCorpusId(-1), m_activeChatSessionId(-1),
       m_activeChatSessionTitle(tr("New Chat")), m_busy(false), m_statusText(tr("Select a group")),
       m_modelReady(false), m_chatBusy(false), m_stopwords(nullptr), m_wordnet(nullptr), m_lemmatizer(nullptr) {
-    m_engine = std::make_unique<LexisEngine>(QString::fromUtf8(kConnInfo));
-    if (!m_engine->isConnected()) {
+    char *conninfo = config_load_db_conninfo(kConfigPath);
+    if (conninfo != nullptr) {
+        m_connInfo = QString::fromUtf8(conninfo);
+        free(conninfo);
+    }
+    m_engine = std::make_unique<LexisEngine>(m_connInfo);
+    if (m_connInfo.isEmpty()) {
+        emit notify(tr("No database configured. Set db_conninfo in config/lexis.conf "
+                       "(copy config/lexis.conf.example and fill in your password)."));
+    } else if (!m_engine->isConnected()) {
         emit notify(tr("Could not connect to the database. Is Postgres running (make pg-start)?"));
     } else {
         refreshCorpusModel();
@@ -314,7 +320,7 @@ void AppController::ingestFiles(const QStringList &fileUrls) {
     m_statusText = tr("Processing %1 file(s)...").arg(localPaths.size());
     emit statusTextChanged();
 
-    m_activeWorker = new IngestWorker(QString::fromUtf8(kConnInfo), m_activeCorpusId, localPaths, m_stopwords,
+    m_activeWorker = new IngestWorker(m_connInfo, m_activeCorpusId, localPaths, m_stopwords,
                                        m_wordnet, m_lemmatizer, this);
     connect(m_activeWorker, &IngestWorker::ingestFinished, this, &AppController::onIngestFinished);
     connect(m_activeWorker, &QThread::finished, m_activeWorker, &QObject::deleteLater);
@@ -391,7 +397,7 @@ void AppController::sendChatMessage(const QString &question) {
     m_chatBusy = true;
     emit chatBusyChanged();
 
-    m_activeQueryWorker = new QueryWorker(QString::fromUtf8(kConnInfo), m_activeCorpusId, m_activeChatSessionId,
+    m_activeQueryWorker = new QueryWorker(m_connInfo, m_activeCorpusId, m_activeChatSessionId,
                                            question, m_stopwords, m_wordnet, m_lemmatizer, this);
     connect(m_activeQueryWorker, &QueryWorker::queryFinished, this, &AppController::onQueryFinished);
     connect(m_activeQueryWorker, &QThread::finished, m_activeQueryWorker, &QObject::deleteLater);
