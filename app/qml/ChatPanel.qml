@@ -193,10 +193,16 @@ Item {
             spacing: Theme.spacingXS
 
             // Sidebar collapse toggle. Pure UI state owned by Main.qml;
-            // this button only requests the flip.
+            // this button only requests the flip. Fixed square with zero
+            // padding so the glyph sits dead-centre and the left/right
+            // breathing room around the button reads symmetric.
             ToolButton {
                 text: "☰"
-                font.pixelSize: Theme.fontSizeTitle
+                font.pixelSize: 22
+                padding: 0
+                implicitWidth: 38
+                implicitHeight: 38
+                Layout.rightMargin: Theme.spacingXS
                 onClicked: root.sidebarToggleRequested()
                 ToolTip.visible: hovered
                 ToolTip.text: qsTr("Show or hide the sidebar")
@@ -231,19 +237,48 @@ Item {
             }
 
             Button {
-                // Text glyphs, not an icon font -- matches the app's
-                // existing "⋯"/"⌄" usage and needs no bundled assets.
-                text: qsTr("◷  History")
+                id: historyButton
                 flat: true
                 enabled: AppController.activeCorpusId >= 0
                 onClicked: historyDrawer.open()
+                // Custom contentItem so the glyph can be larger than the
+                // label while both stay vertically centred as one row --
+                // a single text string can only render at one size.
+                // Text glyphs, not an icon font: matches the app's
+                // existing "⋯"/"⌄" usage, no bundled assets. Labels take
+                // their default palette colour, which tracks the
+                // button's enabled/disabled state on its own.
+                contentItem: Row {
+                    spacing: Theme.spacingXS
+                    Label {
+                        text: "◷"
+                        font.pixelSize: 18
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                    Label {
+                        text: qsTr("History")
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                }
             }
 
             Button {
-                text: qsTr("✎  New chat")
+                id: newChatButton
                 flat: true
                 enabled: AppController.activeCorpusId >= 0
                 onClicked: AppController.startNewChat()
+                contentItem: Row {
+                    spacing: Theme.spacingXS
+                    Label {
+                        text: "✎"
+                        font.pixelSize: 18
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                    Label {
+                        text: qsTr("New chat")
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                }
             }
         }
 
