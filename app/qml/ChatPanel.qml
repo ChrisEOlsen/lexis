@@ -44,6 +44,10 @@ Item {
     // centers it, the way every chat client does.
     readonly property int columnWidth: 760
 
+    // Emitted by the header's "☰" button; Main.qml owns the actual
+    // collapsed/expanded state.
+    signal sidebarToggleRequested()
+
     property int pendingDeleteSessionId: -1
     property string pendingDeleteTitle: ""
 
@@ -188,6 +192,16 @@ Item {
             Layout.fillWidth: true
             spacing: Theme.spacingXS
 
+            // Sidebar collapse toggle. Pure UI state owned by Main.qml;
+            // this button only requests the flip.
+            ToolButton {
+                text: "☰"
+                font.pixelSize: Theme.fontSizeTitle
+                onClicked: root.sidebarToggleRequested()
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("Show or hide the sidebar")
+            }
+
             ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 0
@@ -217,14 +231,16 @@ Item {
             }
 
             Button {
-                text: qsTr("History")
+                // Text glyphs, not an icon font -- matches the app's
+                // existing "⋯"/"⌄" usage and needs no bundled assets.
+                text: qsTr("◷  History")
                 flat: true
                 enabled: AppController.activeCorpusId >= 0
                 onClicked: historyDrawer.open()
             }
 
             Button {
-                text: qsTr("New chat")
+                text: qsTr("✎  New chat")
                 flat: true
                 enabled: AppController.activeCorpusId >= 0
                 onClicked: AppController.startNewChat()
@@ -385,6 +401,7 @@ Item {
                                     messageDelegate.streamWords.slice(
                                         0, messageDelegate.revealedWordCount).join(" "))
                         wrapMode: Text.WordWrap
+                        font.pixelSize: Theme.fontSizeAnswer
                         color: root.palette.text
                         // Markdown can produce real links. Without this they
                         // render as links and do nothing.

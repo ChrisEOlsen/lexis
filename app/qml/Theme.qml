@@ -49,6 +49,9 @@ QtObject {
     // overriding that is what makes a styled app look subtly wrong.
     readonly property int fontSizeTitle: 20
     readonly property int fontSizeCaption: 12
+    // Assistant answers only -- a notch above the control default so the
+    // content users actually read leads the visual hierarchy.
+    readonly property int fontSizeAnswer: 15
     readonly property int fontWeightBold: Font.DemiBold
 
     // -- Motion --

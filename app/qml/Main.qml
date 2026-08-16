@@ -15,6 +15,17 @@ ApplicationWindow {
     minimumHeight: 560
     title: "LEXIS"
 
+    // Sidebar collapse -- pure UI state, toggled from ChatPanel's header
+    // button. Fully collapsible: the panel animates to zero width and
+    // fades, leaving the whole window to the conversation. The animated
+    // value is this plain property, not the Layout attached property --
+    // Behavior on attached properties is not reliably supported.
+    property bool sidebarCollapsed: false
+    property real sidebarWidth: sidebarCollapsed ? 0 : 260
+    Behavior on sidebarWidth {
+        NumberAnimation { duration: Theme.durationNav; easing.type: Easing.OutCubic }
+    }
+
     // No explicit `color`. ApplicationWindow is one of the controls
     // FluentWinUI3 implements, so the window background is the style's --
     // which is what makes it match the dialogs and popups drawn over it
@@ -59,13 +70,21 @@ ApplicationWindow {
         spacing: Theme.spacingM
 
         GroupSidebar {
-            Layout.preferredWidth: 260
+            Layout.preferredWidth: window.sidebarWidth
             Layout.fillHeight: true
+            // Fade with the width so mid-animation content reads as
+            // sliding away rather than being crushed.
+            opacity: window.sidebarWidth / 260
+            // At width 0 the item (and its 1px border) must not paint,
+            // and it must not eat the RowLayout's spacing either.
+            visible: window.sidebarWidth > 0.5
+            clip: true
         }
 
         ChatPanel {
             Layout.fillWidth: true
             Layout.fillHeight: true
+            onSidebarToggleRequested: window.sidebarCollapsed = !window.sidebarCollapsed
         }
     }
 }
