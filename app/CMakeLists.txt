@@ -205,6 +205,22 @@ target_compile_definitions(lexis_app PRIVATE LEXIS_TESSDATA_PREFIX="${LEXIS_TESS
 target_link_libraries(lexis_app PRIVATE lexis_core Qt6::Quick Qt6::QuickControls2
     PkgConfig::POPPLER_CPP PkgConfig::PUGIXML PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBZIP)
 
+# Extraction verification tool -- the app's format extractors, runnable
+# from the terminal (see extract_main.cpp's own header comment).
+qt_add_executable(lexis_extract
+    src/extract_main.cpp
+    src/DocxExtractor.cpp
+    src/PdfExtractor.cpp
+    src/OcrExtractor.cpp
+)
+target_include_directories(lexis_extract PRIVATE ${PG_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(lexis_extract PRIVATE LEXIS_TESSDATA_PREFIX="${LEXIS_TESSDATA_PREFIX}")
+target_link_libraries(lexis_extract PRIVATE lexis_core Qt6::Core
+    PkgConfig::POPPLER_CPP PkgConfig::PUGIXML PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBZIP)
+set_target_properties(lexis_extract PROPERTIES
+    BUILD_RPATH "${LLAMA_CPP_DIR}/lib;${GGML_DIR}/lib"
+)
+
 # Batch evaluation harness. Links the app's own QueryWorker so a measurement
 # run exercises the exact routing/retrieval/generation code the UI runs --
 # every earlier measurement in this project used a scratch program that
