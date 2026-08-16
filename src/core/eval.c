@@ -11,7 +11,6 @@
 #include "eval.h"
 
 #include "bm25.h"
-#include "query_formulation.h"
 #include "retrieval.h"
 
 #include <math.h>

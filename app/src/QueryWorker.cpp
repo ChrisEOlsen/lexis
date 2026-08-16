@@ -45,17 +45,6 @@ extern "C" {
 #include <vector>
 
 namespace {
-// Retrieval depth/trim policy now lives in bm25.h (LEXIS_SEARCH_*),
-// shared with the CLI's run_query() -- one pipeline, defined once. The
-// measurement history behind the values (depth 12 vs 5/20/30, the token
-// budget vs LOCAL_LLM_N_CTX, the 0.6 floor cutting exactly the flat
-// noise tail) is recorded at the definitions and in SPEED.md. These
-// aliases keep this file's call sites readable.
-constexpr size_t kCandidateCeiling = LEXIS_SEARCH_CANDIDATE_CEILING;
-constexpr size_t kMaxPassages = LEXIS_SEARCH_MAX_PASSAGES;
-constexpr int kTokenBudget = LEXIS_SEARCH_TOKEN_BUDGET;
-constexpr double kScoreFloorRatio = LEXIS_SEARCH_SCORE_FLOOR_RATIO;
-
 // Persisted provenance for one answer: which tool ran, and what it
 // retrieved. Stored as a JSON *object*, not the bare array this used to
 // write, because the tool name is a property of the answer rather than of

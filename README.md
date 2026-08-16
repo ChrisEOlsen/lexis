@@ -1,40 +1,55 @@
-# LEXIS — Lexical Extraction and Inference System
+# LEXIS
 
-A retrieval-augmented AI pipeline that replaces the vector embedding layer of
-traditional RAG with a fast, lexical retrieval core written in C, backed by a
-BM25-scored inverted index and an AI-powered query rewriting step.
+**Purpose: Chat with very large documents completely offline.**
 
-See `LEXIS_Project_Specification.docx` for the full project specification.
+Drop your documents into a group -- manuals, papers, contracts,
+scanned files -- and ask questions in plain language. LEXIS finds the
+right passages and writes a grounded answer, with the sources one
+click away. Nothing leaves your machine: no API keys, no cloud, no
+per-question cost.
 
-## Layout
+## What makes it different
 
-- `src/core/` — C retrieval/indexing core: tokenizer, stopword filter,
-  Postgres-backed inverted index, BM25 scorer, ingestion pipeline, a
-  llama.cpp-backed local LLM client, WordNet synonym/hypernym/hyponym lookup
-- `include/` — public headers for the C core
-- `config/` — pipeline configuration templates
-- `data/` — corpus, WordNet 3.0 database files (committed, real data),
-  stopword lists, generated index
-- `scripts/` — one-time setup scripts (e.g. `download_model.sh`, fetching
-  the local GGUF model)
-- `tests/` — the C test suite (`tests/core/`)
+Most document-chat tools embed everything into vectors and search
+those. LEXIS uses classic full-text search instead -- the same family
+of algorithms behind real search engines -- sharpened with local
+models where they help:
 
-## Build
+- a small model refines your question and picks meaning-appropriate
+  synonyms before searching,
+- a tiny embedding model re-orders the results so the best passage
+  leads,
+- a local chat model writes the answer from those passages and
+  nothing else.
 
-Requires native Postgres running (`make pg-start`) and the local model
-downloaded once via `scripts/download_model.sh`.
+The payoff is a system you can see into. The Source panel shows the
+exact search that ran and the exact passages the answer came from.
+Indexing is pure text processing -- a thousand documents take minutes,
+not hours -- and the index never needs rebuilding when models change.
 
-```
-make check
-```
+## Where it stands
+
+Measured, not estimated (details in [docs/evaluation.md](docs/evaluation.md)):
+
+- On a 913-question benchmark against a 900-page manual: the right
+  passage reaches the model 97% of the time, 99% of answers are
+  faithful to their sources, ~8.6s per answer, all local.
+- On the standard BEIR retrieval benchmark, LEXIS outscores the
+  published BM25 baseline and the embedding retrievers most RAG
+  systems were built on.
+
+## Documentation
+
+- [docs/overview.md](docs/overview.md) -- what LEXIS is and how the pieces fit
+- [docs/pipeline.md](docs/pipeline.md) -- what happens when you ask a question
+- [docs/architecture.md](docs/architecture.md) -- the codebase, module by module
+- [docs/ingestion.md](docs/ingestion.md) -- how documents become searchable
+- [docs/configuration.md](docs/configuration.md) -- settings
+- [docs/building.md](docs/building.md) -- build and run from source
+- [docs/evaluation.md](docs/evaluation.md) -- quality measurement and current numbers
 
 ## Status
 
-Per the spec's build order (section 7): Stages 1-5 are implemented and
-tested — tokenizer, stopword filter, SQLite inverted index, BM25 scorer,
-ingestion pipeline (single documents and whole directories), an OpenRouter
-HTTP client, and a WordNet-backed synonym/hypernym/hyponym lookup table
-built from the real WordNet 3.0 database. Stage 6 (Python sidecar POS
-tagging) is deliberately deferred — see LIMITATIONS.md. Stages 7-9 (query
-formulation wiring, end-to-end integration test, optional reranker) are not
-yet started.
+Working desktop app (macOS, Apple Silicon), built from source today --
+see [docs/building.md](docs/building.md). A packaged one-step install
+is planned.

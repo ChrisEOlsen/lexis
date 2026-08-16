@@ -22,7 +22,6 @@
 #include "lemmatizer.h"
 #include "local_llm_client.h"
 #include "pg_store.h"
-#include "query_formulation.h"
 #include "query_log.h"
 #include "retrieval.h"
 #include "stopwords.h"

@@ -47,3 +47,6 @@ venv/
 # VSCode workspace settings -- same reason as .qmlls.ini above: pins
 # absolute paths to this machine's Homebrew qmlls and build tree.
 /.vscode/
+
+# Internal working notes -- local only, never committed
+/dev/
