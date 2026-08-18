@@ -14,6 +14,7 @@ extern "C" {
 
 #include <cstdlib>
 
+#include <QDirIterator>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -323,11 +324,40 @@ void AppController::ingestFiles(const QStringList &fileUrls) {
     for (const QString &fileUrl : fileUrls) {
         QUrl url(fileUrl);
         QString localPath = url.isLocalFile() ? url.toLocalFile() : fileUrl;
-        if (!localPath.isEmpty()) {
+        if (localPath.isEmpty()) {
+            continue;
+        }
+        if (!QFileInfo(localPath).isDir()) {
+            // A directly-dropped file goes through as-is, whatever its
+            // type -- IngestWorker reports unsupported ones back as
+            // "skipped", which is the right feedback for a deliberate
+            // single-file drop.
             localPaths.append(localPath);
+            continue;
+        }
+        // A dropped folder: walk it recursively and keep only the
+        // types IngestWorker can extract (keep this list in sync with
+        // its suffix dispatch). Everything else is ignored SILENTLY --
+        // a real folder is full of incidental files (.DS_Store,
+        // installers, whatever), and listing them all as "skipped"
+        // would bury the useful part of the completion message.
+        static const QStringList kSupportedSuffixes = {
+            QStringLiteral("txt"),  QStringLiteral("csv"), QStringLiteral("docx"),
+            QStringLiteral("pdf"),  QStringLiteral("png"), QStringLiteral("jpg"),
+            QStringLiteral("jpeg"), QStringLiteral("tiff"), QStringLiteral("tif"),
+            QStringLiteral("bmp")};
+        QDirIterator it(localPath, QDir::Files, QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            const QString filePath = it.next();
+            if (kSupportedSuffixes.contains(QFileInfo(filePath).suffix().toLower())) {
+                localPaths.append(filePath);
+            }
         }
     }
     if (localPaths.isEmpty()) {
+        // Reachable by dropping a folder with nothing usable inside --
+        // silence here would read as the drop not registering at all.
+        emit notify(tr("No supported documents found in the dropped folder."));
         return;
     }
 

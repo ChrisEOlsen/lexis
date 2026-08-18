@@ -108,14 +108,24 @@ Item {
         }
 
         Button {
+            id: newGroupButton
             Layout.fillWidth: true
             Layout.topMargin: Theme.spacingXS
             text: qsTr("+  New Group")
             // highlighted is Fluent's accent (primary action) button.
             highlighted: true
             // White regardless of theme -- the accent fill is dark enough
-            // in both light and dark modes for white to read.
-            palette.buttonText: "white"
+            // in both light and dark modes for white to read. A custom
+            // contentItem, because FluentWinUI3 ignores palette.buttonText
+            // on highlighted buttons (verified: the text stayed black).
+            contentItem: Text {
+                text: newGroupButton.text
+                font: newGroupButton.font
+                color: "white"
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
+            }
             onClicked: {
                 nameField.text = ""
                 newGroupDialog.open()

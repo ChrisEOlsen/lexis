@@ -103,7 +103,10 @@ ApplicationWindow {
     Rectangle {
         anchors.fill: parent
         visible: SetupController.required || SetupController.downloading
-        color: Qt.rgba(0, 0, 0, 0.75)
+        // Opaque black, not a translucent scrim -- the UI underneath is
+        // alive (animations, loading states) and movement bleeding
+        // through the setup screen looks broken.
+        color: "black"
 
         // Swallow clicks so the UI underneath is inert during setup.
         MouseArea {

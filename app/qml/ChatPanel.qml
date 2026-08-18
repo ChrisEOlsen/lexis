@@ -213,7 +213,10 @@ Item {
                 spacing: 0
 
                 Label {
-                    text: AppController.activeCorpusId >= 0 ? AppController.activeCorpusName : qsTr("LEXIS")
+                    // "Select a group", not "LEXIS" -- the window frame
+                    // already says LEXIS, and the app name where the
+                    // group name belongs reads as a broken state.
+                    text: AppController.activeCorpusId >= 0 ? AppController.activeCorpusName : qsTr("Select a group")
                     font.pixelSize: Theme.fontSizeTitle
                     font.weight: Theme.fontWeightBold
                     Layout.fillWidth: true
