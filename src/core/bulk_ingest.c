@@ -24,6 +24,7 @@
 #include "tokenizer.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,6 +77,23 @@ typedef struct {
  * [*start, *end). Returns 0 if a (possibly empty, at the tail) range was
  * claimed, or 1 if the whole table has already been claimed by other
  * workers (nothing left to do). */
+/* See bulk_ingest.h's cancellation contract. Checked at every phase
+ * boundary and per Phase 2 batch, so a cancel lands within one batch's
+ * worth of work rather than after the whole run. */
+static atomic_int g_cancel_requested = 0;
+
+void bulk_ingest_request_cancel(void) {
+    atomic_store(&g_cancel_requested, 1);
+}
+
+void bulk_ingest_clear_cancel(void) {
+    atomic_store(&g_cancel_requested, 0);
+}
+
+static int cancel_requested(void) {
+    return atomic_load(&g_cancel_requested);
+}
+
 static int phase2_claim_batch(Phase2Worker *w, int64_t *start, int64_t *end) {
     pthread_mutex_lock(w->range_mutex);
     if (*w->next_row > w->total_rows) {
@@ -248,7 +266,7 @@ static void *phase2_worker_run(void *arg) {
 
     while (1) {
         int64_t start, end;
-        if (phase2_claim_batch(w, &start, &end) != 0) {
+        if (cancel_requested() || phase2_claim_batch(w, &start, &end) != 0) {
             break;
         }
 
@@ -326,6 +344,12 @@ long bulk_ingest_tsv(const char *conninfo, const char *schema_name, const Stopwo
 
     clock_gettime(CLOCK_MONOTONIC, &phase1_end);
 
+    if (cancel_requested()) {
+        pg_store_drop_staging_tables(coordinator);
+        pg_store_close(coordinator);
+        return BULK_INGEST_CANCELLED;
+    }
+
     /* Phase 2: thread_count workers, each with its own connection,
      * race-free by construction -- see this file's header comment. */
     struct timespec phase2_start, phase2_end;
@@ -380,6 +404,14 @@ long bulk_ingest_tsv(const char *conninfo, const char *schema_name, const Stopwo
     if (any_failed) {
         pg_store_close(coordinator);
         return -1;
+    }
+
+    if (cancel_requested()) {
+        /* Nothing to unwind here beyond the staging tables -- the caller
+         * (or the next run's defensive drop) owns any schema cleanup. */
+        pg_store_drop_staging_tables(coordinator);
+        pg_store_close(coordinator);
+        return BULK_INGEST_CANCELLED;
     }
 
     /* Defer postings' PK/FK constraints and terms/postings' durability
@@ -603,6 +635,13 @@ long bulk_ingest_rebuild_corpus(const char *conninfo, int64_t corpus_id, const c
     remove(csv_path);
     free(csv_path);
 
+    if (total_passages == BULK_INGEST_CANCELLED || cancel_requested()) {
+        fprintf(stderr, "bulk_ingest_rebuild_corpus: cancelled, corpus %lld left untouched\n",
+                (long long)corpus_id);
+        pg_store_drop_bare_schema(coordinator, temp_schema);
+        pg_store_close(coordinator);
+        return BULK_INGEST_CANCELLED;
+    }
     if (total_passages < 0) {
         fprintf(stderr,
                 "bulk_ingest_rebuild_corpus: ingest into the rebuild schema failed, corpus %lld left untouched\n",

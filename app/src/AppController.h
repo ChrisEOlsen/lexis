@@ -151,6 +151,13 @@ public:
     // finishes. A no-op while a load is in flight or already done.
     Q_INVOKABLE void retryModelLoad();
 
+    // Aborts the running ingest (the progress panel's Cancel button).
+    // Lossless: the rebuild happens in a temporary schema that only
+    // replaces the group at the very end, so cancelling leaves the
+    // group exactly as it was before the drop. A no-op when nothing is
+    // ingesting.
+    Q_INVOKABLE void cancelIngest();
+
 signals:
     void activeCorpusIdChanged();
     void activeChatSessionIdChanged();
@@ -166,8 +173,8 @@ signals:
     void notify(QString message);
 
 private slots:
-    void onIngestFinished(bool ok, qint64 totalPassages, QStringList skipped, QStringList malformed,
-                           QStringList noTextFound);
+    void onIngestFinished(bool ok, bool cancelled, qint64 totalPassages, QStringList skipped,
+                           QStringList malformed, QStringList noTextFound);
     void onIngestProgress(int filesDone, int filesTotal, qint64 indexEtaMs);
     void onModelLoadFinished(bool ok);
     void onQueryFinished(bool ok, QString answer, QVariantList sources, QString tool,

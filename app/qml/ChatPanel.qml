@@ -338,6 +338,15 @@ Item {
                 Layout.alignment: Qt.AlignHCenter
             }
 
+            Button {
+                text: qsTr("Cancel")
+                Layout.alignment: Qt.AlignHCenter
+                // Lossless: the rebuild only replaces the group's data at
+                // its very last step, so cancelling leaves the group as it
+                // was before the drop (see AppController::cancelIngest()).
+                onClicked: AppController.cancelIngest()
+            }
+
             Item { Layout.fillHeight: true }
         }
 

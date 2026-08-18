@@ -95,6 +95,12 @@ AppController::~AppController() {
     // local_llm_client_cleanup() while a query is still using the
     // model, out from under a still-running worker would not be.
     if (m_activeWorker != nullptr) {
+        // Quitting mid-ingest: without the cancel this wait() blocked
+        // the UI thread for the rest of a possibly minutes-long ingest
+        // (observed as a beachball needing a force quit). Cancelling
+        // first makes the wait end at the pipeline's next checkpoint --
+        // moments, not minutes -- and is lossless (see cancelIngest()).
+        m_activeWorker->requestCancel();
         m_activeWorker->wait();
     }
     if (m_modelLoader != nullptr) {
@@ -179,6 +185,12 @@ bool AppController::createGroup(const QString &displayName) {
 }
 
 bool AppController::deleteGroup(qint64 corpusId) {
+    if (corpusId == m_ingestingCorpusId) {
+        // Deleting a group whose index is mid-rebuild would race the
+        // rebuild's final schema swap. Cancel first, delete after.
+        emit notify(tr("This group is still ingesting. Cancel the ingestion first, then delete it."));
+        return false;
+    }
     if (!m_engine->deleteCorpus(corpusId)) {
         emit notify(tr("Could not delete group: %1").arg(m_engine->lastError()));
         return false;
@@ -384,6 +396,15 @@ void AppController::ingestFiles(const QStringList &fileUrls) {
     m_activeWorker->start();
 }
 
+void AppController::cancelIngest() {
+    if (m_activeWorker == nullptr) {
+        return;
+    }
+    m_activeWorker->requestCancel();
+    m_ingestStatusText = tr("Cancelling...");
+    emit ingestStateChanged();
+}
+
 void AppController::onIngestProgress(int filesDone, int filesTotal, qint64 indexEtaMs) {
     if (indexEtaMs < 0) {
         // Extraction phase: real per-file progress, scaled into the
@@ -405,8 +426,8 @@ void AppController::onIngestProgress(int filesDone, int filesTotal, qint64 index
     emit ingestStateChanged();
 }
 
-void AppController::onIngestFinished(bool ok, qint64 totalPassages, QStringList skipped, QStringList malformed,
-                                      QStringList noTextFound) {
+void AppController::onIngestFinished(bool ok, bool cancelled, qint64 totalPassages, QStringList skipped,
+                                      QStringList malformed, QStringList noTextFound) {
     m_activeWorker = nullptr; // the object itself is cleaned up by the QThread::finished->deleteLater() connection
     m_busy = false;
     m_statusText = tr("Drag files here to add them to this group.");
@@ -421,6 +442,13 @@ void AppController::onIngestFinished(bool ok, qint64 totalPassages, QStringList 
 
     if (ok && totalPassages > 0) {
         refreshDocumentModel();
+    }
+
+    if (cancelled) {
+        // Nothing landed: the rebuild's temporary schema was dropped and
+        // the group is exactly as it was before the drop.
+        emit notify(tr("Ingestion cancelled. The group was left unchanged."));
+        return;
     }
 
     QStringList messageParts;

@@ -18,14 +18,29 @@ IngestWorker::IngestWorker(QString conninfo, qint64 corpusId, QStringList filePa
       m_stopwords(stopwords), m_wordnet(wordnet), m_lemmatizer(lemmatizer) {
 }
 
+void IngestWorker::requestCancel() {
+    m_cancelRequested.storeRelease(1);
+    // Reaches into whichever bulk_ingest phase is running right now;
+    // harmless if the run is still in extraction.
+    bulk_ingest_request_cancel();
+}
+
 void IngestWorker::run() {
     QVector<QPair<QString, QString>> newDocuments;
     QStringList skipped;
     QStringList malformed;
     QStringList noTextFound;
 
+    // A stale flag from a previously-cancelled run must not abort this
+    // one -- see bulk_ingest.h.
+    bulk_ingest_clear_cancel();
+
     int filesDone = 0;
     for (const QString &path : m_filePaths) {
+        if (m_cancelRequested.loadAcquire()) {
+            emit ingestFinished(true, true, 0, {}, {}, {});
+            return;
+        }
         emit ingestProgress(filesDone++, m_filePaths.size(), -1);
         QFileInfo info(path);
         QString suffix = info.suffix().toLower();
@@ -98,8 +113,12 @@ void IngestWorker::run() {
         }
     }
 
+    if (m_cancelRequested.loadAcquire()) {
+        emit ingestFinished(true, true, 0, {}, {}, {});
+        return;
+    }
     if (newDocuments.isEmpty()) {
-        emit ingestFinished(true, 0, skipped, malformed, noTextFound);
+        emit ingestFinished(true, false, 0, skipped, malformed, noTextFound);
         return;
     }
 
@@ -146,5 +165,10 @@ void IngestWorker::run() {
                                              texts.constData(), static_cast<size_t>(names.size()), m_stopwords,
                                              m_wordnet, m_lemmatizer, kChunkSize, kChunkOverlap, kThreadCount);
 
-    emit ingestFinished(total >= 0, total >= 0 ? static_cast<qint64>(total) : 0, skipped, malformed, noTextFound);
+    if (total == BULK_INGEST_CANCELLED) {
+        emit ingestFinished(true, true, 0, {}, {}, {});
+        return;
+    }
+    emit ingestFinished(total >= 0, false, total >= 0 ? static_cast<qint64>(total) : 0, skipped, malformed,
+                         noTextFound);
 }

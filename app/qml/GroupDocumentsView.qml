@@ -15,7 +15,11 @@ Item {
 
     signal backRequested()
 
-    enabled: !AppController.busy
+    // NOT `enabled: !AppController.busy` on the root. That froze this
+    // whole panel during an ingest -- including the back button, which
+    // is the only way to reach OTHER groups, whose chat is deliberately
+    // still available mid-ingest. Only the controls that would start a
+    // second ingest are gated, individually, below.
 
     ColumnLayout {
         anchors.fill: parent
@@ -97,7 +101,7 @@ Item {
 
             DropArea {
                 anchors.fill: parent
-                enabled: AppController.activeCorpusId >= 0
+                enabled: AppController.activeCorpusId >= 0 && !AppController.busy
                 onDropped: function (drop) {
                     AppController.ingestFiles(drop.urls)
                 }
@@ -130,6 +134,7 @@ Item {
             Layout.topMargin: Theme.spacingXS
             text: qsTr("+  Add Documents")
             highlighted: true
+            enabled: !AppController.busy
             contentItem: Text {
                 text: addDocumentsButton.text
                 font: addDocumentsButton.font
@@ -151,6 +156,7 @@ Item {
             Layout.topMargin: Theme.spacingXS
             text: qsTr("+  Add Folder")
             highlighted: true
+            enabled: !AppController.busy
             contentItem: Text {
                 text: addFolderButton.text
                 font: addFolderButton.font

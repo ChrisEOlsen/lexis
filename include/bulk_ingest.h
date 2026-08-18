@@ -38,6 +38,24 @@
 #include "stopwords.h"
 #include "wordnet.h"
 
+/* Cooperative cancellation, for a UI that lets the user abort a
+ * long-running ingest. One process-wide flag (only one ingest runs at
+ * a time by both callers' design): the UI thread calls
+ * bulk_ingest_request_cancel(), the pipeline checks the flag at its
+ * phase boundaries and inside Phase 2's batch loop, and a cancelled
+ * run returns BULK_INGEST_CANCELLED. bulk_ingest_rebuild_corpus()
+ * makes cancellation lossless: the rebuild happens in a temporary
+ * schema that only replaces the live corpus at the final swap, so a
+ * cancelled rebuild drops the temporary schema and the corpus is
+ * exactly as it was.
+ *
+ * Callers must bulk_ingest_clear_cancel() before starting a run -- a
+ * stale flag from a previously-cancelled run would abort the new one
+ * immediately. */
+#define BULK_INGEST_CANCELLED (-2)
+void bulk_ingest_request_cancel(void);
+void bulk_ingest_clear_cancel(void);
+
 /* Ingests every row of the file at `tsv_path` (one "<id><TAB><text>" row
  * per line, no header, CSV-quoted per RFC4180 -- see pg_store.h's
  * pg_store_copy_documents_raw() for why plain unquoted TSV isn't safe:

@@ -22,6 +22,7 @@
 #ifndef LEXIS_APP_INGESTWORKER_H
 #define LEXIS_APP_INGESTWORKER_H
 
+#include <QAtomicInt>
 #include <QString>
 #include <QStringList>
 #include <QThread>
@@ -39,15 +40,24 @@ public:
     IngestWorker(QString conninfo, qint64 corpusId, QStringList filePaths, const StopwordSet *stopwords,
                  const WordNetTable *wordnet, const Lemmatizer *lemmatizer, QObject *parent = nullptr);
 
+    // Cooperative cancel, callable from the UI thread while run() is on
+    // its own. Extraction stops between files; the database rebuild
+    // stops at its next internal checkpoint (see bulk_ingest.h) and
+    // drops its temporary schema, so the group's live data is exactly
+    // as it was before the ingest started. The result arrives as
+    // ingestFinished(cancelled = true).
+    void requestCancel();
+
 signals:
     // Named ingestFinished, not finished -- QThread already has its own
     // finished() signal (no args, emitted when run() returns); reusing
     // that name here would shadow it. totalPassages is meaningless when
     // ok is false. skipped/malformed/noTextFound categorize every input
     // file that didn't turn into a document -- see run()'s own comment
-    // for what lands in which list.
-    void ingestFinished(bool ok, qint64 totalPassages, QStringList skipped, QStringList malformed,
-                         QStringList noTextFound);
+    // for what lands in which list. cancelled = the user aborted; ok is
+    // true in that case (nothing failed) and the corpus is unchanged.
+    void ingestFinished(bool ok, bool cancelled, qint64 totalPassages, QStringList skipped,
+                         QStringList malformed, QStringList noTextFound);
 
     // Progress for the two phases of an ingest. During extraction,
     // filesDone/filesTotal advance and indexEtaMs is -1. When the
@@ -62,6 +72,7 @@ protected:
     void run() override;
 
 private:
+    QAtomicInt m_cancelRequested;
     QString m_conninfo;
     qint64 m_corpusId;
     QStringList m_filePaths;
