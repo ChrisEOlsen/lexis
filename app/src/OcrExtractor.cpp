@@ -1,5 +1,7 @@
 #include "OcrExtractor.h"
 
+#include <cstdlib>
+
 #include <allheaders.h>
 #include <tesseract/baseapi.h>
 
@@ -17,7 +19,10 @@ QString extractTextFromImage(const QString &path, QString *errorOut) {
     }
 
     tesseract::TessBaseAPI api;
-    if (api.Init(LEXIS_TESSDATA_PREFIX, "eng") != 0) {
+    // Runtime override for the installed app bundle (set by main.cpp);
+    // the compile-time Homebrew path serves the dev build.
+    const char *tessdata = getenv("LEXIS_TESSDATA_DIR");
+    if (api.Init(tessdata != nullptr ? tessdata : LEXIS_TESSDATA_PREFIX, "eng") != 0) {
         pixDestroy(&image);
         if (errorOut != nullptr) {
             *errorOut = QStringLiteral("Could not initialize the OCR engine.");

@@ -5,6 +5,8 @@
 /build/
 /lexis
 /app/build/
+/app/build-release/
+/dist/
 
 # Generated index (rebuilt from data/corpus via ingest)
 /data/index/*

@@ -129,6 +129,12 @@ public:
     // the answer once QueryWorker finishes.
     Q_INVOKABLE void sendChatMessage(const QString &question);
 
+    // Starts the background model load if it never ran -- the
+    // constructor skips it when the model file doesn't exist yet (fresh
+    // install), and the setup overlay calls this once the download
+    // finishes. A no-op while a load is in flight or already done.
+    Q_INVOKABLE void retryModelLoad();
+
 signals:
     void activeCorpusIdChanged();
     void activeChatSessionIdChanged();

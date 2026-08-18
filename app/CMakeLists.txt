@@ -47,8 +47,14 @@ set(CMAKE_PREFIX_PATH "/opt/homebrew/opt/qtbase" "/opt/homebrew/opt/qtdeclarativ
 set(Qt6Quick_DIR "/opt/homebrew/opt/qtdeclarative/lib/cmake/Qt6Quick")
 set(Qt6QuickControls2_DIR "/opt/homebrew/opt/qtdeclarative/lib/cmake/Qt6QuickControls2")
 
-find_package(Qt6 REQUIRED COMPONENTS Quick QuickControls2)
-qt_standard_project_setup()
+find_package(Qt6 REQUIRED COMPONENTS Quick QuickControls2 Network)
+# REQUIRES 6.5 opts into the modern Qt CMake policies -- the one that
+# matters here is QTP0001: the QML module's resources embed under
+# ":/qt/qml", the prefix the engine actually searches. Without it the
+# dev build only worked because the loose Lexis/ module dir sits next
+# to the binary in the build tree; an installed .app has no such dir
+# and "Module Lexis contains no type Main" was the result.
+qt_standard_project_setup(REQUIRES 6.5)
 
 # Format-extraction adapters (see ../APP_SPEC.md's "Document ingestion"
 # section): poppler-cpp for PDF, pugixml + libzip for an in-house DOCX
@@ -68,6 +74,7 @@ set(LEXIS_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 # Mirrors the top-level Makefile's CORE_SRCS exactly -- see this file's
 # header comment.
 set(LEXIS_CORE_SRCS
+    ${LEXIS_ROOT}/src/core/paths.c
     ${LEXIS_ROOT}/src/core/tokenizer.c
     ${LEXIS_ROOT}/src/core/stopwords.c
     ${LEXIS_ROOT}/src/core/pg_store.c
@@ -139,7 +146,24 @@ target_include_directories(lexis_core PRIVATE
 target_link_directories(lexis_core PUBLIC ${PG_LIB_DIR} ${LLAMA_CPP_DIR}/lib ${GGML_DIR}/lib)
 target_link_libraries(lexis_core PUBLIC pq llama ggml ggml-base pthread)
 
+# OFF (the default) builds lexis_app as a plain binary run from the
+# repo root, exactly as development has always worked. ON builds a
+# LEXIS.app bundle for scripts/package_app.sh to fill with data files,
+# models config, and the bundled Postgres -- nothing but the output
+# shape changes.
+option(LEXIS_BUNDLE "Build lexis_app as a macOS .app bundle for packaging" OFF)
+
 qt_add_executable(lexis_app src/main.cpp)
+if(LEXIS_BUNDLE)
+    set_target_properties(lexis_app PROPERTIES
+        MACOSX_BUNDLE TRUE
+        OUTPUT_NAME "LEXIS"
+        MACOSX_BUNDLE_BUNDLE_NAME "LEXIS"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "app.lexis.desktop"
+        MACOSX_BUNDLE_BUNDLE_VERSION "1.0"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
+    )
+endif()
 
 # QML module: registers AppController/CorpusListModel/DocumentListModel
 # (QML_ELEMENT-tagged) for `import Lexis` and compiles qml/*.qml into
@@ -194,6 +218,12 @@ qt_add_qml_module(lexis_app
         src/PdfExtractor.cpp
         src/OcrExtractor.h
         src/OcrExtractor.cpp
+        src/AppEnvironment.h
+        src/AppEnvironment.cpp
+        src/PostgresManager.h
+        src/PostgresManager.cpp
+        src/SetupController.h
+        src/SetupController.cpp
 )
 # qt_add_qml_module()'s generated type-registration file includes its
 # QML_ELEMENT headers via angle brackets (<AppController.h>, guarded by
@@ -202,7 +232,7 @@ qt_add_qml_module(lexis_app
 # the generated file fails to compile with "undeclared identifier".
 target_include_directories(lexis_app PRIVATE ${PG_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(lexis_app PRIVATE LEXIS_TESSDATA_PREFIX="${LEXIS_TESSDATA_PREFIX}")
-target_link_libraries(lexis_app PRIVATE lexis_core Qt6::Quick Qt6::QuickControls2
+target_link_libraries(lexis_app PRIVATE lexis_core Qt6::Quick Qt6::QuickControls2 Qt6::Network
     PkgConfig::POPPLER_CPP PkgConfig::PUGIXML PkgConfig::TESSERACT PkgConfig::LEPTONICA PkgConfig::LIBZIP)
 
 # Extraction verification tool -- the app's format extractors, runnable

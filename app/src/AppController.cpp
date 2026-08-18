@@ -9,24 +9,25 @@
 extern "C" {
 #include "config.h"
 #include "local_llm_client.h"
+#include "paths.h"
 }
 
 #include <cstdlib>
 
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QUrl>
 
 namespace {
-// Mirrors main.c's LEXIS_STOPWORDS_PATH/LEXIS_WORDNET_DIR/
-// LEXIS_CONFIG_PATH exactly. The database conninfo and the model path
-// come from config/lexis.conf (the conninfo embeds a password, which is
-// why that file is untracked and never printed). No config UI exists
-// yet for the rest to come from anywhere else.
-const char *kStopwordsPath = "data/stopwords/english.txt";
-const char *kWordnetDir = "data/wordnet";
-const char *kConfigPath = "config/lexis.conf";
+// Every path goes through the C core's paths module: relative to the
+// working directory in a dev build (the historical behavior), absolute
+// into the .app bundle's Resources / Application Support once main.cpp
+// has called lexis_paths_set(). The conninfo and model path come from
+// the config file either way.
+const char *kStopwordsRelPath = "data/stopwords/english.txt";
+const char *kWordnetRelDir = "data/wordnet";
 } // namespace
 
 AppController::AppController(QObject *parent)
@@ -36,7 +37,7 @@ AppController::AppController(QObject *parent)
       m_activeQueryWorker(nullptr), m_activeCorpusId(-1), m_activeChatSessionId(-1),
       m_activeChatSessionTitle(tr("New Chat")), m_busy(false), m_statusText(tr("Select a group")),
       m_modelReady(false), m_chatBusy(false), m_stopwords(nullptr), m_wordnet(nullptr), m_lemmatizer(nullptr) {
-    char *conninfo = config_load_db_conninfo(kConfigPath);
+    char *conninfo = config_load_db_conninfo(lexis_paths_config_file());
     if (conninfo != nullptr) {
         m_connInfo = QString::fromUtf8(conninfo);
         free(conninfo);
@@ -51,9 +52,13 @@ AppController::AppController(QObject *parent)
         refreshCorpusModel();
     }
 
-    m_stopwords = stopword_set_load(kStopwordsPath);
-    m_wordnet = wordnet_table_load(kWordnetDir);
-    m_lemmatizer = lemmatizer_load(kWordnetDir);
+    char *stopwordsPath = lexis_paths_resource(kStopwordsRelPath);
+    char *wordnetDir = lexis_paths_resource(kWordnetRelDir);
+    m_stopwords = stopwordsPath != nullptr ? stopword_set_load(stopwordsPath) : nullptr;
+    m_wordnet = wordnetDir != nullptr ? wordnet_table_load(wordnetDir) : nullptr;
+    m_lemmatizer = wordnetDir != nullptr ? lemmatizer_load(wordnetDir) : nullptr;
+    free(stopwordsPath);
+    free(wordnetDir);
     if (m_stopwords == nullptr || m_wordnet == nullptr || m_lemmatizer == nullptr) {
         emit notify(tr("Could not load language data from data/stopwords or data/wordnet."));
     }
@@ -61,10 +66,21 @@ AppController::AppController(QObject *parent)
     // Kicked off immediately, not deferred to first chat use -- see
     // ModelLoader.h's own comment on why (~9-19s load time overlapping
     // with whatever the user does first, instead of stalling their
-    // first question).
-    char *modelPath = config_load_model_path(kConfigPath);
+    // first question). Skipped quietly when the model file isn't there
+    // yet -- that is the fresh-install state the setup overlay handles;
+    // it calls retryModelLoad() when the download lands.
+    char *modelPath = config_load_model_path(lexis_paths_config_file());
     m_modelPath = QString::fromUtf8(modelPath);
     free(modelPath);
+    if (QFileInfo::exists(m_modelPath)) {
+        retryModelLoad();
+    }
+}
+
+void AppController::retryModelLoad() {
+    if (m_modelReady || m_modelLoader != nullptr) {
+        return;
+    }
     m_modelLoader = new ModelLoader(m_modelPath, this);
     connect(m_modelLoader, &ModelLoader::modelLoadFinished, this, &AppController::onModelLoadFinished);
     connect(m_modelLoader, &QThread::finished, m_modelLoader, &QObject::deleteLater);

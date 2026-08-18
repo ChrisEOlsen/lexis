@@ -4,6 +4,14 @@
 #include <QQuickStyle>
 #include <QStyleHints>
 
+#include "AppEnvironment.h"
+#include "PostgresManager.h"
+#include "SetupController.h"
+
+extern "C" {
+#include "paths.h"
+}
+
 int main(int argc, char *argv[]) {
     // Deliberately NOT forcing QSG_RENDER_LOOP=basic. That was added as
     // a diagnostic while chasing hover/animation flicker and a popup
@@ -17,6 +25,41 @@ int main(int argc, char *argv[]) {
     // does the drawing, so any main-thread work stalls them mid-flight,
     // which produces exactly the stutter it was meant to diagnose.
     QGuiApplication app(argc, argv);
+    // Names ~/Library/Application Support/LEXIS (via QStandardPaths) --
+    // must be set before AppEnvironment::detect() asks for it. No
+    // organization name on purpose: QStandardPaths on macOS appends
+    // BOTH names, which would nest the directory as LEXIS/LEXIS.
+    QCoreApplication::setApplicationName("LEXIS");
+
+    // Installed .app bundle vs. dev build tree. In a bundle: point the
+    // C core at Resources/ (read-only data) and Application Support
+    // (config, models), then run the private bundled Postgres as a
+    // child process. In a dev tree every branch below is skipped and
+    // behavior is exactly what it always was.
+    //
+    // pgManager is a stack object declared BEFORE the QML engine on
+    // purpose: C++ destroys in reverse order, so the engine (and with
+    // it AppController's open database connections) goes down first,
+    // then pgManager's destructor stops the server.
+    const AppEnvironment env = AppEnvironment::detect();
+    PostgresManager pgManager;
+    QString envError;
+    if (env.bundleMode) {
+        lexis_paths_set(env.resourcesDir.toUtf8().constData(), env.configFile.toUtf8().constData());
+        // OcrExtractor reads this instead of the compile-time Homebrew
+        // tessdata path.
+        qputenv("LEXIS_TESSDATA_DIR", (env.resourcesDir + "/tessdata").toUtf8());
+        if (env.ensureSupportLayout(&envError)) {
+            pgManager.configure(env.pgBinDir, env.pgDataDir, env.pgSocketDir);
+            pgManager.ensureStarted(&envError);
+        }
+        if (!envError.isEmpty()) {
+            // Continue anyway: AppController's own connection check will
+            // surface a dialog, and this detail lands in the log.
+            qCritical("LEXIS startup: %s", qUtf8Printable(envError));
+        }
+    }
+    SetupController::configure(env.bundleMode);
 
     // FluentWinUI3 rather than Basic. Basic supplies no design language
     // of its own -- it is a customization substrate -- so every control
