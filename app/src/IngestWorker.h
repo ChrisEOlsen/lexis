@@ -49,6 +49,15 @@ signals:
     void ingestFinished(bool ok, qint64 totalPassages, QStringList skipped, QStringList malformed,
                          QStringList noTextFound);
 
+    // Progress for the two phases of an ingest. During extraction,
+    // filesDone/filesTotal advance and indexEtaMs is -1. When the
+    // database rebuild starts, one final emission carries indexEtaMs: a
+    // rough estimate of how long the rebuild will take (from the text
+    // volume and the measured passages/sec rate) -- rough because the
+    // rebuild is one C call with no progress hooks, so the UI animates
+    // through the estimate rather than tracking real progress.
+    void ingestProgress(int filesDone, int filesTotal, qint64 indexEtaMs);
+
 protected:
     void run() override;
 

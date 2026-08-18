@@ -24,7 +24,9 @@ void IngestWorker::run() {
     QStringList malformed;
     QStringList noTextFound;
 
+    int filesDone = 0;
     for (const QString &path : m_filePaths) {
+        emit ingestProgress(filesDone++, m_filePaths.size(), -1);
         QFileInfo info(path);
         QString suffix = info.suffix().toLower();
 
@@ -125,10 +127,20 @@ void IngestWorker::run() {
     QVector<const char *> texts;
     names.reserve(nameBytes.size());
     texts.reserve(textBytes.size());
+    qint64 totalTextBytes = 0;
     for (int i = 0; i < nameBytes.size(); i++) {
         names.append(nameBytes[i].constData());
         texts.append(textBytes[i].constData());
+        totalTextBytes += textBytes[i].size();
     }
+
+    // Rebuild-duration estimate for the progress display: ~6 bytes per
+    // English word, a 160-word stride per passage (chunk 200, overlap
+    // 40), and the measured ~3500 passages/sec ingest rate on this
+    // machine class. Order-of-magnitude honest, not precise.
+    const qint64 estimatedPassages = totalTextBytes / (6 * 160);
+    const qint64 indexEtaMs = qMax<qint64>(1000, estimatedPassages * 1000 / 3500);
+    emit ingestProgress(m_filePaths.size(), m_filePaths.size(), indexEtaMs);
 
     long total = bulk_ingest_rebuild_corpus(m_conninfo.toUtf8().constData(), m_corpusId, names.constData(),
                                              texts.constData(), static_cast<size_t>(names.size()), m_stopwords,

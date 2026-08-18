@@ -366,11 +366,43 @@ void AppController::ingestFiles(const QStringList &fileUrls) {
     m_statusText = tr("Processing %1 file(s)...").arg(localPaths.size());
     emit statusTextChanged();
 
+    // Chat with THIS group is blocked until the ingest lands (the group
+    // is mid-rebuild; answers would come from a half-built index --
+    // observed: "there are no documents" while 33K documents were being
+    // ingested). Every other group stays fully usable meanwhile.
+    m_ingestingCorpusId = m_activeCorpusId;
+    m_ingestProgress = 0.0;
+    m_ingestAnimMs = 0;
+    m_ingestStatusText = tr("Preparing...");
+    emit ingestStateChanged();
+
     m_activeWorker = new IngestWorker(m_connInfo, m_activeCorpusId, localPaths, m_stopwords,
                                        m_wordnet, m_lemmatizer, this);
     connect(m_activeWorker, &IngestWorker::ingestFinished, this, &AppController::onIngestFinished);
+    connect(m_activeWorker, &IngestWorker::ingestProgress, this, &AppController::onIngestProgress);
     connect(m_activeWorker, &QThread::finished, m_activeWorker, &QObject::deleteLater);
     m_activeWorker->start();
+}
+
+void AppController::onIngestProgress(int filesDone, int filesTotal, qint64 indexEtaMs) {
+    if (indexEtaMs < 0) {
+        // Extraction phase: real per-file progress, scaled into the
+        // first 60% of the bar (the index rebuild owns the rest).
+        m_ingestProgress = filesTotal > 0 ? 0.6 * double(filesDone) / double(filesTotal) : 0.0;
+        m_ingestAnimMs = 250;
+        m_ingestStatusText = tr("Reading documents (%1 of %2)...").arg(filesDone).arg(filesTotal);
+    } else {
+        // Index rebuild: one C call with no progress hooks. The bar's
+        // target jumps to near-done and QML animates there over the
+        // estimated duration -- honest movement, estimated pace.
+        m_ingestProgress = 0.97;
+        m_ingestAnimMs = int(qMin<qint64>(indexEtaMs, 30 * 60 * 1000));
+        const qint64 seconds = indexEtaMs / 1000;
+        m_ingestStatusText =
+            seconds < 90 ? tr("Building the search index (about %1 seconds)...").arg(qMax<qint64>(seconds, 5))
+                         : tr("Building the search index (about %1 minutes)...").arg((seconds + 30) / 60);
+    }
+    emit ingestStateChanged();
 }
 
 void AppController::onIngestFinished(bool ok, qint64 totalPassages, QStringList skipped, QStringList malformed,
@@ -380,6 +412,12 @@ void AppController::onIngestFinished(bool ok, qint64 totalPassages, QStringList 
     m_statusText = tr("Drag files here to add them to this group.");
     emit busyChanged();
     emit statusTextChanged();
+
+    m_ingestingCorpusId = -1;
+    m_ingestProgress = 0.0;
+    m_ingestAnimMs = 0;
+    m_ingestStatusText.clear();
+    emit ingestStateChanged();
 
     if (ok && totalPassages > 0) {
         refreshDocumentModel();
@@ -413,6 +451,13 @@ void AppController::sendChatMessage(const QString &question) {
         // previous query is still running (only one at a time --
         // local_llm_chat_completion() has no concurrency support of its
         // own, see QueryWorker.h), or an empty/whitespace-only message.
+        return;
+    }
+    if (m_activeCorpusId == m_ingestingCorpusId) {
+        // This group's index is mid-rebuild; an answer now would come
+        // from a half-built (or momentarily empty) corpus. ChatPanel
+        // already swaps the chat for a progress panel -- this guard is
+        // the backstop in case a message slips through anyway.
         return;
     }
 

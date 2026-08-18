@@ -44,6 +44,13 @@ Item {
     // centers it, the way every chat client does.
     readonly property int columnWidth: 760
 
+    // Whether the group being VIEWED is the one currently ingesting.
+    // Chat is replaced by the progress panel below for exactly that
+    // group; switching to any other group brings the normal chat back
+    // immediately, mid-ingest.
+    readonly property bool groupIngesting: AppController.activeCorpusId >= 0
+                                           && AppController.activeCorpusId === AppController.ingestingCorpusId
+
     // Emitted by the header's "☰" button; Main.qml owns the actual
     // collapsed/expanded state.
     signal sidebarToggleRequested()
@@ -285,9 +292,59 @@ Item {
             }
         }
 
+        // -- Ingestion in progress (replaces the conversation for the
+        // one group currently ingesting) --
+        ColumnLayout {
+            visible: root.groupIngesting
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            spacing: Theme.spacingL
+
+            Item { Layout.fillHeight: true }
+
+            Label {
+                text: qsTr("Ingestion in progress")
+                font.pixelSize: Theme.fontSizeTitle
+                font.weight: Theme.fontWeightBold
+                Layout.alignment: Qt.AlignHCenter
+            }
+
+            Label {
+                text: AppController.ingestStatusText
+                color: root.palette.placeholderText
+                Layout.alignment: Qt.AlignHCenter
+            }
+
+            ProgressBar {
+                Layout.preferredWidth: Math.min(420, root.width - 2 * Theme.spacingXL)
+                Layout.alignment: Qt.AlignHCenter
+                value: AppController.ingestProgress
+                // The animation duration comes from C++: short real steps
+                // while files are read, then one long glide through the
+                // index rebuild's estimated duration (the rebuild itself
+                // reports no progress -- see IngestWorker.h).
+                Behavior on value {
+                    NumberAnimation {
+                        duration: AppController.ingestAnimMs
+                        easing.type: Easing.OutQuad
+                    }
+                }
+            }
+
+            Label {
+                text: qsTr("You can chat with other groups while this finishes.")
+                color: root.palette.placeholderText
+                font.pixelSize: Theme.fontSizeCaption
+                Layout.alignment: Qt.AlignHCenter
+            }
+
+            Item { Layout.fillHeight: true }
+        }
+
         // -- Conversation --
         ListView {
             id: messageList
+            visible: !root.groupIngesting
             Layout.fillWidth: true
             Layout.fillHeight: true
             Layout.topMargin: Theme.spacingS
@@ -514,6 +571,7 @@ Item {
         // Basic's TextField had no design of its own; Fluent's has a
         // proper resting state, focus underline, and disabled state.
         Item {
+            visible: !root.groupIngesting
             Layout.fillWidth: true
             Layout.topMargin: Theme.spacingXS
             implicitHeight: composerRow.implicitHeight

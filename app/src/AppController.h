@@ -54,6 +54,18 @@ class AppController : public QObject {
     Q_PROPERTY(QString activeCorpusName READ activeCorpusName NOTIFY activeCorpusIdChanged)
     Q_PROPERTY(bool busy READ isBusy NOTIFY busyChanged)
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusTextChanged)
+    // The one group currently ingesting (-1 = none). Chat is blocked for
+    // this group only -- ChatPanel swaps in an "ingestion in progress"
+    // panel when it is the active group; every other group stays fully
+    // usable, including chat, while the ingest runs in the background.
+    Q_PROPERTY(qint64 ingestingCorpusId READ ingestingCorpusId NOTIFY ingestStateChanged)
+    // 0..1 target for the progress bar. Real during extraction; when the
+    // index rebuild starts (one C call, no progress hooks) it jumps to
+    // near-complete and ingestAnimMs carries the estimated rebuild time,
+    // so QML animates through the estimate instead of freezing.
+    Q_PROPERTY(double ingestProgress READ ingestProgress NOTIFY ingestStateChanged)
+    Q_PROPERTY(int ingestAnimMs READ ingestAnimMs NOTIFY ingestStateChanged)
+    Q_PROPERTY(QString ingestStatusText READ ingestStatusText NOTIFY ingestStateChanged)
     Q_PROPERTY(CorpusListModel *corpusModel READ corpusModel CONSTANT)
     Q_PROPERTY(DocumentListModel *documentModel READ documentModel CONSTANT)
     Q_PROPERTY(ChatMessageListModel *chatModel READ chatModel CONSTANT)
@@ -78,6 +90,10 @@ public:
     QString activeCorpusName() const;
     bool isBusy() const;
     QString statusText() const;
+    qint64 ingestingCorpusId() const { return m_ingestingCorpusId; }
+    double ingestProgress() const { return m_ingestProgress; }
+    int ingestAnimMs() const { return m_ingestAnimMs; }
+    QString ingestStatusText() const { return m_ingestStatusText; }
     CorpusListModel *corpusModel() const;
     DocumentListModel *documentModel() const;
     ChatMessageListModel *chatModel() const;
@@ -140,6 +156,7 @@ signals:
     void activeChatSessionIdChanged();
     void busyChanged();
     void statusTextChanged();
+    void ingestStateChanged();
     void modelReadyChanged();
     void chatBusyChanged();
     // Reused for both real errors and informational results (e.g. "N
@@ -151,6 +168,7 @@ signals:
 private slots:
     void onIngestFinished(bool ok, qint64 totalPassages, QStringList skipped, QStringList malformed,
                            QStringList noTextFound);
+    void onIngestProgress(int filesDone, int filesTotal, qint64 indexEtaMs);
     void onModelLoadFinished(bool ok);
     void onQueryFinished(bool ok, QString answer, QVariantList sources, QString tool,
                          QString searchQuery, QString searchTerms);
@@ -177,6 +195,10 @@ private:
 
     qint64 m_activeCorpusId;
     QString m_activeCorpusName;
+    qint64 m_ingestingCorpusId = -1;
+    double m_ingestProgress = 0.0;
+    int m_ingestAnimMs = 0;
+    QString m_ingestStatusText;
     qint64 m_activeChatSessionId; // -1 = pending new chat, no session row created yet (see startNewChat())
     QString m_activeChatSessionTitle;
     bool m_busy;
