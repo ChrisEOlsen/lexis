@@ -46,10 +46,12 @@ Measured, not estimated (details in [docs/evaluation.md](docs/evaluation.md)):
 - [docs/ingestion.md](docs/ingestion.md) -- how documents become searchable
 - [docs/configuration.md](docs/configuration.md) -- settings
 - [docs/building.md](docs/building.md) -- build and run from source
+- [docs/packaging.md](docs/packaging.md) -- build the one-file installer (DMG)
 - [docs/evaluation.md](docs/evaluation.md) -- quality measurement and current numbers
 
 ## Status
 
-Working desktop app (macOS, Apple Silicon), built from source today --
-see [docs/building.md](docs/building.md). A packaged one-step install
-is planned.
+Working desktop app (macOS, Apple Silicon). Build it from source
+([docs/building.md](docs/building.md)) or package it as a one-file
+installer with a first-run model download
+([docs/packaging.md](docs/packaging.md)).

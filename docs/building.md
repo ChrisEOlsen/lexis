@@ -71,22 +71,7 @@ while the models load.
 
 ## Packaging the macOS app
 
-`scripts/package_app.sh` builds a self-contained LEXIS.app and a DMG
-in `dist/`. The bundle carries the Qt frameworks, every library the
-app links, the language data, English OCR data, and a private
-PostgreSQL server -- nothing from Homebrew is needed on the machine
-that runs it.
-
-The installed app keeps its own state in
-`~/Library/Application Support/LEXIS/`: the config file, the
-downloaded models, and the database. Its Postgres listens on a unix
-socket in a private directory instead of a network port, and the
-macOS user account is the login -- there is no database password.
-On first launch the app offers to download the two models (about
-5.1 GB); everything else works out of the box.
-
-The DMG out of `package_app.sh` is unsigned, so other Macs will warn
-before opening it. `scripts/sign_and_notarize.sh` signs and notarizes
-the app -- it must run on a Mac with an Apple Developer ID
-certificate; the comments at the top of the script walk through the
-one-time setup.
+`./scripts/package_app.sh` builds a self-contained LEXIS.app and the
+one-file installer `dist/LEXIS.dmg`. The full walkthrough -- what the
+script does, the first-launch experience, testing, and signing for
+distribution -- is in [packaging.md](packaging.md).
