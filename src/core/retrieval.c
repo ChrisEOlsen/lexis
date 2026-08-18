@@ -11,6 +11,7 @@
 #include "local_llm_client.h"
 #include "query_formulation.h"
 #include "config.h"
+#include "paths.h"
 #include "reranker.h"
 #include "synonym_table.h"
 
@@ -25,7 +26,11 @@ static const SynonymTable *learned_synonyms(void) {
     static int attempted = 0;
     if (!attempted) {
         attempted = 1;
-        table = synonym_table_load(LEXIS_SYNONYMS_PATH_DEFAULT);
+        char *table_path = lexis_paths_resource(LEXIS_SYNONYMS_PATH_DEFAULT);
+        if (table_path != NULL) {
+            table = synonym_table_load(table_path);
+            free(table_path);
+        }
     }
     return table;
 }
@@ -38,7 +43,7 @@ static int reranker_ready(void) {
     static int ready = 0;
     if (!attempted) {
         attempted = 1;
-        char *path = config_load_reranker_model_path(LEXIS_CONFIG_PATH_DEFAULT);
+        char *path = config_load_reranker_model_path(lexis_paths_config_file());
         if (path != NULL) {
             ready = (reranker_init(path) == 0);
             free(path);

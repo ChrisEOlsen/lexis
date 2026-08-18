@@ -7,6 +7,7 @@
 
 #include "config.h"
 #include "local_llm_client.h"
+#include "paths.h"
 #include "prompts.h"
 #include "string_builder.h"
 
@@ -26,7 +27,7 @@
 static int thinking_enabled(void) {
     static int cached = -1;
     if (cached == -1) {
-        cached = config_load_thinking(LEXIS_CONFIG_PATH_DEFAULT);
+        cached = config_load_thinking(lexis_paths_config_file());
     }
     return cached;
 }

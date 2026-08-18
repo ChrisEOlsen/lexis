@@ -21,6 +21,7 @@
 #include "ingest.h"
 #include "lemmatizer.h"
 #include "local_llm_client.h"
+#include "paths.h"
 #include "pg_store.h"
 #include "query_log.h"
 #include "retrieval.h"
@@ -56,7 +57,6 @@ static const char *g_db_conninfo = NULL;
 #define LEXIS_DB_LABEL "127.0.0.1:5434/lexis (native)"
 #define LEXIS_STOPWORDS_PATH "data/stopwords/english.txt"
 #define LEXIS_WORDNET_DIR "data/wordnet"
-#define LEXIS_CONFIG_PATH "config/lexis.conf"
 /* The local GGUF model path now comes from config/lexis.conf's
  * `model_path` (config_load_model_path(), falling back to
  * LEXIS_DEFAULT_MODEL_PATH) -- see config.h for the full history of how
@@ -190,12 +190,12 @@ static int run_query(const char *question) {
      * failed to initialize. Measured overhead is small (~2.5ms p50 on top
      * of a ~5ms bare BM25 search, see LIMITATIONS.md) but production
      * traffic shouldn't have to pay it just so testing can observe it. */
-    LexisMode mode = config_load_mode(LEXIS_CONFIG_PATH);
+    LexisMode mode = config_load_mode(lexis_paths_config_file());
     if (mode == LEXIS_MODE_TESTING && query_log_init_schema(store) != 0) {
         fprintf(stderr, "lexis: warning: pipeline logging unavailable, continuing without it\n");
     }
 
-    char *model_path = config_load_model_path(LEXIS_CONFIG_PATH);
+    char *model_path = config_load_model_path(lexis_paths_config_file());
     if (model_path == NULL || local_llm_client_init(model_path) != 0) {
         fprintf(stderr, "lexis: failed to load local model from %s\n",
                 model_path != NULL ? model_path : "(out of memory)");
@@ -368,7 +368,7 @@ static int run_eval(const char *queries_path, const char *qrels_path, int use_ll
      * Without it, query_formulation_terms_only() never calls the model
      * at all -- skip paying that load cost for nothing. */
     if (use_llm_expansion) {
-        char *model_path = config_load_model_path(LEXIS_CONFIG_PATH);
+        char *model_path = config_load_model_path(lexis_paths_config_file());
         if (model_path == NULL || local_llm_client_init(model_path) != 0) {
             fprintf(stderr, "lexis: failed to load local model from %s\n",
                     model_path != NULL ? model_path : "(out of memory)");
@@ -418,12 +418,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    g_db_conninfo = config_load_db_conninfo(LEXIS_CONFIG_PATH);
+    g_db_conninfo = config_load_db_conninfo(lexis_paths_config_file());
     if (g_db_conninfo == NULL) {
         fprintf(stderr,
                 "lexis: no database connection configured -- set db_conninfo in %s\n"
                 "(copy config/lexis.conf.example and fill in your password)\n",
-                LEXIS_CONFIG_PATH);
+                lexis_paths_config_file());
         return 1;
     }
 
