@@ -620,6 +620,16 @@ Item {
                         horizontalAlignment: Text.AlignHCenter
                         verticalAlignment: Text.AlignVCenter
                     }
+                    // Explicit accent fill so the button reads blue in
+                    // every state -- the style's own highlighted
+                    // background drops to neutral gray when disabled,
+                    // which is most of this button's life (empty field).
+                    background: Rectangle {
+                        radius: 5
+                        color: sendButton.palette.accent
+                        opacity: sendButton.enabled ? (sendButton.pressed ? 0.8 : sendButton.hovered ? 0.9 : 1.0)
+                                                    : 0.45
+                    }
                     enabled: AppController.activeCorpusId >= 0 && AppController.modelReady
                              && !AppController.chatBusy && questionField.text.trim().length > 0
                     ToolTip.visible: hovered
