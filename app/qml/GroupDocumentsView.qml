@@ -121,12 +121,45 @@ Item {
             indeterminate: true
         }
 
+        // Same accent-button treatment as GroupsListView's "+ New Group":
+        // custom white contentItem because FluentWinUI3 ignores
+        // palette.buttonText on highlighted buttons.
         Button {
+            id: addDocumentsButton
             Layout.fillWidth: true
             Layout.topMargin: Theme.spacingXS
-            text: qsTr("Add Documents")
+            text: qsTr("+  Add Documents")
             highlighted: true
+            contentItem: Text {
+                text: addDocumentsButton.text
+                font: addDocumentsButton.font
+                color: "white"
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
+            }
             onClicked: addDocumentsDialog.open()
+        }
+
+        // The file picker above cannot select folders (FileDialog and
+        // FolderDialog are separate, mutually exclusive pickers -- Qt
+        // exposes no combined mode), so folders get their own button.
+        // Drag-and-drop remains the one place both work at once.
+        Button {
+            id: addFolderButton
+            Layout.fillWidth: true
+            Layout.topMargin: Theme.spacingXS
+            text: qsTr("+  Add Folder")
+            highlighted: true
+            contentItem: Text {
+                text: addFolderButton.text
+                font: addFolderButton.font
+                color: "white"
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
+            }
+            onClicked: addFolderDialog.open()
         }
     }
 
@@ -144,6 +177,16 @@ Item {
                 urls.push(selectedFiles[i].toString())
             }
             AppController.ingestFiles(urls)
+        }
+    }
+
+    FolderDialog {
+        id: addFolderDialog
+        title: qsTr("Add Folder")
+        onAccepted: {
+            // ingestFiles walks a dropped-or-picked folder recursively and
+            // keeps only supported types -- same path as drag-and-drop.
+            AppController.ingestFiles([selectedFolder.toString()])
         }
     }
 }
