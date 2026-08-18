@@ -46,7 +46,7 @@ Measured, not estimated (details in [docs/evaluation.md](docs/evaluation.md)):
 - [docs/ingestion.md](docs/ingestion.md) -- how documents become searchable
 - [docs/configuration.md](docs/configuration.md) -- settings
 - [docs/building.md](docs/building.md) -- build and run from source
-- [docs/packaging.md](docs/packaging.md) -- build the one-file installer (DMG)
+- [docs/packaging.md](docs/packaging.md) -- the installer and the release pipeline
 - [docs/evaluation.md](docs/evaluation.md) -- quality measurement and current numbers
 
 ## Status

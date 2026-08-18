@@ -72,6 +72,7 @@ while the models load.
 ## Packaging the macOS app
 
 `./scripts/package_app.sh` builds a self-contained LEXIS.app and the
-one-file installer `dist/LEXIS.dmg`. The full walkthrough -- what the
-script does, the first-launch experience, testing, and signing for
-distribution -- is in [packaging.md](packaging.md).
+installer image `dist/LEXIS.dmg`; `./scripts/sign_and_notarize.sh`
+signs and notarizes it for distribution. [packaging.md](packaging.md)
+documents the release pipeline, the bundle contents, and the
+installed app's first-launch behavior.

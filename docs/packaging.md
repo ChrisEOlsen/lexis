@@ -1,99 +1,80 @@
-# Packaging: building the installer
+# Packaging
 
-How to turn the source tree into `LEXIS.dmg` -- the one-file installer
-a user opens, drags to Applications, and runs. No Homebrew, no
-terminal, no Postgres setup on their side.
+LEXIS ships as a signed, notarized disk image: `LEXIS-signed.dmg`.
+The image mounts like a drive and contains `LEXIS.app` next to a
+shortcut to `/Applications`; installing is dragging one onto the
+other. The installed app has no dependencies -- no Homebrew, no
+separate Postgres, no terminal steps.
 
-## What a DMG is
+Two scripts produce the release:
 
-A `.dmg` is a macOS disk image: one file that mounts like a drive when
-double-clicked. Ours contains `LEXIS.app` and a shortcut to
-`/Applications`, so installing is dragging one icon onto the other.
-That is the entire install.
+- `scripts/package_app.sh` builds the self-contained app bundle and
+  an unsigned intermediate, `dist/LEXIS.dmg`.
+- `scripts/sign_and_notarize.sh` signs the bundle with the Developer
+  ID certificate, submits it to Apple's notarization service, staples
+  the result, and produces the final `LEXIS-signed.dmg`. It runs on
+  whichever Mac holds the certificate, which does not have to be the
+  build machine.
 
-## Building it
+## What the bundle contains
 
-One command, from the project root, on a machine already set up for
-development (the same Homebrew packages `docs/building.md` lists):
+`package_app.sh` assembles everything the app needs into the bundle:
 
-```bash
-./scripts/package_app.sh
-```
+1. A Release build of the app as `LEXIS.app` (the dev build stays a
+   plain binary; the bundle shape is a build option).
+2. The Qt frameworks and QML components, placed by `macdeployqt`.
+3. The read-only data: WordNet, the stopword list, the learned
+   synonym table, and English OCR data.
+4. A minimal PostgreSQL server (~40 MB). The app runs it privately;
+   the user never interacts with it.
+5. Every linked library, copied in with all Homebrew path references
+   rewritten to point inside the bundle. The script verifies no
+   Homebrew reference survives -- this check is what guarantees the
+   app runs on a machine with nothing installed.
 
-Takes a few minutes. The result is `dist/LEXIS.dmg` (~80 MB). The
-script stops with a clear error if any step fails.
+The models are not in the bundle: at 5.1 GB they are downloaded on
+first launch instead, which keeps the installer at ~80 MB.
 
-What it does, step by step:
+## First launch
 
-1. **Release build.** Compiles the app into a `LEXIS.app` bundle
-   (`app/build-release/`) instead of the plain binary the dev build
-   makes.
-2. **Qt bundling.** Runs `macdeployqt`, Qt's own tool that copies the
-   Qt frameworks and QML files the app uses into the bundle.
-3. **Data files.** Copies WordNet, the stopword list, the learned
-   synonym table, and English OCR data into the bundle's Resources.
-4. **A private PostgreSQL.** Copies a minimal Postgres server (~40 MB)
-   into the bundle. The installed app runs it itself; the user never
-   knows it is there.
-5. **Library rewiring.** Every library the app or Postgres needs is
-   copied into the bundle and every reference to a Homebrew path is
-   rewritten to point inside the bundle. The script then verifies not
-   a single Homebrew reference remains -- this is what makes the app
-   work on a Mac with nothing installed.
-6. **DMG.** Signs the app with a placeholder signature and packs it
-   into `dist/LEXIS.dmg`.
+The installed app keeps all mutable state in
+`~/Library/Application Support/LEXIS/` -- the config file, the
+models, and the database. The bundle itself is never written to.
 
-The models are NOT in the DMG -- they are 5.1 GB. The app downloads
-them on first launch instead (see below).
+On first launch the app:
 
-## What happens on the user's first launch
+1. Creates that folder and writes a default config.
+2. Initializes and starts its private Postgres. The server accepts
+   connections only through a file socket in a folder readable by
+   that macOS user alone, and the macOS login is the credential --
+   no database password exists.
+3. Shows a welcome screen for the one-time model download (~5.1 GB,
+   with progress; interrupted downloads resume).
 
-1. The app sets up its home folder:
-   `~/Library/Application Support/LEXIS/` -- config file, models,
-   database all live there. The app bundle itself is never written to.
-2. It initializes and starts its private Postgres. The database
-   accepts connections only through a file socket in a folder only
-   that macOS user can read, and the macOS login is the credential --
-   there is no database password anywhere.
-3. A welcome screen offers the one-time model download (~5.1 GB, with
-   a progress bar; safe to interrupt, it resumes).
-4. The normal app. On later launches, steps 1-3 are instant checks.
+Later launches reduce to instant checks. The Postgres server starts
+with the app and stops with it.
 
-Deleting the app does not delete that home folder -- a reinstall
-finds the models and data again. Removing LEXIS completely means
-deleting both `LEXIS.app` and `~/Library/Application Support/LEXIS`.
+Deleting the app does not delete the Application Support folder; a
+reinstall finds the models and data intact. A complete removal is
+both `LEXIS.app` and `~/Library/Application Support/LEXIS`.
 
-## Testing the DMG on the build machine
+## Signing and notarization
 
-Open `dist/LEXIS.dmg`, drag LEXIS to Applications, launch it. To see
-the full first-run experience (welcome screen and download), make sure
-`~/Library/Application Support/LEXIS/models/` is empty first --
-otherwise the app finds the models and skips setup.
+Gatekeeper only clears apps signed with an Apple Developer ID
+certificate and notarized by Apple. `sign_and_notarize.sh` covers the
+whole sequence: it signs every binary in the bundle with the hardened
+runtime, submits the app for notarization (an automated scan, usually
+minutes), staples Apple's ticket to the app, and packs the final DMG.
+The comments at the top of the script document the one-time
+credential setup on the signing machine.
 
-## Signing for distribution
+The unsigned intermediate from `package_app.sh` exists only between
+the two scripts. It runs normally on the build machine; on any other
+Mac it hits a Gatekeeper warning, which is what the signing step
+exists to remove.
 
-macOS only trusts apps signed with an Apple Developer ID certificate,
-which requires an Apple Developer Program membership. The DMG from
-`package_app.sh` is not signed that way, so on any other Mac,
-Gatekeeper warns and the user has to right-click > Open to get past
-it.
+## System requirements
 
-For distribution, run `scripts/sign_and_notarize.sh` on a Mac that
-has the Developer ID Application certificate installed (this does not
-have to be the build machine):
-
-```bash
-./scripts/sign_and_notarize.sh "Developer ID Application: Name (TEAMID)" /path/to/LEXIS.app
-```
-
-It signs every binary in the bundle, uploads the app to Apple's
-notarization service (an automated malware scan, usually minutes),
-staples Apple's approval to the app, and produces `LEXIS-signed.dmg`.
-That file installs on any Mac with no warnings. The comments at the
-top of the script cover the one-time credential setup.
-
-## Requirements for the installed app
-
-Apple Silicon Mac, 16 GB RAM realistic minimum (the chat model alone
-needs ~5 GB of it), ~11 GB free disk (app + models + room for the
-database).
+Apple Silicon Mac. 16 GB RAM is the realistic minimum -- the chat
+model alone holds ~5 GB of it. Disk: ~11 GB (app, models, and room
+for the database).
