@@ -70,18 +70,20 @@ the full first-run experience (welcome screen and download), make sure
 `~/Library/Application Support/LEXIS/models/` is empty first --
 otherwise the app finds the models and skips setup.
 
-## Signing: why other Macs complain, and the fix
+## Signing for distribution
 
-macOS only trusts apps signed with an Apple Developer ID ($99/year
-account). Our DMG is not, so on any other Mac, Gatekeeper warns and
-the user has to right-click > Open to get past it.
+macOS only trusts apps signed with an Apple Developer ID certificate,
+which requires an Apple Developer Program membership. The DMG from
+`package_app.sh` is not signed that way, so on any other Mac,
+Gatekeeper warns and the user has to right-click > Open to get past
+it.
 
-The fix is `scripts/sign_and_notarize.sh`, run by someone who has a
-Developer ID certificate on their Mac (it does not have to be the
-build machine):
+For distribution, run `scripts/sign_and_notarize.sh` on a Mac that
+has the Developer ID Application certificate installed (this does not
+have to be the build machine):
 
 ```bash
-./scripts/sign_and_notarize.sh "Developer ID Application: Their Name (TEAMID)" /path/to/LEXIS.app
+./scripts/sign_and_notarize.sh "Developer ID Application: Name (TEAMID)" /path/to/LEXIS.app
 ```
 
 It signs every binary in the bundle, uploads the app to Apple's

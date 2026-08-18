@@ -12,9 +12,9 @@
 #   5. Ad-hoc signs the bundle and builds dist/LEXIS.dmg
 #
 # The result runs on this machine and any Mac that disables Gatekeeper
-# checks for it; for a normal double-click install on other Macs, hand
-# dist/LEXIS.dmg's app to someone with an Apple Developer ID and
-# scripts/sign_and_notarize.sh.
+# checks for it. For a normal double-click install on other Macs, the
+# app must additionally be signed and notarized with an Apple
+# Developer ID -- see scripts/sign_and_notarize.sh.
 #
 # Models are NOT bundled -- the app downloads them on first run
 # (~5.1GB; see SetupController). To smoke-test without downloading,

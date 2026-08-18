@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Signs and notarizes LEXIS.app with a real Apple Developer ID, then
+# Signs and notarizes LEXIS.app with an Apple Developer ID, then
 # builds the final DMG. Run this on a Mac that has the Developer ID
-# certificate in its keychain -- it is meant for the person with the
-# $99/year Apple Developer account, not for the build machine.
+# Application certificate in its keychain (requires an Apple Developer
+# Program membership); this does not have to be the build machine.
 #
 # One-time setup on that Mac:
 #   1. Install the "Developer ID Application" certificate (Xcode ->
