@@ -602,10 +602,28 @@ Item {
 
                 Button {
                     id: sendButton
-                    text: qsTr("Send")
+                    // U+21B5, the return-key glyph -- a text-font
+                    // character, not an emoji codepoint (same reasoning
+                    // as the sidebar's "‹" back glyph: emoji render as
+                    // color stickers against flat chrome).
+                    text: "↵"
+                    font.pixelSize: 18
+                    implicitWidth: 44
                     highlighted: true
+                    // White via a custom contentItem -- FluentWinUI3
+                    // ignores palette.buttonText on highlighted buttons,
+                    // same fix as "+ New Group".
+                    contentItem: Text {
+                        text: sendButton.text
+                        font: sendButton.font
+                        color: "white"
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
                     enabled: AppController.activeCorpusId >= 0 && AppController.modelReady
                              && !AppController.chatBusy && questionField.text.trim().length > 0
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Send (Enter)")
                     onClicked: {
                         AppController.sendChatMessage(questionField.text)
                         questionField.text = ""
