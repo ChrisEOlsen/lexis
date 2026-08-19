@@ -361,9 +361,34 @@ Item {
             spacing: Theme.spacingM
             model: AppController.chatModel
 
-            // Keeps the newest message in view as messages are appended --
-            // ListView does not auto-follow once content overflows.
-            onCountChanged: positionViewAtEnd()
+            // Keeps the newest message in view. Two mechanisms, both
+            // needed:
+            //
+            // 1. positionViewAtEnd() on count changes alone under-scrolls:
+            //    a new message's delegate height (wrapped text) settles
+            //    AFTER countChanged fires, so the jump lands short of the
+            //    real end. Deferring via Qt.callLater(), and re-following
+            //    on contentHeight changes, tracks the true bottom as the
+            //    layout finishes.
+            //
+            // 2. followTail: auto-scroll must stop the moment the user
+            //    scrolls up to reread something (yanking the view down
+            //    while they read is worse than not following), and resume
+            //    when they return to the bottom -- or when they send a
+            //    new message, which is an explicit "I'm at the front of
+            //    the conversation again".
+            property bool followTail: true
+            onCountChanged: {
+                followTail = true
+                Qt.callLater(positionViewAtEnd)
+            }
+            onContentHeightChanged: {
+                if (followTail) {
+                    Qt.callLater(positionViewAtEnd)
+                }
+            }
+            onMovementStarted: followTail = false
+            onMovementEnded: followTail = atYEnd
 
             // Centre-of-screen state for an empty conversation: either the
             // model is still loading, or it is ready and waiting for a
