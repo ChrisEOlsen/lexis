@@ -624,9 +624,12 @@ Item {
                     // every state -- the style's own highlighted
                     // background drops to neutral gray when disabled,
                     // which is most of this button's life (empty field).
+                    // Hardcoded blue, NOT palette.accent: this style does
+                    // not feed its accent through the palette, so
+                    // palette.accent resolved to a default gray.
                     background: Rectangle {
                         radius: 5
-                        color: sendButton.palette.accent
+                        color: "#0A84FF"
                         opacity: sendButton.enabled ? (sendButton.pressed ? 0.8 : sendButton.hovered ? 0.9 : 1.0)
                                                     : 0.45
                     }
