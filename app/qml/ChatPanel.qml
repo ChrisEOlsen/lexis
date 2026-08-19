@@ -612,7 +612,12 @@ Item {
                     highlighted: true
                     // White via a custom contentItem -- FluentWinUI3
                     // ignores palette.buttonText on highlighted buttons,
-                    // same fix as "+ New Group".
+                    // same fix as "+ New Group". The background is the
+                    // style's own (NO override): that is what makes this
+                    // button pixel-identical to every other accent
+                    // button, hover and press states included. Earlier
+                    // hand-painted backgrounds all mismatched one state
+                    // or another.
                     contentItem: Text {
                         text: sendButton.text
                         font: sendButton.font
@@ -620,26 +625,20 @@ Item {
                         horizontalAlignment: Text.AlignHCenter
                         verticalAlignment: Text.AlignVCenter
                     }
-                    // Explicit accent fill so the button reads blue in
-                    // every state. The subtlety: a disabled control
-                    // resolves palette colors from the palette's
-                    // *disabled* group, where accent is gray -- and this
-                    // button is disabled whenever the field is empty,
-                    // i.e. most of the time. Taking accent from the
-                    // always-enabled root keeps the ACTIVE group's blue
-                    // -- the exact same color every other accent button
-                    // wears -- and dims it via opacity instead.
-                    background: Rectangle {
-                        radius: 5
-                        color: root.palette.accent
-                        opacity: sendButton.enabled ? (sendButton.pressed ? 0.8 : sendButton.hovered ? 0.9 : 1.0)
-                                                    : 0.45
-                    }
+                    // Deliberately NOT gated on the field having text: a
+                    // disabled control swaps to the palette's disabled
+                    // colors (gray accent), which read as broken here.
+                    // The button stays live-blue whenever chat itself is
+                    // usable; clicking with an empty field is a no-op
+                    // (sendChatMessage drops empty messages).
                     enabled: AppController.activeCorpusId >= 0 && AppController.modelReady
-                             && !AppController.chatBusy && questionField.text.trim().length > 0
+                             && !AppController.chatBusy
                     ToolTip.visible: hovered
                     ToolTip.text: qsTr("Send (Enter)")
                     onClicked: {
+                        if (questionField.text.trim().length === 0) {
+                            return
+                        }
                         AppController.sendChatMessage(questionField.text)
                         questionField.text = ""
                     }
