@@ -621,15 +621,17 @@ Item {
                         verticalAlignment: Text.AlignVCenter
                     }
                     // Explicit accent fill so the button reads blue in
-                    // every state -- the style's own highlighted
-                    // background drops to neutral gray when disabled,
-                    // which is most of this button's life (empty field).
-                    // Hardcoded blue, NOT palette.accent: this style does
-                    // not feed its accent through the palette, so
-                    // palette.accent resolved to a default gray.
+                    // every state. The subtlety: a disabled control
+                    // resolves palette colors from the palette's
+                    // *disabled* group, where accent is gray -- and this
+                    // button is disabled whenever the field is empty,
+                    // i.e. most of the time. Taking accent from the
+                    // always-enabled root keeps the ACTIVE group's blue
+                    // -- the exact same color every other accent button
+                    // wears -- and dims it via opacity instead.
                     background: Rectangle {
                         radius: 5
-                        color: "#0A84FF"
+                        color: root.palette.accent
                         opacity: sendButton.enabled ? (sendButton.pressed ? 0.8 : sendButton.hovered ? 0.9 : 1.0)
                                                     : 0.45
                     }
