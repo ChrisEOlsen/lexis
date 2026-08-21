@@ -208,12 +208,18 @@
     "group's documents.\n\n"                                                 \
     "The message below is conversational rather than a request for "          \
     "information from those documents, so reply directly and briefly. "       \
+    "The conversation so far is visible to you -- questions about it "        \
+    "(\"what did I ask earlier?\") are answered by reading it, not "          \
+    "declined. "                                                              \
     LEXIS_PROMPT_RULE_NO_ASK_FOR_DOCS                                         \
     "Never ask which product, vehicle, model or version the user means -- "   \
     "the collection is already loaded and is the only subject. If the "       \
-    "message does need information from the documents after all, reply "      \
-    "like this example: \"Happy to help -- ask me anything about the "        \
-    "documents and I'll look it up.\"\n\nMessage: "
+    "message does need information from the documents after all, offer to "   \
+    "look it up.\n\nMessage: "
+/* No verbatim example reply in this prompt on purpose: with one present
+ * the model parroted the example word-for-word ("Happy to help -- ask me
+ * anything...") instead of engaging with the actual message -- observed
+ * live for "It does - look again" and "What was it before that?". */
 
 /* -- Answer generation ------------------------------------------------- */
 

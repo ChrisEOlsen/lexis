@@ -241,10 +241,12 @@ bool runSearchPipeline(PgStore *store, const char *questionCstr, const std::vect
 // Reasoning-skip prefill comes from prompts.h (LEXIS_PREFILL_NO_THINK),
 // shared with every other model call in the project.
 
-// Leaves room for the chat template's own markup plus the reply itself;
-// the exact figure matters less than reserving *some* headroom, since
-// LOCAL_LLM_N_CTX bounds prompt and generation together.
-constexpr int kConverseReservedTokens = 2048;
+// Leaves room for the chat template's own markup plus the reply itself.
+// Derived from the generation cap rather than a literal because the two
+// must move together (same lesson as generation.c's
+// GENERATION_RESERVED_OUTPUT_TOKENS) -- and this path now runs the
+// reasoning pass, whose trace alone has been measured past 512 tokens.
+constexpr int kConverseReservedTokens = LOCAL_LLM_MAX_NEW_TOKENS + 256;
 
 bool runConversePipeline(const char *questionCstr, const std::vector<LocalLlmTurn> &turns, QString *answerOut) {
     int budget = LOCAL_LLM_N_CTX - kConverseReservedTokens;
@@ -280,7 +282,13 @@ bool runConversePipeline(const char *questionCstr, const std::vector<LocalLlmTur
     QByteArray conversePrompt = QByteArray(LEXIS_PROMPT_CONVERSE_HEAD) + questionCstr;
     windowed.push_back(LocalLlmTurn{"user", conversePrompt.constData()});
 
-    char *answer = local_llm_chat_completion_multi(windowed.data(), windowed.size(), LEXIS_PREFILL_NO_THINK);
+    // Reasoning pass ON for this path, unconditionally -- unlike answer
+    // generation it is not config-gated. CHAT messages are rare and
+    // short (greetings, meta-questions), so the latency cost is small,
+    // and the observed failure mode without it was real: "what was my
+    // question before that?" needs a two-step history lookup, and with
+    // reasoning off the model recited its instruction header instead.
+    char *answer = local_llm_chat_completion_multi_ex(windowed.data(), windowed.size(), NULL, 1);
     if (answer == nullptr) {
         return false;
     }

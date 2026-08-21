@@ -607,7 +607,9 @@ Item {
         Item {
             visible: !root.groupIngesting
             Layout.fillWidth: true
-            Layout.topMargin: Theme.spacingXS
+            // spacingL, not XS: the conversation's last line sat nearly
+            // flush against the input bar.
+            Layout.topMargin: Theme.spacingL
             implicitHeight: composerRow.implicitHeight
 
             RowLayout {
