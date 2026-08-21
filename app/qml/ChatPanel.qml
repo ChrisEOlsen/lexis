@@ -1088,7 +1088,11 @@ Item {
         // binding-loop avoidance as Main.qml's messageDialog.
         width: Math.min(520, root.width - 2 * Theme.spacingXL)
 
-        contentItem: Label {
+        // A plain child, NOT a contentItem override -- overriding
+        // contentItem with a width-dependent wrapping label loops
+        // implicitHeight (observed at runtime); the child form is the
+        // same proven shape as Main.qml's messageDialog.
+        Label {
             width: helpDialog.availableWidth
             wrapMode: Text.WordWrap
             textFormat: Text.RichText
