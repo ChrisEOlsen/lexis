@@ -1084,16 +1084,15 @@ Item {
         modal: true
         anchors.centerIn: Overlay.overlay
         standardButtons: Dialog.Ok
-        // Explicit widths on the dialog AND the wrapping label -- same
-        // binding-loop avoidance as Main.qml's messageDialog.
-        width: Math.min(520, root.width - 2 * Theme.spacingXL)
+        // Fixed width AND a constant label width (not availableWidth):
+        // a RichText label whose width references the dialog's own
+        // geometry loops implicitHeight (observed at runtime, both as a
+        // contentItem override and as a plain child) -- constants on
+        // both ends leave nothing circular.
+        width: 520
 
-        // A plain child, NOT a contentItem override -- overriding
-        // contentItem with a width-dependent wrapping label loops
-        // implicitHeight (observed at runtime); the child form is the
-        // same proven shape as Main.qml's messageDialog.
         Label {
-            width: helpDialog.availableWidth
+            width: 470
             wrapMode: Text.WordWrap
             textFormat: Text.RichText
             text: qsTr(
