@@ -290,6 +290,22 @@ Item {
                     }
                 }
             }
+
+            // Usage help. Always enabled -- unlike History/New chat it
+            // is useful before any group exists.
+            Button {
+                id: helpButton
+                flat: true
+                onClicked: helpDialog.open()
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("How to get the best answers")
+                contentItem: Label {
+                    text: "?"
+                    font.pixelSize: 18
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
         }
 
         // -- Ingestion in progress (replaces the conversation for the
@@ -1058,6 +1074,43 @@ Item {
                     text: qsTr("This answer predates passage text being stored, so only the identifiers above are available for it. New answers include the full passage.")
                 }
             }
+        }
+    }
+
+    // -- Usage help ("?" in the header) --
+    Dialog {
+        id: helpDialog
+        title: qsTr("Getting the best out of LEXIS")
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        standardButtons: Dialog.Ok
+        // Explicit widths on the dialog AND the wrapping label -- same
+        // binding-loop avoidance as Main.qml's messageDialog.
+        width: Math.min(520, root.width - 2 * Theme.spacingXL)
+
+        contentItem: Label {
+            width: helpDialog.availableWidth
+            wrapMode: Text.WordWrap
+            textFormat: Text.RichText
+            text: qsTr(
+                "<p>LEXIS finds answers by <b>matching the words in your question " +
+                "against the words in your documents</b> (plus close synonyms), " +
+                "re-ordering the best matches by meaning, and writing an answer " +
+                "from those passages only.</p>" +
+                "<p><b>Use specific keywords.</b> Because the search is word-based, " +
+                "concrete terms that likely appear in the document work best -- " +
+                "names, part numbers, error codes, section titles. " +
+                "“oil filter torque spec” finds more than " +
+                "“how tight should that thing be”.</p>" +
+                "<p><b>Follow-ups are fine.</b> LEXIS rewrites them into standalone " +
+                "questions using the conversation, but the same rule applies: the " +
+                "more concrete words, the better the search.</p>" +
+                "<p><b>Broad questions work differently.</b> “What is this " +
+                "collection about?” is answered from a generated overview of " +
+                "the whole group rather than a search.</p>" +
+                "<p><b>Check the Source panel</b> under any answer to see the exact " +
+                "search that ran and the passages the answer came from. If an " +
+                "answer seems off, that is the place to look.</p>")
         }
     }
 }
