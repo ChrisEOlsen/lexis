@@ -42,8 +42,16 @@ What happens between hitting Enter and seeing an answer.
 
 8. **Answering.** The chat model gets the passages, the original
    question, and recent conversation history, with strict rules:
-   answer only from the passages, say so if they don't contain the
-   answer, plain prose.
+   answer only from the passages, plain prose, and -- because the
+   passages were picked by keyword match -- don't assume a passage is
+   relevant just because it shares words with the question. When the
+   passages settle the question it answers directly. When they only
+   half-settle it (the topic is there but the number isn't, two
+   figures disagree, the spec is for the neighbouring case), it lays
+   out what the passages actually say, with the conditions attached,
+   and names what's still open, instead of picking the likeliest
+   answer and stating it as fact. Only when nothing relevant is there
+   at all does it say the question isn't covered.
 
 9. **Retry on refusal.** If the answer is a refusal ("the material
    doesn't contain..."), the pipeline tries once more with a wider
@@ -51,9 +59,25 @@ What happens between hitting Enter and seeing an answer.
    user see a refusal.
 
 10. **Record.** The answer is saved with its provenance: which tool
-    ran, the exact search terms, the rewritten question if any, and
-    the full text of every passage used. The Source panel shows all
+    ran, the exact search terms, the rewritten question if any, and the
+    full text of every passage used. The Source panel shows all
     of it.
+
+Steps 1-8 are visible while they happen: the app's footer reports each
+stage as it starts ("Refining the question...", "Searching the
+group...", "Reading 12 passages...", "Writing..."), and the answer
+streams in token by token as it is written rather than appearing all at
+once. The reasoning pass never streams -- if the model thinks, the
+stream holds until the thinking block closes. A refusal retry announces
+itself ("Trying again with a deeper search...") and restarts the
+answer.
+
+**On demand.** The newest SEARCH answer also carries a "Try harder"
+action: the same deeper retrieval and forced reasoning the automatic
+refusal retry uses, run on request. The replacement answer replaces the
+original in the conversation and in history -- but only on success. A
+retry that fails, or that finds nothing the second time, leaves the
+original answer exactly as it was.
 
 ## In the CLI
 

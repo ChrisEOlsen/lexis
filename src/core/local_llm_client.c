@@ -220,12 +220,271 @@ static char *apply_chat_template_multi(const LocalLlmTurn *turns, size_t count, 
     return with_prefill;
 }
 
+/* Strips a leading reasoning block (plus any whitespace right after it),
+ * in place, so a thinking model's internal monologue never reaches a
+ * caller's displayed or persisted output.
+ *
+ * Two formats are recognised, because the delimiters are per-model and
+ * getting them wrong is silent -- the reasoning simply arrives as the
+ * answer:
+ *
+ *   <think> ... </think>                    the widespread convention
+ *   <|channel>thought ... <channel|>     Gemma 4's, taken from its own
+ *                                        chat template (note the pipe
+ *                                        moves to the other side on the
+ *                                        closing tag -- it is NOT a typo,
+ *                                        and the template's own
+ *                                        strip_thinking macro splits on
+ *                                        exactly that string)
+ *
+ * Only strips a block that starts at the very beginning of `reply` and
+ * actually closes. An unterminated block -- generation having hit
+ * LOCAL_LLM_MAX_NEW_TOKENS mid-thought -- is left untouched rather than
+ * guessed at, so the truncation is visible instead of being silently
+ * turned into a plausible-looking answer. */
+static const struct {
+    const char *open;
+    const char *close;
+} kThinkFormats[] = {
+    {"<think>", "</think>"},
+    {"<|channel>thought", "<channel|>"},
+};
+
+static void strip_leading_think_block(char *reply) {
+    for (size_t i = 0; i < sizeof(kThinkFormats) / sizeof(kThinkFormats[0]); i++) {
+        size_t open_len = strlen(kThinkFormats[i].open);
+        if (strncmp(reply, kThinkFormats[i].open, open_len) != 0) {
+            continue;
+        }
+        char *close = strstr(reply + open_len, kThinkFormats[i].close);
+        if (close == NULL) {
+            return; /* opened but never closed -- leave it visible */
+        }
+        char *after = close + strlen(kThinkFormats[i].close);
+        while (*after == '\n' || *after == '\r' || *after == ' ' || *after == '\t') {
+            after++;
+        }
+        memmove(reply, after, strlen(after) + 1); /* +1 carries the NUL along */
+        return;
+    }
+}
+
+/* -- Streaming think suppression ---------------------------------------
+ *
+ * The non-streaming path strips a leading reasoning block from the
+ * completed reply above. A streaming caller must not receive those
+ * bytes live -- the model's internal monologue would flash past the
+ * user before the answer replaced it -- but "does this reply open with
+ * a think block?" cannot be answered until either the block closes or
+ * the reply provably does not start with any open marker. So the
+ * decode loop holds pieces in a gate until that question resolves:
+ *
+ *   - DECIDING: bytes are compared against both open markers. Once
+ *     they diverge from both (an ordinary answer -- the overwhelmingly
+ *     common case, and always the case on the prefill path, where the
+ *     template has already closed the think block in the prompt),
+ *     everything held is released and every later piece flows through
+ *     unchanged. Once one open marker fully matches, the gate goes
+ *     INSIDE with that format.
+ *   - INSIDE: pieces are held and scanned for the format's close
+ *     marker. When it is found, everything up to and including it plus
+ *     the whitespace run after it (the same run
+ *     strip_leading_think_block() skips) is dropped, and the tail is
+ *     released; the reply streams as plain answer text from there on.
+ *   - Generation ends while still DECIDING or INSIDE -- a think block
+ *     that opened but never closed, the truncated-mid-thought case --
+ *     everything held is released as-is: the same "leave the truncation
+ *     visible" rule the non-streaming strip applies, so a stream that
+ *     dies mid-thought never looks like a clean empty answer.
+ *
+ * The final reply the loop returns is still stripped by
+ * strip_leading_think_block(), so the returned string (what callers
+ * persist and display) can never diverge from the non-streaming path;
+ * the gate only governs which bytes reach the callback along the way. */
+typedef struct {
+    int phase_deciding; /* 1 until the reply's opening is understood */
+    int phase_inside;   /* 1 once an open marker matched */
+    size_t format;      /* index into kThinkFormats once known */
+    /* DECIDING only: matched-prefix length against each open marker,
+     * or SIZE_MAX for a format the held text has already diverged from. */
+    size_t open_match[2];
+    /* INSIDE only: bytes of the held text already scanned for the close
+     * marker -- the next scan starts close_len-1 bytes earlier so a
+     * marker split across a piece boundary is still found. */
+    size_t close_scanned;
+    /* Set when the gate leaves INSIDE with the whitespace run after the
+     * close marker still unfinished -- the run continues into the next
+     * piece, and strip_leading_think_block() skips it there too. Stays
+     * set through pass-through pieces until real answer text arrives. */
+    int skip_leading_ws;
+    /* The held buffer: reply bytes whose disposition is not yet
+     * decided. In DECIDING this is everything; in INSIDE it is the
+     * think block body; once released, it is empty. */
+    StringBuilder held;
+} ThinkGate;
+
+/* The whitespace strip_leading_think_block() skips after a close marker. */
+static int think_gap_ws(char c) {
+    return c == '\n' || c == '\r' || c == ' ' || c == '\t';
+}
+
+#define THINK_GATE_FORMAT_COUNT (sizeof(kThinkFormats) / sizeof(kThinkFormats[0]))
+#define THINK_GATE_RULED_OUT ((size_t)-1)
+
+/* Feeds one decoded piece through the gate, invoking `on_piece` with
+ * whatever the gate decides is now displayable answer text. */
+static void think_gate_feed(ThinkGate *gate, const char *piece, LocalLlmStreamFn on_piece, void *user_data) {
+    /* Released state first, and WITHOUT touching `held`: once the gate
+     * has released, holding is over, and appending pieces to the buffer
+     * anyway would make think_gate_flush() re-emit the whole answer as
+     * one final duplicate piece (found by the stream-identity check).
+     * Pass-through is pure: the piece goes to the callback and nothing
+     * else. */
+    if (!gate->phase_deciding && !gate->phase_inside) {
+        size_t len = strlen(piece);
+        size_t start = 0;
+        if (gate->skip_leading_ws) {
+            while (start < len && think_gap_ws(piece[start])) {
+                start++;
+            }
+            if (start == len) {
+                return; /* still inside the run: nothing displayable yet */
+            }
+            gate->skip_leading_ws = 0;
+        }
+        if (on_piece != NULL) {
+            on_piece(piece + start, len - start, user_data);
+        }
+        return;
+    }
+
+    if (string_builder_append(&gate->held, piece) != 0) {
+        return; /* allocation failure: the loop's own append will fail and abort the call */
+    }
+
+    if (gate->phase_deciding) {
+        size_t held_len = gate->held.length;
+        int any_alive = 0;
+        int matched = -1;
+        for (size_t f = 0; f < THINK_GATE_FORMAT_COUNT; f++) {
+            if (gate->open_match[f] == THINK_GATE_RULED_OUT) {
+                continue;
+            }
+            size_t open_len = strlen(kThinkFormats[f].open);
+            /* Extend this format's matched prefix over the new bytes. */
+            while (gate->open_match[f] < open_len && gate->open_match[f] < held_len &&
+                   gate->held.data[gate->open_match[f]] == kThinkFormats[f].open[gate->open_match[f]]) {
+                gate->open_match[f]++;
+            }
+            if (gate->open_match[f] >= open_len) {
+                matched = (int)f; /* the full open marker has been consumed */
+                break;
+            }
+            if (gate->open_match[f] == held_len) {
+                /* Held text is still a strict prefix of this open
+                 * marker -- can't rule it out yet. */
+                any_alive = 1;
+            } else {
+                /* Held text diverged from this marker inside its
+                 * length: ruled out permanently. */
+                gate->open_match[f] = THINK_GATE_RULED_OUT;
+            }
+        }
+
+        if (matched >= 0) {
+            gate->phase_deciding = 0;
+            gate->phase_inside = 1;
+            gate->format = (size_t)matched;
+            gate->close_scanned = 0;
+            /* The open marker stays in `held` and is dropped along with
+             * the whole think block when the close marker is found.
+             * Deliberately NOT returning: this same piece may already
+             * carry the close marker (a short block whose open and close
+             * land in one piece), and the INSIDE scan below is what
+             * finds it. Returning here would leave that block held until
+             * some later piece arrived -- and if none did, the flush
+             * would emit the entire reasoning block. */
+        } else {
+            if (!any_alive) {
+                /* An ordinary answer: release everything held and stream
+                 * every later piece straight through. */
+                gate->phase_deciding = 0;
+                if (on_piece != NULL && gate->held.length > 0) {
+                    on_piece(gate->held.data, gate->held.length, user_data);
+                }
+                free(gate->held.data);
+                gate->held.data = NULL;
+                gate->held.length = 0;
+                gate->held.capacity = 0;
+            }
+            return;
+        }
+    }
+
+    if (gate->phase_inside) {
+        const char *close = kThinkFormats[gate->format].close;
+        size_t close_len = strlen(close);
+        size_t held_len = gate->held.length;
+        size_t from = gate->close_scanned >= close_len - 1 ? gate->close_scanned - (close_len - 1) : 0;
+        for (size_t i = from; i + close_len <= held_len; i++) {
+            if (memcmp(gate->held.data + i, close, close_len) == 0) {
+                size_t after = i + close_len;
+                while (after < held_len && think_gap_ws(gate->held.data[after])) {
+                    after++;
+                }
+                gate->phase_inside = 0;
+                if (after < held_len) {
+                    if (on_piece != NULL) {
+                        on_piece(gate->held.data + after, held_len - after, user_data);
+                    }
+                } else {
+                    /* The held text ends exactly where the skip does --
+                     * either the close marker landed on a piece boundary
+                     * or the run consumed the rest. The run may continue
+                     * in the next piece; the non-streaming strip would
+                     * eat that too, so keep skipping rather than passing
+                     * whitespace the returned answer does not have. */
+                    gate->skip_leading_ws = 1;
+                }
+                free(gate->held.data);
+                gate->held.data = NULL;
+                gate->held.length = 0;
+                gate->held.capacity = 0;
+                return;
+            }
+        }
+        gate->close_scanned = held_len;
+    }
+}
+
+/* Releases whatever the gate is still holding. Called exactly once when
+ * generation ends, before the reply is returned -- the
+ * opened-but-never-closed case must stay visible, matching
+ * strip_leading_think_block()'s rule. */
+static void think_gate_flush(ThinkGate *gate, LocalLlmStreamFn on_piece, void *user_data) {
+    if (gate->held.data != NULL && gate->held.length > 0 && on_piece != NULL) {
+        on_piece(gate->held.data, gate->held.length, user_data);
+    }
+    free(gate->held.data);
+    gate->held.data = NULL;
+    gate->held.length = 0;
+    gate->held.capacity = 0;
+}
+
 /* Shared greedy-decode loop, run against an already-tokenized prompt
  * (`tokens[0..n_tokens)`, already sized against LOCAL_LLM_N_CTX by the
  * caller). Returns the generated reply text (caller must free(), never
  * NULL on success -- an empty string is a valid reply, see below), or
- * NULL on failure. Does not free `tokens` -- the caller owns it. */
-static char *run_decode_loop(llama_token *tokens, int32_t n_tokens) {
+ * NULL on failure. Does not free `tokens` -- the caller owns it.
+ *
+ * `on_piece` (when non-NULL) receives the reply's displayable answer
+ * text live, piece by piece, post think-suppression (see ThinkGate);
+ * the loop's returned buffer still carries the unstripped reply, which
+ * the public entry points strip exactly as the non-streaming path
+ * does. The two paths share this one loop -- the same sampler, the
+ * same decode calls, the same caps -- so their outputs are bit-identical
+ * by construction. */
+static char *run_decode_loop(llama_token *tokens, int32_t n_tokens, LocalLlmStreamFn on_piece, void *user_data) {
     struct llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
     struct llama_sampler *sampler = llama_sampler_chain_init(sparams);
     if (sampler == NULL) {
@@ -234,6 +493,19 @@ static char *run_decode_loop(llama_token *tokens, int32_t n_tokens) {
     /* Greedy (always the highest-probability token) -- deterministic and
      * cheap, matching the "fast and grounded" goal over creative variety. */
     llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+
+    ThinkGate gate;
+    gate.phase_deciding = on_piece != NULL ? 1 : 0;
+    gate.phase_inside = 0;
+    gate.format = 0;
+    for (size_t f = 0; f < THINK_GATE_FORMAT_COUNT; f++) {
+        gate.open_match[f] = 0;
+    }
+    gate.close_scanned = 0;
+    gate.skip_leading_ws = 0;
+    gate.held.data = NULL;
+    gate.held.length = 0;
+    gate.held.capacity = 0;
 
     StringBuilder reply = {NULL, 0, 0};
     struct llama_batch batch = llama_batch_get_one(tokens, n_tokens);
@@ -260,6 +532,9 @@ static char *run_decode_loop(llama_token *tokens, int32_t n_tokens) {
                 ok = 0;
                 break;
             }
+            if (on_piece != NULL) {
+                think_gate_feed(&gate, piece, on_piece, user_data);
+            }
         }
 
         n_ctx_used++;
@@ -274,6 +549,10 @@ static char *run_decode_loop(llama_token *tokens, int32_t n_tokens) {
     }
 
     llama_sampler_free(sampler);
+
+    if (on_piece != NULL) {
+        think_gate_flush(&gate, on_piece, user_data);
+    }
 
     if (!ok) {
         free(reply.data);
@@ -290,57 +569,11 @@ static char *run_decode_loop(llama_token *tokens, int32_t n_tokens) {
     return reply.data;
 }
 
-/* Strips a leading reasoning block (plus any whitespace right after it),
- * in place, so a thinking model's internal monologue never reaches a
- * caller's displayed or persisted output.
- *
- * Two formats are recognised, because the delimiters are per-model and
- * getting them wrong is silent -- the reasoning simply arrives as the
- * answer:
- *
- *   <think> ... </think>                 the widespread convention
- *   <|channel>thought ... <channel|>     Gemma 4's, taken from its own
- *                                        chat template (note the pipe
- *                                        moves to the other side on the
- *                                        closing tag -- it is NOT a typo,
- *                                        and the template's own
- *                                        strip_thinking macro splits on
- *                                        exactly that string)
- *
- * Only strips a block that starts at the very beginning of `reply` and
- * actually closes. An unterminated block -- generation having hit
- * LOCAL_LLM_MAX_NEW_TOKENS mid-thought -- is left untouched rather than
- * guessed at, so the truncation is visible instead of being silently
- * turned into a plausible-looking answer. */
-static void strip_leading_think_block(char *reply) {
-    static const struct {
-        const char *open;
-        const char *close;
-    } formats[] = {
-        {"<think>", "</think>"},
-        {"<|channel>thought", "<channel|>"},
-    };
-
-    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
-        size_t open_len = strlen(formats[i].open);
-        if (strncmp(reply, formats[i].open, open_len) != 0) {
-            continue;
-        }
-        char *close = strstr(reply + open_len, formats[i].close);
-        if (close == NULL) {
-            return; /* opened but never closed -- leave it visible */
-        }
-        char *after = close + strlen(formats[i].close);
-        while (*after == '\n' || *after == '\r' || *after == ' ' || *after == '\t') {
-            after++;
-        }
-        memmove(reply, after, strlen(after) + 1); /* +1 carries the NUL along */
-        return;
-    }
-}
-
-char *local_llm_chat_completion_multi_ex(const LocalLlmTurn *turns, size_t count, const char *prefill,
-                                          int force_thinking) {
+/* One implementation behind both the plain and the streaming entry
+ * points (see local_llm_client.h's streaming doc comment for why
+ * sharing it is what makes their outputs provably identical). */
+static char *chat_completion_multi_ex_common(const LocalLlmTurn *turns, size_t count, const char *prefill,
+                                             int force_thinking, LocalLlmStreamFn on_piece, void *user_data) {
     if (!g_initialized) {
         fprintf(stderr, "local_llm_chat_completion_multi: module not initialized\n");
         return NULL;
@@ -386,12 +619,22 @@ char *local_llm_chat_completion_multi_ex(const LocalLlmTurn *turns, size_t count
         return NULL;
     }
 
-    char *reply = run_decode_loop(tokens, n_tokens);
+    char *reply = run_decode_loop(tokens, n_tokens, on_piece, user_data);
     free(tokens);
     if (reply != NULL) {
         strip_leading_think_block(reply);
     }
     return reply;
+}
+
+char *local_llm_chat_completion_multi_ex(const LocalLlmTurn *turns, size_t count, const char *prefill,
+                                          int force_thinking) {
+    return chat_completion_multi_ex_common(turns, count, prefill, force_thinking, NULL, NULL);
+}
+
+char *local_llm_chat_completion_multi_ex_stream(const LocalLlmTurn *turns, size_t count, const char *prefill,
+                                                int force_thinking, LocalLlmStreamFn on_piece, void *user_data) {
+    return chat_completion_multi_ex_common(turns, count, prefill, force_thinking, on_piece, user_data);
 }
 
 char *local_llm_chat_completion(const char *user_message) {

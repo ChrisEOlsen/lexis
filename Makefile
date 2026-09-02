@@ -60,7 +60,13 @@ CXX      := c++
 CXXFLAGS := -std=c++17 -Wall -Wextra -Iinclude -Isrc/core/vendor
 
 TEST_SRCS := $(wildcard $(TESTDIR)/test_*.c)
+# test_stream_identity loads the real ~5GB chat model, so it is NOT part
+# of `make check` (which must run on any checkout, model or no model) --
+# it has its own manual target. The filter-out keeps the wildcard from
+# dragging it in.
+TEST_SRCS := $(filter-out $(TESTDIR)/test_stream_identity.c,$(TEST_SRCS))
 TEST_BINS := $(patsubst $(TESTDIR)/%.c,$(BUILD)/%,$(TEST_SRCS))
+STREAM_IDENTITY_BIN := $(BUILD)/test_stream_identity
 
 # Native Postgres data directory (port 5434) -- see LEXIS_DB_CONNINFO in
 # main.c. Auto-initialized by `brew install postgresql@18`; this just
@@ -68,7 +74,20 @@ TEST_BINS := $(patsubst $(TESTDIR)/%.c,$(BUILD)/%,$(TEST_SRCS))
 PG_NATIVE_BIN  := /opt/homebrew/opt/postgresql@18/bin
 PG_NATIVE_DATA := /opt/homebrew/var/postgresql@18
 
-.PHONY: check clean pg-start pg-stop
+.PHONY: check clean pg-start pg-stop stream-identity
+
+# The F3 tripwire (see dev/UI_UPGRADES_SPEC.md): the streaming entry
+# point must return bit-identical output to the plain one. Loads the
+# chat model named in config/lexis.conf's model_path (falling back to
+# LEXIS_DEFAULT_MODEL_PATH), and runs the check twice -- thinking off,
+# then forced on, which is the pass that exercises the streaming think
+# gate. Run by hand whenever local_llm_client.c's decode loop changes.
+stream-identity: $(STREAM_IDENTITY_BIN)
+	./$(STREAM_IDENTITY_BIN)
+
+$(STREAM_IDENTITY_BIN): $(TESTDIR)/test_stream_identity.c $(CORE_SRCS) $(JINJA_OBJ)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE_SRCS) $(JINJA_OBJ) $(LDLIBS)
 
 pg-start:
 	$(PG_NATIVE_BIN)/pg_ctl -D $(PG_NATIVE_DATA) -l $(PG_NATIVE_DATA)/server.log start
@@ -85,6 +104,17 @@ check: $(TEST_BINS)
 $(JINJA_OBJ): $(JINJA_SRC)
 	@mkdir -p $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# test_think_gate #includes local_llm_client.c to reach the streaming
+# think gate's static functions, so it must NOT also link that file --
+# every symbol in it would be defined twice. Everything else in
+# CORE_SRCS still links normally (generation.c's calls into the client
+# resolve against the copy compiled inside the test). An explicit rule,
+# so it wins over the generic one below.
+THINK_GATE_SRCS := $(filter-out src/core/local_llm_client.c,$(CORE_SRCS))
+$(BUILD)/test_think_gate: $(TESTDIR)/test_think_gate.c $(CORE_SRCS) $(JINJA_OBJ)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -I$(TESTDIR) -o $@ $< $(THINK_GATE_SRCS) $(JINJA_OBJ) $(LDLIBS)
 
 $(BUILD)/%: $(TESTDIR)/%.c $(CORE_SRCS) $(JINJA_OBJ)
 	@mkdir -p $(BUILD)

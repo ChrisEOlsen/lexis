@@ -110,6 +110,32 @@ char *local_llm_chat_completion_multi(const LocalLlmTurn *turns, size_t count, c
 char *local_llm_chat_completion_multi_ex(const LocalLlmTurn *turns, size_t count, const char *prefill,
                                           int force_thinking);
 
+/* Streaming twin of the above: identical prompt formatting, greedy
+ * decoding, and returned reply -- bit-for-bit the same string -- but
+ * `on_piece` (if non-NULL) is invoked live with each incremental
+ * *answer-text* piece as it is decoded, so a UI can show the answer as
+ * it is written instead of after the full generation completes.
+ *
+ * The reasoning pass never reaches the callback. A reply that opens
+ * with a think block holds its pieces until the block closes (same
+ * two delimiter formats strip_leading_think_block() recognizes, same
+ * whitespace-skip after the close marker, and the same
+ * opened-but-never-closed fallback -- everything held is delivered at
+ * the end, so a mid-thought truncation stays visible exactly as it
+ * does on the non-streaming path). The returned value is always the
+ * full post-strip answer, authoritative over whatever was streamed;
+ * the callback is display plumbing only, which is what lets the
+ * caller persist the returned string and never diverge from what a
+ * non-streaming call would have stored.
+ *
+ * `piece` is NOT NUL-terminated -- it points into a buffer that keeps
+ * growing for the duration of the call, and is only valid for the
+ * duration of the callback. `user_data` is passed through untouched. */
+typedef void (*LocalLlmStreamFn)(const char *piece, size_t piece_len, void *user_data);
+
+char *local_llm_chat_completion_multi_ex_stream(const LocalLlmTurn *turns, size_t count, const char *prefill,
+                                                int force_thinking, LocalLlmStreamFn on_piece, void *user_data);
+
 /* Tokenizes `text` (module's own vocabulary, no BOS/special tokens added
  * -- this counts one turn's own content toward a windowing budget, not a
  * full templated prompt) and returns the token count, or -1 if the

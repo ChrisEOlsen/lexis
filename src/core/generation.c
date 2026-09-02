@@ -175,9 +175,10 @@ static LocalLlmTurn *window_history(const LocalLlmTurn *history, size_t history_
     return windowed;
 }
 
-char *generation_generate_answer_with_history(const char *query_text, PgStore *store, const BM25ResultSet *results,
-                                               const LocalLlmTurn *history, size_t history_count,
-                                               int thinking_override) {
+char *generation_generate_answer_with_history_stream(const char *query_text, PgStore *store, const BM25ResultSet *results,
+                                                      const LocalLlmTurn *history, size_t history_count,
+                                                      int thinking_override, LocalLlmStreamFn on_piece,
+                                                      void *user_data) {
     /* thinking_override: -1 = follow config/lexis.conf's `thinking`
      * setting; 0/1 force it off/on for this one call. The refusal-retry
      * path forces it ON: the measured case thinking rescued was exactly
@@ -190,7 +191,7 @@ char *generation_generate_answer_with_history(const char *query_text, PgStore *s
 
     if (history_count == 0) {
         LocalLlmTurn turn = {.role = "user", .content = prompt};
-        char *answer = local_llm_chat_completion_multi_ex(&turn, 1, NULL, think);
+        char *answer = local_llm_chat_completion_multi_ex_stream(&turn, 1, NULL, think, on_piece, user_data);
         free(prompt);
         return answer;
     }
@@ -223,10 +224,18 @@ char *generation_generate_answer_with_history(const char *query_text, PgStore *s
     free(windowed);
     turns[windowed_count] = (LocalLlmTurn){.role = "user", .content = prompt};
 
-    char *answer = local_llm_chat_completion_multi_ex(turns, windowed_count + 1, NULL, think);
+    char *answer =
+        local_llm_chat_completion_multi_ex_stream(turns, windowed_count + 1, NULL, think, on_piece, user_data);
     free(turns);
     free(prompt);
     return answer;
+}
+
+char *generation_generate_answer_with_history(const char *query_text, PgStore *store, const BM25ResultSet *results,
+                                               const LocalLlmTurn *history, size_t history_count,
+                                               int thinking_override) {
+    return generation_generate_answer_with_history_stream(query_text, store, results, history, history_count,
+                                                           thinking_override, NULL, NULL);
 }
 
 /* Room reserved for history + the question + the model's output, held
@@ -419,11 +428,15 @@ static char *generation_build_summary_prompt(const char *query_text, const char 
     return builder.data;
 }
 
-char *generation_generate_answer_from_summary(const char *query_text, const char *summary_text,
-                                              const LocalLlmTurn *history, size_t history_count) {
+char *generation_generate_answer_from_summary_stream(const char *query_text, const char *summary_text,
+                                                     const LocalLlmTurn *history, size_t history_count,
+                                                     int thinking_override, LocalLlmStreamFn on_piece,
+                                                     void *user_data) {
     if (summary_text == NULL || summary_text[0] == '\0') {
         return NULL;
     }
+
+    const int think = (thinking_override < 0) ? thinking_enabled() : thinking_override;
 
     char *prompt = generation_build_summary_prompt(query_text, summary_text);
     if (prompt == NULL) {
@@ -432,7 +445,7 @@ char *generation_generate_answer_from_summary(const char *query_text, const char
 
     if (history_count == 0) {
         LocalLlmTurn turn = {.role = "user", .content = prompt};
-        char *answer = local_llm_chat_completion_multi_ex(&turn, 1, NULL, thinking_enabled());
+        char *answer = local_llm_chat_completion_multi_ex_stream(&turn, 1, NULL, think, on_piece, user_data);
         free(prompt);
         return answer;
     }
@@ -465,8 +478,15 @@ char *generation_generate_answer_from_summary(const char *query_text, const char
     free(windowed);
     turns[windowed_count] = (LocalLlmTurn){.role = "user", .content = prompt};
 
-    char *answer = local_llm_chat_completion_multi_ex(turns, windowed_count + 1, NULL, thinking_enabled());
+    char *answer = local_llm_chat_completion_multi_ex_stream(turns, windowed_count + 1, NULL, think, on_piece,
+                                                             user_data);
     free(turns);
     free(prompt);
     return answer;
+}
+
+char *generation_generate_answer_from_summary(const char *query_text, const char *summary_text,
+                                              const LocalLlmTurn *history, size_t history_count) {
+    return generation_generate_answer_from_summary_stream(query_text, summary_text, history, history_count, -1, NULL,
+                                                           NULL);
 }

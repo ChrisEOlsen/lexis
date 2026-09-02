@@ -104,6 +104,58 @@ bool answerLooksLikeRefusal(const QString &answer) {
     return false;
 }
 
+// Bridge between the C core's streaming callback (a plain function
+// pointer + void*) and this object's Qt signal. One instance lives on
+// the worker's stack for the duration of run(); the callback fires on
+// that same thread, so emit is safe without locking.
+//
+// `pending` holds the bytes of a multi-byte character that the model
+// split across two pieces: llama.cpp emits raw token bytes, and a token
+// boundary falls mid-codepoint routinely for anything outside ASCII
+// (accents, CJK, emoji). Decoding such a fragment on its own yields
+// U+FFFD, so the tail waits here for the piece that completes it.
+struct TokenBridge {
+    QueryWorker *worker;
+    QByteArray pending;
+};
+
+// Length of the longest prefix of `buf` that ends on a complete UTF-8
+// sequence. Walks back over at most three continuation bytes to the
+// lead byte and asks whether its sequence is all there; anything that
+// isn't valid UTF-8 to begin with is passed through untouched for
+// QString::fromUtf8() to handle exactly as before.
+qsizetype completeUtf8Prefix(const QByteArray &buf) {
+    const qsizetype size = buf.size();
+    for (qsizetype back = 1; back <= 4 && back <= size; back++) {
+        const auto byte = static_cast<unsigned char>(buf.at(size - back));
+        if ((byte & 0xC0) == 0x80) {
+            continue; // continuation byte: keep walking back
+        }
+        qsizetype needed = 1;
+        if ((byte & 0xE0) == 0xC0) {
+            needed = 2;
+        } else if ((byte & 0xF0) == 0xE0) {
+            needed = 3;
+        } else if ((byte & 0xF8) == 0xF0) {
+            needed = 4;
+        }
+        return back >= needed ? size : size - back;
+    }
+    return size;
+}
+
+void token_trampoline(const char *piece, size_t piece_len, void *user_data) {
+    auto *bridge = static_cast<TokenBridge *>(user_data);
+    bridge->pending.append(piece, static_cast<qsizetype>(piece_len));
+    const qsizetype ready = completeUtf8Prefix(bridge->pending);
+    if (ready == 0) {
+        return; // the whole buffer is one unfinished character
+    }
+    const QByteArray complete = bridge->pending.left(ready);
+    bridge->pending.remove(0, ready);
+    emit bridge->worker->queryToken(QString::fromUtf8(complete));
+}
+
 // Source citations for the UI, fetched before generation so a passage
 // that fails to load simply doesn't appear rather than aborting.
 QVariantList collectSources(PgStore *store, const BM25ResultSet *results) {
@@ -133,10 +185,17 @@ QVariantList collectSources(PgStore *store, const BM25ResultSet *results) {
 // a "nothing to search for"/"no matching passages" outcome is a real,
 // friendly answer string, not a failure -- see QueryWorker.h's own
 // comment on why `answer` is never empty on success.
+//
+// fromRetry: called with forceRetry semantics -- the deeper retrieval
+// policy from the start and no refusal pre-check (see QueryWorker.h).
+// Otherwise the ordinary first pass runs, with the one automatic
+// refusal retry after it.
 bool runSearchPipeline(PgStore *store, const char *questionCstr, const std::vector<LocalLlmTurn> &turns,
-                        const StopwordSet *stopwords, const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
-                        QString *answerOut, QVariantList *sourcesOut, QString *searchQueryOut,
-                        QString *searchTermsOut) {
+                       const StopwordSet *stopwords, const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
+                       QueryWorker *worker, bool fromRetry, int thinkingOverride, QString *answerOut,
+                       QVariantList *sourcesOut, QString *searchQueryOut, QString *searchTermsOut) {
+    TokenBridge bridge{worker};
+
     char *reformulated = query_formulation_contextualize_question(questionCstr, turns.data(), turns.size());
     if (reformulated == nullptr) {
         return false;
@@ -153,31 +212,58 @@ bool runSearchPipeline(PgStore *store, const char *questionCstr, const std::vect
     // (src/core/retrieval.c), the same one the CLI and eval run. This
     // function only owns what is chat-specific: contextualization above,
     // provenance capture, source citations, history-aware generation.
+    emit worker->queryStage(fromRetry ? StageRetrying : StageSearching, -1);
     RetrievalPolicy policy = retrieval_default_policy();
+    if (fromRetry) {
+        // The measured refusal-retry parameters, on demand: score
+        // floor off (fills the full passage budget with everything the
+        // search found) -- and the reasoning pass is forced on for the
+        // generation below, matching what the automatic retry does.
+        policy.score_floor_ratio = 0.0;
+    }
     RetrievalRun *run =
         retrieval_run(store, questionCstr, reformulated, stopwords, wordnet, lemmatizer, &policy);
     if (run == nullptr) {
         free(reformulated);
         return false;
     }
+    // "Nothing to search for" and "no matching passages" are ordinary
+    // answers on a first pass -- but on a retry they would REPLACE the
+    // answer being improved (run() calls
+    // pg_store_update_last_assistant_message() on success), destroying a
+    // real answer because the second search happened to come up empty.
+    // A retry that finds nothing is a failure, and the caller keeps the
+    // original.
     if (run->terms->count == 0) {
         free(reformulated);
         retrieval_run_free(run);
+        if (fromRetry) {
+            return false;
+        }
         *answerOut = QObject::tr("I don't have enough to search for in that question -- could you rephrase it?");
         return true;
     }
     if (run->results->count == 0) {
         free(reformulated);
         retrieval_run_free(run);
+        if (fromRetry) {
+            return false;
+        }
         *answerOut = QObject::tr("No matching passages found in this group for that question.");
         return true;
     }
 
+    emit worker->queryStage(StageReading, static_cast<int>(run->results->count));
+    emit worker->queryStage(StageWriting, -1);
+
     // The *original* question, not the reformulated search query -- the
     // reformulation only ever existed to help retrieval, not to replace
     // what the user actually asked (see generation.h's own doc comment).
-    char *answer = generation_generate_answer_with_history(questionCstr, store, run->results,
-                                                            turns.data(), turns.size(), -1);
+    // fromRetry always thinks (part of the measured retry parameters);
+    // otherwise the caller's override decides (-1 = config).
+    char *answer = generation_generate_answer_with_history_stream(
+        questionCstr, store, run->results, turns.data(), turns.size(),
+        fromRetry ? 1 : thinkingOverride, token_trampoline, &bridge);
 
     // Refusal retry, once. Measured on the 913-run: 8 of 19 refusals
     // happened with the gold passage already in context (the model
@@ -187,14 +273,18 @@ bool runSearchPipeline(PgStore *store, const char *questionCstr, const std::vect
     // with the reasoning pass forced ON (the one case thinking measurably
     // rescued was exactly a model misreading passages it already had).
     // Cost lands only on the ~2% of queries that refuse.
-    if (answer != nullptr && answerLooksLikeRefusal(QString::fromUtf8(answer))) {
+    if (!fromRetry && answer != nullptr && answerLooksLikeRefusal(QString::fromUtf8(answer))) {
+        emit worker->queryStage(StageRetrying, -1);
         RetrievalPolicy retryPolicy = retrieval_default_policy();
         retryPolicy.score_floor_ratio = 0.0;
         RetrievalRun *retryRun =
             retrieval_run(store, questionCstr, reformulated, stopwords, wordnet, lemmatizer, &retryPolicy);
         if (retryRun != nullptr && retryRun->results != nullptr && retryRun->results->count > 0) {
-            char *retryAnswer = generation_generate_answer_with_history(
-                questionCstr, store, retryRun->results, turns.data(), turns.size(), /*thinking=*/1);
+            emit worker->queryStage(StageReading, static_cast<int>(retryRun->results->count));
+            emit worker->queryStage(StageWriting, -1);
+            char *retryAnswer = generation_generate_answer_with_history_stream(
+                questionCstr, store, retryRun->results, turns.data(), turns.size(), /*thinking=*/1,
+                token_trampoline, &bridge);
             if (retryAnswer != nullptr && !answerLooksLikeRefusal(QString::fromUtf8(retryAnswer))) {
                 free(answer);
                 answer = retryAnswer;
@@ -248,7 +338,10 @@ bool runSearchPipeline(PgStore *store, const char *questionCstr, const std::vect
 // reasoning pass, whose trace alone has been measured past 512 tokens.
 constexpr int kConverseReservedTokens = LOCAL_LLM_MAX_NEW_TOKENS + 256;
 
-bool runConversePipeline(const char *questionCstr, const std::vector<LocalLlmTurn> &turns, QString *answerOut) {
+bool runConversePipeline(const char *questionCstr, const std::vector<LocalLlmTurn> &turns, QueryWorker *worker,
+                         QString *answerOut) {
+    TokenBridge bridge{worker};
+
     int budget = LOCAL_LLM_N_CTX - kConverseReservedTokens;
     int questionTokens = local_llm_count_tokens(questionCstr);
     if (questionTokens > 0) {
@@ -282,13 +375,16 @@ bool runConversePipeline(const char *questionCstr, const std::vector<LocalLlmTur
     QByteArray conversePrompt = QByteArray(LEXIS_PROMPT_CONVERSE_HEAD) + questionCstr;
     windowed.push_back(LocalLlmTurn{"user", conversePrompt.constData()});
 
+    emit worker->queryStage(StageWriting, -1);
+
     // Reasoning pass ON for this path, unconditionally -- unlike answer
     // generation it is not config-gated. CHAT messages are rare and
     // short (greetings, meta-questions), so the latency cost is small,
     // and the observed failure mode without it was real: "what was my
     // question before that?" needs a two-step history lookup, and with
     // reasoning off the model recited its instruction header instead.
-    char *answer = local_llm_chat_completion_multi_ex(windowed.data(), windowed.size(), NULL, 1);
+    char *answer = local_llm_chat_completion_multi_ex_stream(windowed.data(), windowed.size(), NULL, 1,
+                                                              token_trampoline, &bridge);
     if (answer == nullptr) {
         return false;
     }
@@ -316,7 +412,11 @@ bool runConversePipeline(const char *questionCstr, const std::vector<LocalLlmTur
 // this path -- a list of document names alone would imply the documents
 // were read directly, which is exactly what this path does not do.
 bool runSummaryPipeline(PgStore *store, qint64 corpusId, const char *questionCstr,
-                         const std::vector<LocalLlmTurn> &turns, QString *answerOut, QVariantList *sourcesOut) {
+                         const std::vector<LocalLlmTurn> &turns, QueryWorker *worker, int thinkingOverride,
+                         QString *answerOut, QVariantList *sourcesOut) {
+    TokenBridge bridge{worker};
+
+    emit worker->queryStage(StageSummarizing, -1);
     char *summary = corpus_summary_get_or_build(store, static_cast<int64_t>(corpusId));
     if (summary == nullptr) {
         // No documents, or generation failed. A real answer, not a failure:
@@ -328,7 +428,9 @@ bool runSummaryPipeline(PgStore *store, qint64 corpusId, const char *questionCst
         return true;
     }
 
-    char *answer = generation_generate_answer_from_summary(questionCstr, summary, turns.data(), turns.size());
+    emit worker->queryStage(StageWriting, -1);
+    char *answer = generation_generate_answer_from_summary_stream(questionCstr, summary, turns.data(), turns.size(),
+                                                                   thinkingOverride, token_trampoline, &bridge);
     if (answer == nullptr) {
         free(summary);
         return false;
@@ -358,10 +460,11 @@ bool runSummaryPipeline(PgStore *store, qint64 corpusId, const char *questionCst
 } // namespace
 
 QueryWorker::QueryWorker(QString conninfo, qint64 corpusId, qint64 sessionId, QString question,
-                          const StopwordSet *stopwords, const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
-                          QObject *parent)
+                         const StopwordSet *stopwords, const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
+                         bool forceRetry, int thinkingOverride, QObject *parent)
     : QThread(parent), m_conninfo(std::move(conninfo)), m_corpusId(corpusId), m_sessionId(sessionId),
-      m_question(std::move(question)), m_stopwords(stopwords), m_wordnet(wordnet), m_lemmatizer(lemmatizer) {
+      m_question(std::move(question)), m_stopwords(stopwords), m_wordnet(wordnet), m_lemmatizer(lemmatizer),
+      m_forceRetry(forceRetry), m_thinkingOverride(thinkingOverride) {
 }
 
 void QueryWorker::run() {
@@ -396,6 +499,25 @@ void QueryWorker::run() {
         turns[i].content = history_rows[i].text;
     }
 
+    if (m_forceRetry && !turns.empty() && turns.back().role == std::string("assistant")) {
+        // A retry replaces the newest assistant answer -- that answer
+        // must also not sit in the model's own context (it is the refusal
+        // or near-miss being retried; re-feeding it anchors the
+        // regeneration to the very text that failed). Dropping it gives
+        // the retry exactly the conversation view the original answer
+        // had: history, then the question.
+        turns.pop_back();
+        // And the question itself, which a retry did NOT append below
+        // (its row already exists from the original ask). Leaving it
+        // here would hand the model -- and
+        // query_formulation_contextualize_question() -- the same
+        // question twice, once as the last history turn and again as the
+        // turn the pipeline appends.
+        if (!turns.empty() && turns.back().role == std::string("user")) {
+            turns.pop_back();
+        }
+    }
+
     // Did the previous answer in this conversation come from a retrieval
     // tool? The router needs this to read an elliptical follow-up correctly:
     // "is that all?" names no subject, so judged alone it looks like filler.
@@ -415,29 +537,52 @@ void QueryWorker::run() {
         break; // only the most recent answer matters
     }
 
-    pg_store_append_chat_message(store, m_sessionId, 1, questionCstr, nullptr);
-
-    ToolChoice tool =
-        tool_router_choose_tool(questionCstr, turns.data(), turns.size(), previousAnswerUsedDocuments ? 1 : 0);
+    if (!m_forceRetry) {
+        // A retry's question row already exists (it is the question this
+        // worker is re-answering); only a fresh question gets persisted.
+        pg_store_append_chat_message(store, m_sessionId, 1, questionCstr, nullptr);
+    }
 
     QString answerText;
     QVariantList sources;
     QString searchQuery;
     QString searchTerms;
     bool ok = false;
-    switch (tool) {
-    case TOOL_SUMMARIZE_CORPUS:
-        ok = runSummaryPipeline(store, m_corpusId, questionCstr, turns, &answerText, &sources);
-        break;
-    case TOOL_CONVERSE:
-        // No store access and no `sources` -- the whole point of this
-        // branch is that nothing was retrieved.
-        ok = runConversePipeline(questionCstr, turns, &answerText);
-        break;
-    case TOOL_SEARCH_PASSAGES:
-        ok = runSearchPipeline(store, questionCstr, turns, m_stopwords, m_wordnet, m_lemmatizer, &answerText,
-                                &sources, &searchQuery, &searchTerms);
-        break;
+    QString tool_name;
+
+    if (m_forceRetry) {
+        // "Try harder": the question was already routed to SEARCH and
+        // its answer already exists; re-run retrieval with the deeper
+        // policy. No re-routing (nothing changed about the question),
+        // and the refusal pre-check is off -- the retry IS the request.
+        tool_name = QStringLiteral("search");
+        ok = runSearchPipeline(store, questionCstr, turns, m_stopwords, m_wordnet, m_lemmatizer, this,
+                               /*fromRetry=*/true, m_thinkingOverride, &answerText, &sources, &searchQuery,
+                               &searchTerms);
+    } else {
+        emit queryStage(StageRouting, -1);
+        ToolChoice tool =
+            tool_router_choose_tool(questionCstr, turns.data(), turns.size(), previousAnswerUsedDocuments ? 1 : 0);
+
+        switch (tool) {
+        case TOOL_SUMMARIZE_CORPUS:
+            tool_name = toolName(tool);
+            ok = runSummaryPipeline(store, m_corpusId, questionCstr, turns, this, m_thinkingOverride, &answerText,
+                                    &sources);
+            break;
+        case TOOL_CONVERSE:
+            // No store access and no `sources` -- the whole point of this
+            // branch is that nothing was retrieved.
+            tool_name = toolName(tool);
+            ok = runConversePipeline(questionCstr, turns, this, &answerText);
+            break;
+        case TOOL_SEARCH_PASSAGES:
+            tool_name = toolName(tool);
+            ok = runSearchPipeline(store, questionCstr, turns, m_stopwords, m_wordnet, m_lemmatizer, this,
+                                   /*fromRetry=*/false, m_thinkingOverride, &answerText, &sources, &searchQuery,
+                                   &searchTerms);
+            break;
+        }
     }
 
     pg_store_chat_messages_free(history_rows, history_count);
@@ -448,13 +593,24 @@ void QueryWorker::run() {
         return;
     }
 
-    // Always written now, even for CHAT with no sources: the tool name is
+    // Always written, even for CHAT with no sources: the tool name is
     // what the UI reports, so "nothing was retrieved" has to be recorded
     // rather than left as a NULL that reads identically to a legacy row.
-    const QString tool_name = toolName(tool);
+    // A retry REPLACES the last assistant row instead of appending -- the
+    // live UI shows one improved answer, and a session reloaded from
+    // history must show the same single answer, not the refusal it fixed.
     const QString provenanceJson = provenanceToJson(tool_name, sources, searchQuery, searchTerms);
-    pg_store_append_chat_message(store, m_sessionId, 0, answerText.toUtf8().constData(),
-                                  provenanceJson.toUtf8().constData());
+    if (m_forceRetry) {
+        if (pg_store_update_last_assistant_message(store, m_sessionId, answerText.toUtf8().constData(),
+                                                    provenanceJson.toUtf8().constData()) != 0) {
+            pg_store_close(store);
+            emit queryFinished(false, QString(), QVariantList(), QString(), QString(), QString());
+            return;
+        }
+    } else {
+        pg_store_append_chat_message(store, m_sessionId, 0, answerText.toUtf8().constData(),
+                                      provenanceJson.toUtf8().constData());
+    }
     pg_store_close(store);
 
     emit queryFinished(true, answerText, sources, tool_name, searchQuery, searchTerms);

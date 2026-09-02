@@ -200,9 +200,13 @@ qt_add_qml_module(lexis_app
         qml/GroupsListView.qml
         qml/GroupDocumentsView.qml
         qml/ChatPanel.qml
+        qml/DocumentViewerDialog.qml
+        qml/SettingsDialog.qml
     SOURCES
         src/AppController.h
         src/AppController.cpp
+        src/ConfigManager.h
+        src/ConfigManager.cpp
         src/CorpusListModel.h
         src/CorpusListModel.cpp
         src/DocumentListModel.h

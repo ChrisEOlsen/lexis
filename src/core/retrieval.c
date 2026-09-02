@@ -37,19 +37,47 @@ static const SynonymTable *learned_synonyms(void) {
 
 /* The optional embedding reranker, initialized once per process from
  * config `reranker_model_path` -- same lazy pattern as the synonym
- * table above. No config line = never initialized = pure BM25 order. */
+ * table above. No config line = never initialized = pure BM25 order.
+ *
+ * The user toggle (retrieval_set_reranker_enabled(), declared in
+ * retrieval.h for the app's Settings panel) is a second gate consulted
+ * BEFORE the lazy init: disabling it must not merely skip reranking,
+ * it must skip ever loading the ~67MB model. Enabling it after a
+ * disable resumes the normal lazy path -- the model (re)loads on the
+ * next query that reranks, so the first post-enable query pays a small
+ * one-time load exactly like the process's first query did. */
+static int reranker_user_enabled = 1; /* default: whatever the config says */
+
+/* Lazy-init state, file-scope so the toggle below can reset it. */
+static int reranker_attempted = 0;
+static int reranker_loaded = 0;
+
+void retrieval_set_reranker_enabled(int enabled) {
+    const int want = enabled ? 1 : 0;
+    if (want && !reranker_user_enabled) {
+        /* A disable -> enable transition: reset the attempt flag so the
+         * next query re-runs the lazy load once, rather than inheriting
+         * the outcome of whatever attempt the disabled period
+         * interrupted (or never made). Enabling with the load already
+         * done keeps it -- reranker_loaded survives, no reload cost. */
+        reranker_attempted = 0;
+    }
+    reranker_user_enabled = want;
+}
+
 static int reranker_ready(void) {
-    static int attempted = 0;
-    static int ready = 0;
-    if (!attempted) {
-        attempted = 1;
+    if (!reranker_user_enabled) {
+        return 0;
+    }
+    if (!reranker_attempted) {
+        reranker_attempted = 1;
         char *path = config_load_reranker_model_path(lexis_paths_config_file());
         if (path != NULL) {
-            ready = (reranker_init(path) == 0);
+            reranker_loaded = (reranker_init(path) == 0);
             free(path);
         }
     }
-    return ready;
+    return reranker_loaded;
 }
 
 static long elapsed_ms(struct timespec start, struct timespec end) {

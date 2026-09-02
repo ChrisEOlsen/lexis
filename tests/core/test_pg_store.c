@@ -1073,6 +1073,182 @@ static void test_finish_bulk_load_restores_constraints_and_durability_and_data_s
     pg_store_close(store);
 }
 
+/* -- Document stats / viewer reads / removal (the F1/F4 surface) ---- */
+
+static void test_list_document_stats_groups_and_counts(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+    TEST_ASSERT(pg_store_insert_document(store, "doc-a", "alpha text") == 0, "expected doc-a insert");
+    TEST_ASSERT(pg_store_insert_document(store, "doc-b", "beta text") == 0, "expected doc-b insert");
+    TEST_ASSERT(pg_store_insert_passage(store, "doc-a", 0, "a zero", 4) > 0, "expected passage insert");
+    TEST_ASSERT(pg_store_insert_passage(store, "doc-a", 1, "a one", 6) > 0, "expected passage insert");
+    TEST_ASSERT(pg_store_insert_passage(store, "doc-b", 0, "b zero", 9) > 0, "expected passage insert");
+
+    size_t count = 0;
+    PgStoreDocumentStats *stats = pg_store_list_document_stats(store, &count);
+    TEST_ASSERT(stats != NULL, "expected list_document_stats to succeed");
+    TEST_ASSERT(count == 2, "expected 2 documents with passages, got %zu", count);
+    /* ORDER BY document_name. */
+    TEST_ASSERT_STR_EQ(stats[0].document_name, "doc-a");
+    TEST_ASSERT(stats[0].passage_count == 2, "expected doc-a passage_count 2, got %ld", stats[0].passage_count);
+    TEST_ASSERT(stats[0].total_tokens == 10, "expected doc-a total_tokens 10, got %ld", stats[0].total_tokens);
+    TEST_ASSERT_STR_EQ(stats[1].document_name, "doc-b");
+    TEST_ASSERT(stats[1].passage_count == 1, "expected doc-b passage_count 1, got %ld", stats[1].passage_count);
+    TEST_ASSERT(stats[1].total_tokens == 9, "expected doc-b total_tokens 9, got %ld", stats[1].total_tokens);
+    pg_store_document_stats_free(stats, count);
+
+    pg_store_close(store);
+}
+
+static void test_get_document_text_round_trip(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+    TEST_ASSERT(pg_store_insert_document(store, "manual.pdf", "the full extracted text") == 0,
+                "expected document insert");
+
+    char *text = pg_store_get_document_text(store, "manual.pdf");
+    TEST_ASSERT(text != NULL, "expected get_document_text to find the document");
+    TEST_ASSERT_STR_EQ(text, "the full extracted text");
+    free(text);
+
+    TEST_ASSERT(pg_store_get_document_text(store, "missing.pdf") == NULL,
+                "expected get_document_text to return NULL for a missing document");
+
+    pg_store_close(store);
+}
+
+static void test_get_document_passages_orders_and_round_trips(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+    TEST_ASSERT(pg_store_insert_passage(store, "doc", 1, "second chunk", 5) > 0, "expected passage insert");
+    TEST_ASSERT(pg_store_insert_passage(store, "doc", 0, "first chunk", 3) > 0, "expected passage insert");
+    TEST_ASSERT(pg_store_insert_passage(store, "other", 0, "elsewhere", 2) > 0, "expected passage insert");
+
+    size_t count = 0;
+    PgStoreDocumentPassage *passages = pg_store_get_document_passages(store, "doc", &count);
+    TEST_ASSERT(passages != NULL, "expected get_document_passages to succeed");
+    TEST_ASSERT(count == 2, "expected 2 chunks for doc, got %zu", count);
+    /* Insertion order was chunk 1 then 0 -- the read must come back in
+     * chunk order regardless. */
+    TEST_ASSERT(passages[0].chunk_id == 0, "expected first row chunk_id 0, got %d", passages[0].chunk_id);
+    TEST_ASSERT_STR_EQ(passages[0].text, "first chunk");
+    TEST_ASSERT(passages[0].token_count == 3, "expected token_count 3, got %d", passages[0].token_count);
+    TEST_ASSERT(passages[1].chunk_id == 1, "expected second row chunk_id 1, got %d", passages[1].chunk_id);
+    pg_store_document_passages_free(passages, count);
+
+    size_t missing_count = 99;
+    TEST_ASSERT(pg_store_get_document_passages(store, "missing", &missing_count) != NULL,
+                "expected a valid (empty) array for a document with no chunks");
+    TEST_ASSERT(missing_count == 0, "expected 0 chunks for a missing document, got %zu", missing_count);
+
+    pg_store_close(store);
+}
+
+static void test_remove_document_full_transaction(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+    /* Two documents sharing a term, plus one term only the removed doc
+     * uses -- the shared term must survive, the exclusive one must be
+     * swept, and doc-b's rows must be untouched. */
+    TEST_ASSERT(pg_store_insert_document(store, "doc-a", "text a") == 0, "expected doc-a insert");
+    TEST_ASSERT(pg_store_insert_document(store, "doc-b", "text b") == 0, "expected doc-b insert");
+    int64_t id_a0 = pg_store_insert_passage(store, "doc-a", 0, "shared rare exclusive", 3);
+    int64_t id_b0 = pg_store_insert_passage(store, "doc-b", 0, "shared rare other", 3);
+    TEST_ASSERT(id_a0 > 0 && id_b0 > 0, "expected passage inserts");
+    int64_t term_shared = pg_store_get_or_create_term(store, "shared");
+    int64_t term_exclusive = pg_store_get_or_create_term(store, "exclusive");
+    TEST_ASSERT(term_shared > 0 && term_exclusive > 0, "expected term ids");
+    TEST_ASSERT(pg_store_insert_posting(store, term_shared, id_a0, 1, 3) == 0, "expected posting insert");
+    TEST_ASSERT(pg_store_insert_posting(store, term_shared, id_b0, 1, 3) == 0, "expected posting insert");
+    TEST_ASSERT(pg_store_insert_posting(store, term_exclusive, id_a0, 1, 3) == 0, "expected posting insert");
+
+    TEST_ASSERT(pg_store_remove_document(store, "doc-a") == 0, "expected remove_document to succeed");
+
+    PGresult *res = PQexec(store->conn,
+                           "SELECT count(*) FROM passages WHERE document_name = 'doc-a';");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 0), "0");
+    PQclear(res);
+    res = PQexec(store->conn,
+                 "SELECT count(*) FROM postings WHERE passage_id IN "
+                 "(SELECT id FROM passages WHERE document_name = 'doc-a');");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 0), "0");
+    PQclear(res);
+    TEST_ASSERT(pg_store_get_document_text(store, "doc-a") == NULL,
+                "expected doc-a's documents row to be gone");
+
+    /* doc-b intact. */
+    char b_id_str[32];
+    snprintf(b_id_str, sizeof(b_id_str), "%lld", (long long)id_b0);
+    const char *b_params[1] = {b_id_str};
+    res = PQexecParams(store->conn, "SELECT count(*) FROM passages WHERE id = $1;", 1, NULL, b_params, NULL, NULL,
+                       0);
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 0), "1");
+    PQclear(res);
+    char *b_text = pg_store_get_document_text(store, "doc-b");
+    TEST_ASSERT_STR_EQ(b_text, "text b");
+    free(b_text);
+
+    /* Shared term survives (still posted by doc-b); exclusive term swept. */
+    TEST_ASSERT(pg_store_lookup_term(store, "shared") == term_shared, "expected shared term to survive");
+    TEST_ASSERT(pg_store_lookup_term(store, "exclusive") == -1, "expected exclusive term to be swept");
+
+    /* Unknown name: -1, and nothing changed. */
+    TEST_ASSERT(pg_store_remove_document(store, "missing") == -1,
+                "expected remove_document to fail for a missing document");
+    res = PQexec(store->conn, "SELECT count(*) FROM passages;");
+    TEST_ASSERT_STR_EQ(PQgetvalue(res, 0, 0), "1");
+    PQclear(res);
+
+    pg_store_close(store);
+}
+
+static void test_update_last_assistant_message(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+    char *schema_name = NULL;
+    int64_t corpus = pg_store_create_corpus(store, "Chat Test Group", &schema_name);
+    TEST_ASSERT(corpus > 0, "expected a corpus for the session to hang off");
+    free(schema_name);
+    int64_t session = pg_store_create_chat_session(store, corpus, "session");
+    TEST_ASSERT(session > 0, "expected a chat session");
+
+    TEST_ASSERT(pg_store_append_chat_message(store, session, 1, "question one", NULL) == 0,
+                "expected user message append");
+    TEST_ASSERT(pg_store_append_chat_message(store, session, 0, "first answer",
+                                             "{\"tool\":\"search\",\"passages\":[]}") == 0,
+                "expected assistant message append");
+    TEST_ASSERT(pg_store_update_last_assistant_message(store, session, "deeper answer",
+                                                        "{\"tool\":\"search\",\"passages\":[\"x\"]}") == 0,
+                "expected the update to succeed");
+
+    size_t count = 0;
+    PgStoreChatMessage *messages = pg_store_get_chat_messages(store, session, &count);
+    TEST_ASSERT(messages != NULL, "expected history read");
+    TEST_ASSERT(count == 2, "expected 2 messages (replace, not append), got %zu", count);
+    TEST_ASSERT_STR_EQ(messages[1].text, "deeper answer");
+    TEST_ASSERT_STR_EQ(messages[1].sources_json, "{\"tool\": \"search\", \"passages\": [\"x\"]}");
+    pg_store_chat_messages_free(messages, count);
+
+    /* Newest message is the user's question: nothing to replace. */
+    TEST_ASSERT(pg_store_append_chat_message(store, session, 1, "question two", NULL) == 0,
+                "expected second user message");
+    TEST_ASSERT(pg_store_update_last_assistant_message(store, session, "should not write", NULL) == -1,
+                "expected the update to refuse when the newest row is a user message");
+
+    /* And it refused without writing anything. */
+    messages = pg_store_get_chat_messages(store, session, &count);
+    TEST_ASSERT(count == 3, "expected 3 messages, got %zu", count);
+    TEST_ASSERT_STR_EQ(messages[2].text, "question two");
+    pg_store_chat_messages_free(messages, count);
+
+    pg_store_close(store);
+}
+
 int main(void) {
     test_create_corpus_creates_schema_and_registry_row();
     test_create_corpus_isolates_tables_between_corpora();
@@ -1117,5 +1293,10 @@ int main(void) {
     test_finalize_terms_and_postings_resolves_and_dedups();
     test_prepare_bulk_load_defers_constraints_and_durability();
     test_finish_bulk_load_restores_constraints_and_durability_and_data_survives();
+    test_list_document_stats_groups_and_counts();
+    test_get_document_text_round_trip();
+    test_get_document_passages_orders_and_round_trips();
+    test_remove_document_full_transaction();
+    test_update_last_assistant_message();
     return test_summary();
 }

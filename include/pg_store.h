@@ -251,6 +251,93 @@ PgStoreChatMessage *pg_store_get_chat_messages(PgStore *store, int64_t session_i
  * entry's owned text/sources_json. Safe to call with messages == NULL. */
 void pg_store_chat_messages_free(PgStoreChatMessage *messages, size_t count);
 
+/* Replaces the text and sources of session_id's most recent assistant
+ * message -- what a user-invoked "try harder" retry writes, so the
+ * deeper answer replaces (rather than stacks on) the one it improves,
+ * matching what the live UI shows. Updates only if that message exists
+ * and is genuinely an assistant row (is_user = false); returns -1 on
+ * failure or if the session's newest message is not an assistant row
+ * (nothing modified). */
+int pg_store_update_last_assistant_message(PgStore *store, int64_t session_id, const char *text,
+                                            const char *sources_json);
+
+/* -- Per-document reads and deletion --
+ *
+ * The documents table holds one row per source document (full extracted
+ * text); passages holds its chunks. These support the app's document
+ * viewer (open a document's indexed text, list its chunks, jump to a
+ * cited one) and per-document removal from a group. All operate on the
+ * currently-selected schema (see pg_store_use_corpus()). */
+
+/* One document's per-chunk stats as read back from passages -- owned
+ * document_name, freed via pg_store_document_stats_free(). */
+typedef struct {
+    char *document_name;
+    long passage_count;
+    long total_tokens;
+} PgStoreDocumentStats;
+
+/* Lists every document in the currently-selected schema with its
+ * passage count and total token count, from one GROUP BY over passages
+ * (documents with zero passages -- none in a consistent corpus, but
+ * nothing forbids the shape -- simply don't appear). Ordered by
+ * document_name. Sets *count_out to the number found. Returns a newly
+ * allocated array the caller must free via
+ * pg_store_document_stats_free(), or NULL (with *count_out unset) on a
+ * database or allocation error. */
+PgStoreDocumentStats *pg_store_list_document_stats(PgStore *store, size_t *count_out);
+
+/* Frees an array returned by pg_store_list_document_stats(), including
+ * each entry's owned document_name. Safe to call with stats == NULL. */
+void pg_store_document_stats_free(PgStoreDocumentStats *stats, size_t count);
+
+/* Reads back one document's full stored text (the extraction as it was
+ * indexed, not a re-read of any original file -- the file may no longer
+ * exist; the database is the source of truth). Returns a newly
+ * malloc()'d string the caller must free(), or NULL if no document
+ * with that name exists or on a database/allocation error. */
+char *pg_store_get_document_text(PgStore *store, const char *document_name);
+
+/* One chunk of a document, ordered by chunk_id -- same shape
+ * PgStorePassage uses, minus the document name (constant across the
+ * array). Owned text, freed via pg_store_document_passages_free(). */
+typedef struct {
+    int chunk_id;
+    char *text;
+    int token_count;
+} PgStoreDocumentPassage;
+
+/* Reads back every chunk of `document_name` in chunk order -- what the
+ * document viewer lists as "here is everything search can find in this
+ * document". Sets *count_out to the number of chunks (0 if the document
+ * has none or doesn't exist -- not an error). Returns a newly allocated
+ * array the caller must free via pg_store_document_passages_free(), or
+ * NULL (with *count_out unset) on a database or allocation error. */
+PgStoreDocumentPassage *pg_store_get_document_passages(PgStore *store, const char *document_name,
+                                                       size_t *count_out);
+
+/* Frees an array returned by pg_store_get_document_passages(), including
+ * each entry's owned text. Safe to call with passages == NULL. */
+void pg_store_document_passages_free(PgStoreDocumentPassage *passages, size_t count);
+
+/* Removes one document and every trace of it from the currently-selected
+ * corpus, as one transaction: its postings, its passages, its documents
+ * row, and any terms left with no postings anywhere (terms are only
+ * reachable through postings, so an orphaned row can never contribute to
+ * a search -- but sweeping them keeps the terms table honest for anyone
+ * reading it directly).
+ *
+ * Consistent with rebuild-on-append rather than fighting it: the
+ * documents table is what the next rebuild re-reads, so a removed
+ * document cannot be resurrected by the next document drop. BM25's
+ * document frequencies derive from live postings rows, so the index
+ * stays correct with no rebuild.
+ *
+ * Returns 0 on success, -1 if `document_name` doesn't exist, a delete
+ * fails, or the orphan-term sweep fails (the whole operation rolls
+ * back -- never a half-deleted corpus). */
+int pg_store_remove_document(PgStore *store, const char *document_name);
+
 /* -- Rebuild-on-append primitives -- see APP_SPEC.md's "Adding documents
  * to an existing group" for the full design: a group is rebuilt (not
  * incrementally appended to) by combining its existing documents with

@@ -53,6 +53,18 @@ char *generation_generate_answer(const char *query_text, PgStore *store,
 char *generation_generate_answer_with_history(const char *query_text, PgStore *store, const BM25ResultSet *results,
                                                const LocalLlmTurn *history, size_t history_count, int thinking_override);
 
+/* Streaming counterpart of the above: identical prompt construction,
+ * windowing, and returned answer -- the same string the non-streaming
+ * call returns -- but forwards each decoded answer piece to `on_piece`
+ * live (see local_llm_client.h's streaming doc comment for the
+ * think-suppression and authority rules; the returned value remains the
+ * authoritative full answer). `thinking_override`, history, and failure
+ * contract are unchanged from the non-streaming function. */
+char *generation_generate_answer_with_history_stream(const char *query_text, PgStore *store,
+                                                      const BM25ResultSet *results, const LocalLlmTurn *history,
+                                                      size_t history_count, int thinking_override,
+                                                      LocalLlmStreamFn on_piece, void *user_data);
+
 /* "Read the whole group" counterpart: instead of BM25 passages, the
  * context block is every document currently in the active corpus (via
  * pg_store_get_all_documents()), included whole and in order until the
@@ -82,5 +94,15 @@ char *generation_generate_answer_from_documents(const char *query_text, PgStore 
  * generators. Returns NULL on prompt-building or generation failure. */
 char *generation_generate_answer_from_summary(const char *query_text, const char *summary_text,
                                               const LocalLlmTurn *history, size_t history_count);
+
+/* Streaming counterpart of generation_generate_answer_from_summary():
+ * same prompt, windowing, and returned answer; `on_piece` receives the
+ * answer text live. See local_llm_client.h's streaming doc comment.
+ * `thinking_override` follows the same convention as the passages
+ * generator (-1 = config, 0/1 forced). */
+char *generation_generate_answer_from_summary_stream(const char *query_text, const char *summary_text,
+                                                      const LocalLlmTurn *history, size_t history_count,
+                                                      int thinking_override, LocalLlmStreamFn on_piece,
+                                                      void *user_data);
 
 #endif /* LEXIS_GENERATION_H */

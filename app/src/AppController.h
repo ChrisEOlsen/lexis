@@ -74,12 +74,36 @@ class AppController : public QObject {
     Q_PROPERTY(QString activeChatSessionTitle READ activeChatSessionTitle NOTIFY activeChatSessionIdChanged)
     Q_PROPERTY(bool modelReady READ isModelReady NOTIFY modelReadyChanged)
     Q_PROPERTY(bool chatBusy READ isChatBusy NOTIFY chatBusyChanged)
+    // Live pipeline progress for the chat footer: what the running query
+    // is doing right now ("Searching the group...", "Reading 12
+    // passages...", "Writing...", "Trying again with a deeper search...").
+    // Empty when no query is running -- the footer's placeholder covers
+    // that case. A new query resets it to the routing stage's text.
+    Q_PROPERTY(QString queryStageText READ queryStageText NOTIFY queryStageTextChanged)
+    // Settings-panel state (F5). Both apply live (no restart): thinking
+    // via an explicit per-query override handed to QueryWorker (bypassing
+    // generation.c's once-per-process config cache), the reranker via
+    // retrieval_set_reranker_enabled(). Both persist through
+    // ConfigManager's line-preserving rewrite of config/lexis.conf.
+    // modelDisplayName is read-only display (its change requires a
+    // restart and stays a file edit, per the spec).
+    Q_PROPERTY(bool thinkingEnabled READ isThinkingEnabled NOTIFY settingsChanged)
+    Q_PROPERTY(bool rerankerEnabled READ isRerankerEnabled NOTIFY settingsChanged)
+    Q_PROPERTY(QString modelDisplayName READ modelDisplayName NOTIFY settingsChanged)
     // The local model's context window in tokens (LOCAL_LLM_N_CTX). CONSTANT
     // because it is a compile-time constant of the loaded model, not per
     // message -- the source inspector reports it when the READ tool fed
     // documents to the model directly, since that path's real limit is how
     // much text fits in this window.
     Q_PROPERTY(int contextTokenLimit READ contextTokenLimit CONSTANT)
+    // Whether "Try harder" would actually do something right now: the
+    // newest answer in THIS session came from SEARCH, its question is
+    // still known, and nothing blocks a query. The button binds to this
+    // instead of guessing from the message row, because the retry always
+    // acts on the conversation's newest answer -- a session loaded from
+    // history has answers but no live question to re-ask, and offering
+    // the button there produced a click that silently did nothing.
+    Q_PROPERTY(bool canRetryLastAnswer READ canRetryLastAnswer NOTIFY canRetryLastAnswerChanged)
 
 public:
     explicit AppController(QObject *parent = nullptr);
@@ -102,6 +126,10 @@ public:
     QString activeChatSessionTitle() const;
     bool isModelReady() const;
     bool isChatBusy() const;
+    QString queryStageText() const { return m_queryStageText; }
+    bool isThinkingEnabled() const { return m_thinkingEnabled; }
+    bool isRerankerEnabled() const { return m_rerankerEnabled; }
+    QString modelDisplayName() const { return m_modelDisplayName; }
     int contextTokenLimit() const;
 
     Q_INVOKABLE bool createGroup(const QString &displayName);
@@ -145,6 +173,55 @@ public:
     // the answer once QueryWorker finishes.
     Q_INVOKABLE void sendChatMessage(const QString &question);
 
+    // System clipboard for the answer actions (QML exposes no clipboard
+    // of its own; this is the one-liner a Copy button needs).
+    Q_INVOKABLE void copyToClipboard(const QString &text);
+
+    // Lets QML raise the standard message dialog (the notify() signal's
+    // Main.qml handler) -- for errors a QML component detects itself,
+    // like a document that can't be opened.
+    Q_INVOKABLE void showMessage(const QString &message) { emit notify(message); }
+
+    // -- Settings (F5): live + persisted via ConfigManager --
+    Q_INVOKABLE void setThinkingEnabled(bool enabled);
+    Q_INVOKABLE void setRerankerEnabled(bool enabled);
+
+    // A file:// URL for the directory holding config/lexis.conf, for the
+    // Settings dialog's "Open config folder" -- QML opens it with
+    // Qt.openUrlExternally (Finder on macOS). The file itself is never
+    // opened by the app: config edits are a deliberate human act.
+    Q_INVOKABLE QString configDirectoryUrl() const;
+
+    // Backs the canRetryLastAnswer property; retryLastAnswer() uses the
+    // same call as its own guard, so the button and the action can never
+    // disagree about whether a retry is possible.
+    bool canRetryLastAnswer() const;
+
+    // -- Document viewer (F1) --
+    // Loads one document's stored text and chunk list for the viewer
+    // dialog (see LexisEngine::getDocument()). Returns a QVariantMap
+    // {"name", "text", "chunks"} (chunks: [{"chunkId", "text",
+    // "tokenCount"}...]), or an empty map when the document doesn't
+    // exist or the read fails -- the QML side treats empty as "cannot
+    // open" and says so.
+    Q_INVOKABLE QVariantMap openDocument(const QString &documentName);
+
+    // -- Document removal (F4) --
+    // Removes one document from the ACTIVE group (transactionally --
+    // see pg_store_remove_document()). A no-op when a different group
+    // is ingesting or this group's index is mid-rebuild (the removal
+    // writes to the live schema; a rebuild's swap would race it).
+    Q_INVOKABLE void removeDocument(const QString &documentName);
+
+    // "Try harder" on the newest answer (see QueryWorker's forceRetry):
+    // re-runs that question's SEARCH pipeline with the deeper retrieval
+    // policy and the reasoning pass on, replacing the answer the UI
+    // shows and the row history persists. A no-op when no query is
+    // running, none ever ran in this session, or the newest exchange
+    // wasn't a SEARCH answer (retries don't make sense for CHAT or
+    // SUMMARY answers).
+    Q_INVOKABLE void retryLastAnswer();
+
     // Starts the background model load if it never ran -- the
     // constructor skips it when the model file doesn't exist yet (fresh
     // install), and the setup overlay calls this once the download
@@ -166,6 +243,10 @@ signals:
     void ingestStateChanged();
     void modelReadyChanged();
     void chatBusyChanged();
+    void queryStageTextChanged();
+    void canRetryLastAnswerChanged();
+    // Thinking/reranker/model-display changed (Settings panel).
+    void settingsChanged();
     // Reused for both real errors and informational results (e.g. "N
     // passages added") -- QML shows both the same way, as a dismissible
     // message dialog; splitting into two signals would just double the
@@ -174,11 +255,13 @@ signals:
 
 private slots:
     void onIngestFinished(bool ok, bool cancelled, qint64 totalPassages, QStringList skipped,
-                           QStringList malformed, QStringList noTextFound);
+                            QStringList malformed, QStringList noTextFound);
     void onIngestProgress(int filesDone, int filesTotal, qint64 indexEtaMs);
     void onModelLoadFinished(bool ok);
     void onQueryFinished(bool ok, QString answer, QVariantList sources, QString tool,
-                         QString searchQuery, QString searchTerms);
+                          QString searchQuery, QString searchTerms);
+    void onQueryStage(int stage, int payload);
+    void onQueryToken(QString piece);
 
 private:
     void refreshCorpusModel();
@@ -212,12 +295,45 @@ private:
     QString m_statusText;
     bool m_modelReady;
     bool m_chatBusy;
+    QString m_queryStageText;
+    // The question behind the running/last query, for retryLastAnswer():
+    // a retry re-asks it, not a reformulation (the pipeline re-derives
+    // everything else). Also remembers whether that query's answer was
+    // a SEARCH answer, for the same no-op guards.
+    QString m_lastQuestion;
+    bool m_lastAnswerWasSearch = false;
+    // The last answer's own display fields, so a failed retry can put
+    // the original answer back (a "try harder" must never destroy the
+    // answer it was trying to improve).
+    QString m_lastAnswer;
+    QVariantList m_lastAnswerSources;
+    QString m_lastAnswerTool;
+    QString m_lastAnswerSearchQuery;
+    QString m_lastAnswerSearchTerms;
+    // True while the running query is a "try harder" retry whose live row
+    // is a converted (cleared) previous answer -- on failure that answer
+    // is restored rather than the row discarded. See retryLastAnswer().
+    bool m_retryingLiveAnswer = false;
+    // Keep the m_last* block above describing the ACTIVE session's newest
+    // exchange. Switching sessions without this let a retry run one
+    // session's question against another session's id and overwrite an
+    // unrelated answer. adoptLastExchange() reads the state back out of a
+    // session loaded from history, so the button stays usable there.
+    void clearLastExchange();
+    void adoptLastExchange(const QVector<ChatMessage> &messages);
     QString m_modelPath; // from config/lexis.conf, resolved once in the constructor
     QString m_connInfo;  // from config/lexis.conf db_conninfo -- embeds the password, never shown
 
     StopwordSet *m_stopwords;
     WordNetTable *m_wordnet;
     Lemmatizer *m_lemmatizer;
+
+    // Settings state (F5): read once at startup from the same file
+    // ConfigManager writes, applied live per-query (see the property
+    // comment above), and kept in sync by the setters.
+    bool m_thinkingEnabled = true;
+    bool m_rerankerEnabled = false;
+    QString m_modelDisplayName;
 };
 
 #endif // LEXIS_APP_APPCONTROLLER_H

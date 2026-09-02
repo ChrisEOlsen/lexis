@@ -96,7 +96,44 @@ bool LexisEngine::deleteCorpus(qint64 corpusId) {
     return true;
 }
 
-bool LexisEngine::listDocumentNames(QVector<QString> *out) {
+bool LexisEngine::getDocument(const QString &documentName, QString *textOut, QVariantList *chunksOut) {
+    if (textOut == nullptr || chunksOut == nullptr) {
+        return false;
+    }
+    textOut->clear();
+    chunksOut->clear();
+    if (!isConnected()) {
+        m_lastError = QStringLiteral("Not connected to the database.");
+        return false;
+    }
+
+    char *text = pg_store_get_document_text(m_store, documentName.toUtf8().constData());
+    if (text == nullptr) {
+        captureError("Failed to read document.");
+        return false;
+    }
+    *textOut = QString::fromUtf8(text);
+    free(text);
+
+    size_t chunk_count = 0;
+    PgStoreDocumentPassage *chunks =
+        pg_store_get_document_passages(m_store, documentName.toUtf8().constData(), &chunk_count);
+    if (chunks == nullptr) {
+        captureError("Failed to read document passages.");
+        return false;
+    }
+    for (size_t i = 0; i < chunk_count; i++) {
+        QVariantMap chunk;
+        chunk[QStringLiteral("chunkId")] = chunks[i].chunk_id;
+        chunk[QStringLiteral("text")] = QString::fromUtf8(chunks[i].text);
+        chunk[QStringLiteral("tokenCount")] = chunks[i].token_count;
+        chunksOut->append(chunk);
+    }
+    pg_store_document_passages_free(chunks, chunk_count);
+    return true;
+}
+
+bool LexisEngine::listDocumentStats(QVariantList *out) {
     out->clear();
     if (!isConnected()) {
         m_lastError = QStringLiteral("Not connected to the database.");
@@ -104,17 +141,31 @@ bool LexisEngine::listDocumentNames(QVector<QString> *out) {
     }
 
     size_t count = 0;
-    PgStoreDocument *docs = pg_store_get_all_documents(m_store, &count);
-    if (docs == nullptr) {
-        captureError("Failed to list documents.");
+    PgStoreDocumentStats *stats = pg_store_list_document_stats(m_store, &count);
+    if (stats == nullptr) {
+        captureError("Failed to list document stats.");
         return false;
     }
-
-    out->reserve(static_cast<int>(count));
     for (size_t i = 0; i < count; i++) {
-        out->append(QString::fromUtf8(docs[i].document_name));
+        QVariantMap entry;
+        entry[QStringLiteral("name")] = QString::fromUtf8(stats[i].document_name);
+        entry[QStringLiteral("passageCount")] = static_cast<qlonglong>(stats[i].passage_count);
+        entry[QStringLiteral("tokenCount")] = static_cast<qlonglong>(stats[i].total_tokens);
+        out->append(entry);
     }
-    pg_store_documents_free(docs, count);
+    pg_store_document_stats_free(stats, count);
+    return true;
+}
+
+bool LexisEngine::removeDocument(const QString &documentName) {
+    if (!isConnected()) {
+        m_lastError = QStringLiteral("Not connected to the database.");
+        return false;
+    }
+    if (pg_store_remove_document(m_store, documentName.toUtf8().constData()) != 0) {
+        captureError("Failed to remove document.");
+        return false;
+    }
     return true;
 }
 

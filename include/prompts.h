@@ -75,12 +75,80 @@
     "Write the answer as plain prose for the reader. Do not mention the "    \
     "material you were given, do not refer to \"the context\" or \"the "     \
     "summary\", do not cite source labels or chunk numbers, and do not "     \
-    "describe how you know what you know -- just answer. "
+    "describe how you know what you know -- just answer. The one "           \
+    "exception is saying what the documents do not state, which the rule "   \
+    "above requires when they leave the question open: say that in the "     \
+    "reader's own terms (\"the documents don't give a figure for X\"), "     \
+    "never as \"the context\" or \"chunk 4\". Prose is the default shape, "  \
+    "but when you are laying out several separate findings, a short list "   \
+    "of them is clearer and is fine. "
 
-/* The anti-hallucination floor for every grounded answer. */
+/* The anti-hallucination floor for every grounded answer.
+ *
+ * This used to be a single line -- "if the material does not contain
+ * enough information to answer, say so rather than guessing" -- which
+ * gave the model only two moves: a confident answer, or a refusal. Real
+ * retrieved material is very often neither. It half-answers: the right
+ * topic with the specific number missing, two figures that disagree, a
+ * spec given for the trim level next to the one asked about. Faced with
+ * that and only two moves available, a model does not refuse -- refusing
+ * feels wrong when it is plainly holding relevant text -- so it picks the
+ * nearest plausible value and states it flatly. The user cannot tell that
+ * answer apart from one the documents actually support.
+ *
+ * So the rule is now a decision with three outcomes, and the middle one
+ * is the point of the change: settled -> answer; partial or conflicting
+ * -> report what was actually found, with its conditions attached, and
+ * name what is still open; nothing relevant at all -> say it is not
+ * covered. Split across two macros only so the ANSWER_FROM_SUMMARY path
+ * can take the first without the passage-shaped second. */
 #define LEXIS_PROMPT_RULE_GROUNDED                                           \
-    "If the material does not contain enough information to answer, say so " \
-    "rather than guessing. "
+    "Answer only from the material provided, and work out first whether "    \
+    "it actually settles the question. If it states the answer outright, "   \
+    "give that answer directly and plainly. "
+
+/* The middle outcome. "Do not choose the most likely answer and state it
+ * as fact" is the load-bearing sentence: without it a model treats a
+ * near-miss passage as close enough and rounds it up to certainty.
+ *
+ * The specific prohibitions at the end are the three ways that rounding
+ * up actually shows up in this pipeline -- filling the missing half from
+ * what the model knows about the subject generally, quietly picking one
+ * of two conflicting figures (or splitting the difference), and carrying
+ * a value across from the neighbouring case that happened to be in the
+ * same passage. Each is a plausible-looking answer with nothing behind
+ * it, which is exactly the failure the retrieved text was meant to
+ * prevent. */
+#define LEXIS_PROMPT_RULE_UNCERTAINTY                                        \
+    "If it does not -- the material is partial, ambiguous, gives "           \
+    "conflicting figures, or covers a case close to but not the same as "    \
+    "the one asked about -- then do not choose the most likely answer and "  \
+    "state it as fact. Set out instead what the material does give: the "    \
+    "specific figures, conditions, names, steps or statements bearing on "   \
+    "the question, each with the conditions that came with it, and say "     \
+    "plainly which part of the question they leave open. Several separate "  \
+    "findings are clearer as a short list. Never fill a gap from general "   \
+    "knowledge, never reconcile or average values that disagree, and "       \
+    "never give a figure stated for one case as though it applied to "      \
+    "another. Only when nothing in the material bears on the question at "   \
+    "all should you say it is not covered. "
+
+/* Passage-path only. The retrieved set comes from BM25 -- keyword
+ * scoring, not comprehension -- so a passage can rank highly on shared
+ * words while being about something else entirely, and the reranker
+ * reorders that set rather than filtering it. The model is never told
+ * this, and the natural reading of "here is your context" is that
+ * everything in it was chosen because it belongs. Saying where the
+ * passages came from is what makes the rule above usable: to judge
+ * whether the material settles the question, the model first has to know
+ * it is allowed to conclude that a passage in front of it does not
+ * count. */
+#define LEXIS_PROMPT_RULE_KEYWORD_MATCHES                                    \
+    "The passages below were found by matching words in the question, so "   \
+    "some of them may share wording with it without being about it. "       \
+    "Shared wording is not evidence that a passage answers the question: "   \
+    "check that a passage really concerns what was asked before relying "    \
+    "on it, and disregard the ones that do not. "
 
 /* -- Tool routing ------------------------------------------------------ */
 
@@ -224,10 +292,16 @@
 /* -- Answer generation ------------------------------------------------- */
 
 /* SEARCH path: answer from BM25-retrieved passages. Caller appends the
- * labelled passage blocks, then the question. */
+ * labelled passage blocks, then the question.
+ *
+ * Rule order is the order the model has to make the decisions in: what
+ * the passages are and how far to trust them, then whether they settle
+ * the question, then what to do when they do not, then how to write it. */
 #define LEXIS_PROMPT_ANSWER_FROM_PASSAGES_HEAD                               \
     "You are answering a question using only the provided context. "         \
+    LEXIS_PROMPT_RULE_KEYWORD_MATCHES                                        \
     LEXIS_PROMPT_RULE_GROUNDED                                               \
+    LEXIS_PROMPT_RULE_UNCERTAINTY                                            \
     LEXIS_PROMPT_RULE_NO_ASK_FOR_DOCS                                        \
     LEXIS_PROMPT_RULE_PLAIN_PROSE                                            \
     "\n\nContext:\n\n"
@@ -240,16 +314,32 @@
     "You are answering a question using the full text of the documents "     \
     "below. "                                                                \
     LEXIS_PROMPT_RULE_GROUNDED                                               \
+    LEXIS_PROMPT_RULE_UNCERTAINTY                                            \
     LEXIS_PROMPT_RULE_NO_ASK_FOR_DOCS                                        \
     LEXIS_PROMPT_RULE_PLAIN_PROSE                                            \
     "\n\nContext:\n\n"
 
 /* SUMMARY path: answer a broad question from the group's cached overview
- * (corpus_summary.h) instead of from document text. */
+ * (corpus_summary.h) instead of from document text.
+ *
+ * No _UNCERTAINTY here, and the added rule is its narrower cousin. This
+ * path is reached for questions about the collection as a whole, which
+ * the overview is by construction able to answer -- hedging over a broad
+ * question it does answer would be a regression. The one real gap is a
+ * misroute: a question naming a specific detail lands here, the overview
+ * has the topic but not the number, and the model supplies a number. So
+ * the instruction is scoped to exactly that -- do not invent a specific
+ * the overview does not hold; say what it does cover and that the detail
+ * itself is a lookup. */
 #define LEXIS_PROMPT_ANSWER_FROM_SUMMARY_HEAD                                \
     "You are answering a question about a collection of documents, using "   \
     "the overview of that collection given below. The overview describes "   \
-    "documents that have already been provided and indexed. "                \
+    "documents that have already been provided and indexed. It describes "   \
+    "the collection in general terms and does not hold the details inside "  \
+    "the documents, so if the question asks for a specific fact, figure "    \
+    "or instruction, never produce one that is not in the overview: say "    \
+    "what the overview does show about that topic, and that the detail "     \
+    "itself would have to be looked up in the documents. "                   \
     LEXIS_PROMPT_RULE_NO_ASK_FOR_DOCS                                        \
     LEXIS_PROMPT_RULE_PLAIN_PROSE                                            \
     "\n\nCollection overview:\n\n"

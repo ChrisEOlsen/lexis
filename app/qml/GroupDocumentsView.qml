@@ -1,7 +1,8 @@
 // Drill-down level 2: the active group's documents -- header (back +
-// name), document list, drag-and-drop ingestion, and an "Add Documents"
-// file picker. Emits `backRequested`, same "doesn't know about its own
-// StackView" shape as GroupsListView.
+// name), document list (click to view a document's indexed text and
+// chunks, "..." menu to remove it), drag-and-drop ingestion, and an
+// "Add Documents" file picker. Emits `backRequested`, same "doesn't know
+// about its own StackView" shape as GroupsListView.
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -14,6 +15,16 @@ Item {
     id: root
 
     signal backRequested()
+
+    property string pendingRemoveName: ""
+
+    function openDocumentViewer(name) {
+        documentViewer.openFor(name, -1)
+    }
+
+    DocumentViewerDialog {
+        id: documentViewer
+    }
 
     // NOT `enabled: !AppController.busy` on the root. That froze this
     // whole panel during an ingest -- including the back button, which
@@ -71,20 +82,61 @@ Item {
                 id: docDelegate
                 required property var model
                 width: documentList.width
-                // Not clickable: there is no document detail view yet, so
-                // the row is presentational. hoverEnabled/press feedback
-                // would promise an interaction that does not exist.
-                enabled: false
 
-                contentItem: Label {
-                    // docDelegate.model, not parent.model: `parent` is
-                    // whatever visual parent the Control gives its
-                    // contentItem, which is only correct by accident.
-                    text: docDelegate.model.name
-                    color: docDelegate.palette.text
-                    elide: Text.ElideRight
-                    verticalAlignment: Text.AlignVCenter
+                contentItem: RowLayout {
+                    spacing: Theme.spacingXS
+
+                    ColumnLayout {
+                        spacing: 0
+                        Layout.fillWidth: true
+
+                        Label {
+                            text: docDelegate.model.name
+                            color: docDelegate.palette.text
+                            Layout.fillWidth: true
+                            elide: Text.ElideRight
+                        }
+
+                        // The at-a-glance corpus numbers: how much of the
+                        // index this document actually is. Placeholder
+                        // styling on purpose -- a caption, not a second
+                        // line competing with the name.
+                        Label {
+                            visible: docDelegate.model.passageCount !== undefined
+                            text: docDelegate.model.passageCount + " passages"
+                            color: docDelegate.palette.placeholderText
+                            font.pixelSize: Theme.fontSizeCaption
+                            Layout.fillWidth: true
+                            elide: Text.ElideRight
+                        }
+                    }
+
+                    ToolButton {
+                        text: "⋯"
+                        font.pixelSize: 16
+                        implicitWidth: 28
+                        implicitHeight: 28
+                        // Consumes the press, so opening the menu does
+                        // not also open the viewer.
+                        onClicked: rowMenu.popup()
+
+                        Menu {
+                            id: rowMenu
+
+                            MenuItem {
+                                text: qsTr("Remove document…")
+                                onTriggered: {
+                                    root.pendingRemoveName = docDelegate.model.name
+                                    removeConfirm.open()
+                                }
+                            }
+                        }
+                    }
                 }
+
+                // Click opens the document viewer (DocumentViewerDialog)
+                // -- the row is a real thing now, not a dead label.
+                onClicked: root.openDocumentViewer(docDelegate.model.name)
             }
 
             // Empty state -- previously the list just showed nothing,
@@ -193,6 +245,39 @@ Item {
             // ingestFiles walks a dropped-or-picked folder recursively and
             // keeps only supported types -- same path as drag-and-drop.
             AppController.ingestFiles([selectedFolder.toString()])
+        }
+    }
+
+    // Removal confirm, same stock-dialog pattern as group deletion.
+    // Names the passages explicitly: what vanishes is this document's
+    // searchable text -- the source file on disk is untouched.
+    Dialog {
+        id: removeConfirm
+        title: qsTr("Remove document")
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        standardButtons: Dialog.Cancel | Dialog.Discard
+        onDiscarded: {
+            AppController.removeDocument(root.pendingRemoveName)
+            removeConfirm.close()
+        }
+
+        ColumnLayout {
+            width: removeConfirm.availableWidth
+            spacing: Theme.spacingS
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("Remove \"%1\" from this group?").arg(root.pendingRemoveName)
+                font.weight: Theme.fontWeightBold
+            }
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("Its text becomes unsearchable here and its passages stop appearing in answers. The original file on disk is not deleted. This cannot be undone.")
+            }
         }
     }
 }

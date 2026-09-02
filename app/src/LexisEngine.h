@@ -17,6 +17,7 @@
 
 #include <QDateTime>
 #include <QString>
+#include <QVariantList>
 #include <QVector>
 
 extern "C" {
@@ -89,11 +90,24 @@ public:
     // corpusId doesn't exist or the deletion fails.
     bool deleteCorpus(qint64 corpusId);
 
-    // Lists every document's name in whichever corpus useCorpus() last
-    // scoped this connection to -- reads through that same scoped
-    // connection, doesn't take a corpus id of its own. Returns false on
-    // failure (*out left empty, not partially filled).
-    bool listDocumentNames(QVector<QString> *out);
+    // -- Per-document reads and removal (document viewer / management).
+    // All operate on the corpus this connection is currently scoped to
+    // (whichever useCorpus() last selected). --
+
+    // One document's viewer payload: full stored text plus every chunk
+    // as {"chunkId", "text", "tokenCount"} maps, chunk order. False if
+    // the document doesn't exist or the read fails.
+    bool getDocument(const QString &documentName, QString *textOut, QVariantList *chunksOut);
+
+    // Per-document {name, passageCount, tokenCount} maps for the
+    // document list, one round trip.
+    bool listDocumentStats(QVariantList *out);
+
+    // Removes documentName (and its passages/postings/orphaned terms)
+    // from the scoped corpus, transactionally. False if the name is
+    // unknown, the connection is down, or any step fails (in which
+    // case nothing changed).
+    bool removeDocument(const QString &documentName);
 
     // -- Chat sessions -- take corpusId/sessionId directly as SQL
     // parameters rather than relying on useCorpus()'s search_path, since

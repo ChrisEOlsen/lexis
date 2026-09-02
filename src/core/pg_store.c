@@ -522,6 +522,220 @@ void pg_store_chat_messages_free(PgStoreChatMessage *messages, size_t count) {
     free(messages);
 }
 
+int pg_store_update_last_assistant_message(PgStore *store, int64_t session_id, const char *text,
+                                            const char *sources_json) {
+    char id_str[32];
+    snprintf(id_str, sizeof(id_str), "%lld", (long long)session_id);
+    const char *params[3] = {id_str, text, sources_json};
+    /* The WHERE guards make this safe by construction: only a session's
+     * single newest row is even a candidate (ORDER BY id DESC LIMIT 1
+     * inside the subselect), and only if that row is an assistant row --
+     * a session whose last message is the user's question has nothing
+     * for a retry to replace, and the 0-rows-affected result surfaces
+     * that as -1 below rather than silently updating some older answer. */
+    PGresult *res = PQexecParams(
+        store->conn,
+        "UPDATE public.chat_messages SET text = $2, sources = $3::jsonb "
+        "WHERE id = (SELECT id FROM public.chat_messages WHERE session_id = $1 ORDER BY id DESC LIMIT 1) "
+        "  AND is_user = false;",
+        3, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "pg_store_update_last_assistant_message: update failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        return -1;
+    }
+    int affected = atoi(PQcmdTuples(res));
+    PQclear(res);
+    if (affected == 0) {
+        fprintf(stderr, "pg_store_update_last_assistant_message: session %lld has no assistant message to update\n",
+                (long long)session_id);
+        return -1;
+    }
+    return 0;
+}
+
+PgStoreDocumentStats *pg_store_list_document_stats(PgStore *store, size_t *count_out) {
+    PGresult *res = PQexec(store->conn,
+                           "SELECT document_name, COUNT(*) AS passage_count, "
+                           "COALESCE(SUM(token_count), 0) AS total_tokens "
+                           "FROM passages GROUP BY document_name ORDER BY document_name;");
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        fprintf(stderr, "pg_store_list_document_stats: select failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        return NULL;
+    }
+
+    int rows = PQntuples(res);
+    PgStoreDocumentStats *stats = malloc(sizeof(PgStoreDocumentStats) * (size_t)(rows > 0 ? rows : 1));
+    if (stats == NULL) {
+        PQclear(res);
+        return NULL;
+    }
+
+    for (int r = 0; r < rows; r++) {
+        stats[r].document_name = strdup(PQgetvalue(res, r, 0));
+        stats[r].passage_count = atol(PQgetvalue(res, r, 1));
+        stats[r].total_tokens = atol(PQgetvalue(res, r, 2));
+        if (stats[r].document_name == NULL) {
+            PQclear(res);
+            pg_store_document_stats_free(stats, (size_t)r + 1);
+            return NULL;
+        }
+    }
+    PQclear(res);
+
+    *count_out = (size_t)rows;
+    return stats;
+}
+
+void pg_store_document_stats_free(PgStoreDocumentStats *stats, size_t count) {
+    if (stats == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        free(stats[i].document_name);
+    }
+    free(stats);
+}
+
+char *pg_store_get_document_text(PgStore *store, const char *document_name) {
+    const char *params[1] = {document_name};
+    PGresult *res = PQexecParams(store->conn, "SELECT text FROM documents WHERE document_name = $1;", 1, NULL,
+                                 params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        fprintf(stderr, "pg_store_get_document_text: select failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        return NULL;
+    }
+    if (PQntuples(res) == 0) {
+        PQclear(res);
+        return NULL;
+    }
+    char *text = strdup(PQgetvalue(res, 0, 0));
+    PQclear(res);
+    return text;
+}
+
+PgStoreDocumentPassage *pg_store_get_document_passages(PgStore *store, const char *document_name,
+                                                       size_t *count_out) {
+    const char *params[1] = {document_name};
+    PGresult *res = PQexecParams(store->conn,
+                                 "SELECT chunk_id, text, token_count FROM passages "
+                                 "WHERE document_name = $1 ORDER BY chunk_id;",
+                                 1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        fprintf(stderr, "pg_store_get_document_passages: select failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        return NULL;
+    }
+
+    int rows = PQntuples(res);
+    PgStoreDocumentPassage *passages = malloc(sizeof(PgStoreDocumentPassage) * (size_t)(rows > 0 ? rows : 1));
+    if (passages == NULL) {
+        PQclear(res);
+        return NULL;
+    }
+
+    for (int r = 0; r < rows; r++) {
+        passages[r].chunk_id = atoi(PQgetvalue(res, r, 0));
+        passages[r].text = strdup(PQgetvalue(res, r, 1));
+        passages[r].token_count = atoi(PQgetvalue(res, r, 2));
+        if (passages[r].text == NULL) {
+            PQclear(res);
+            pg_store_document_passages_free(passages, (size_t)r + 1);
+            return NULL;
+        }
+    }
+    PQclear(res);
+
+    *count_out = (size_t)rows;
+    return passages;
+}
+
+void pg_store_document_passages_free(PgStoreDocumentPassage *passages, size_t count) {
+    if (passages == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        free(passages[i].text);
+    }
+    free(passages);
+}
+
+int pg_store_remove_document(PgStore *store, const char *document_name) {
+    const char *params[1] = {document_name};
+
+    if (pg_store_begin_transaction(store) != 0) {
+        return -1;
+    }
+
+    /* Postings first -- they reference the passages rows being deleted.
+     * Everything runs in one transaction, so a failure at any step
+     * rolls the whole removal back (see pg_store.h's doc comment). */
+    PGresult *res = PQexecParams(
+        store->conn,
+        "DELETE FROM postings WHERE passage_id IN "
+        "(SELECT id FROM passages WHERE document_name = $1);",
+        1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "pg_store_remove_document: postings delete failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        pg_store_rollback_transaction(store);
+        return -1;
+    }
+    PQclear(res);
+
+    res = PQexecParams(store->conn, "DELETE FROM passages WHERE document_name = $1;", 1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "pg_store_remove_document: passages delete failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        pg_store_rollback_transaction(store);
+        return -1;
+    }
+    int passages_deleted = atoi(PQcmdTuples(res));
+    PQclear(res);
+
+    res = PQexecParams(store->conn, "DELETE FROM documents WHERE document_name = $1;", 1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "pg_store_remove_document: documents delete failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        pg_store_rollback_transaction(store);
+        return -1;
+    }
+    int documents_deleted = atoi(PQcmdTuples(res));
+    PQclear(res);
+
+    if (documents_deleted == 0) {
+        /* Unknown document name -- nothing matched, so nothing was
+         * modified; roll back (the postings/passage deletes were no-ops
+         * against a name with no rows) and report failure. */
+        fprintf(stderr, "pg_store_remove_document: no document named '%s'\n", document_name);
+        pg_store_rollback_transaction(store);
+        return -1;
+    }
+
+    /* Sweep terms orphaned by the deletions (not just this document's --
+     * also any a PREVIOUS partial state left behind). NOT EXISTS is a
+     * plain anti-join against the live postings table, so it stays
+     * correct regardless of how many documents share a term. */
+    res = PQexec(store->conn,
+                 "DELETE FROM terms WHERE NOT EXISTS "
+                 "(SELECT 1 FROM postings WHERE postings.term_id = terms.id);");
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "pg_store_remove_document: terms sweep failed: %s\n", PQerrorMessage(store->conn));
+        PQclear(res);
+        pg_store_rollback_transaction(store);
+        return -1;
+    }
+    PQclear(res);
+    (void)passages_deleted;
+
+    if (pg_store_commit_transaction(store) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 /* Lives in public next to public.corpora -- see pg_store.h's "Group
  * summaries" comment for why the cache can't live in the corpus's own
  * schema. PRIMARY KEY on corpus_id, not a generated id: there is exactly

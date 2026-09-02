@@ -1,4 +1,5 @@
 #include "AppController.h"
+#include "ConfigManager.h"
 #include "CorpusListModel.h"
 #include "DocumentListModel.h"
 #include "IngestWorker.h"
@@ -10,15 +11,19 @@ extern "C" {
 #include "config.h"
 #include "local_llm_client.h"
 #include "paths.h"
+#include "retrieval.h"
 }
 
 #include <cstdlib>
 
+#include <QClipboard>
 #include <QDirIterator>
 #include <QFileInfo>
+#include <QGuiApplication>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QModelIndex>
 #include <QUrl>
 
 namespace {
@@ -76,6 +81,15 @@ AppController::AppController(QObject *parent)
     if (QFileInfo::exists(m_modelPath)) {
         retryModelLoad();
     }
+
+    // Settings state (F5): read through the same file the Settings
+    // panel will rewrite. The reranker's live gate starts in whatever
+    // state the config implies -- the first query's lazy init reads the
+    // config line itself, so an absent line needs no explicit call.
+    const QString configPath = QString::fromUtf8(lexis_paths_config_file());
+    m_thinkingEnabled = ConfigManager(configPath).thinkingEnabled();
+    m_rerankerEnabled = ConfigManager(configPath).rerankerEnabled();
+    m_modelDisplayName = QFileInfo(m_modelPath).fileName();
 }
 
 void AppController::retryModelLoad() {
@@ -198,7 +212,7 @@ bool AppController::deleteGroup(qint64 corpusId) {
     if (corpusId == m_activeCorpusId) {
         m_activeCorpusId = -1;
         m_activeCorpusName.clear();
-        m_documentModel->setDocumentNames({});
+        m_documentModel->setDocuments({});
         // The chat state has to be torn down too, not just the documents.
         // Deleting the active group used to leave the conversation sitting
         // on screen and the deleted group's sessions still listed in the
@@ -211,6 +225,7 @@ bool AppController::deleteGroup(qint64 corpusId) {
         m_chatSessionModel->setSessions({});
         startNewChat();
         emit activeCorpusIdChanged();
+        emit canRetryLastAnswerChanged();
     }
     refreshCorpusModel();
     return true;
@@ -256,13 +271,61 @@ void AppController::selectGroup(qint64 corpusId) {
     startNewChat();
 
     emit activeCorpusIdChanged();
+    emit canRetryLastAnswerChanged();
 }
 
 void AppController::startNewChat() {
     m_activeChatSessionId = -1;
     m_activeChatSessionTitle = tr("New Chat");
     m_chatModel->setMessages({});
+    clearLastExchange();
     emit activeChatSessionIdChanged();
+    emit canRetryLastAnswerChanged();
+}
+
+// The m_last* fields describe the newest exchange of the session on
+// screen. They must be cleared or re-derived on every session change:
+// left stale, retryLastAnswer()'s guards all pass and the retry runs the
+// PREVIOUS session's question against the current session's id, then
+// replaces this session's newest answer with the result.
+void AppController::clearLastExchange() {
+    m_lastQuestion.clear();
+    m_lastAnswerWasSearch = false;
+    m_lastAnswer.clear();
+    m_lastAnswerSources.clear();
+    m_lastAnswerTool.clear();
+    m_lastAnswerSearchQuery.clear();
+    m_lastAnswerSearchTerms.clear();
+}
+
+// Reads the newest exchange back out of a session loaded from history,
+// so "Try harder" works there exactly as it does on a fresh answer. Only
+// a trailing assistant message qualifies: the retry replaces the last
+// answer, so there has to be one, and the question it re-asks is the
+// user message immediately before it.
+void AppController::adoptLastExchange(const QVector<ChatMessage> &messages) {
+    clearLastExchange();
+    if (messages.isEmpty() || messages.last().isUser) {
+        return;
+    }
+    const ChatMessage &answer = messages.last();
+    int questionIndex = -1;
+    for (int i = messages.size() - 2; i >= 0; i--) {
+        if (messages.at(i).isUser) {
+            questionIndex = i;
+            break;
+        }
+    }
+    if (questionIndex < 0) {
+        return; // an answer with no question above it: nothing to re-ask
+    }
+    m_lastQuestion = messages.at(questionIndex).text;
+    m_lastAnswer = answer.text;
+    m_lastAnswerSources = answer.sources;
+    m_lastAnswerTool = answer.tool;
+    m_lastAnswerSearchQuery = answer.searchQuery;
+    m_lastAnswerSearchTerms = answer.searchTerms;
+    m_lastAnswerWasSearch = (answer.tool == QStringLiteral("search"));
 }
 
 void AppController::selectChatSession(qint64 sessionId) {
@@ -307,8 +370,10 @@ void AppController::selectChatSession(qint64 sessionId) {
                                     /*isFresh=*/false});
     }
     m_chatModel->setMessages(messages);
+    adoptLastExchange(messages);
 
     emit activeChatSessionIdChanged();
+    emit canRetryLastAnswerChanged();
 }
 
 void AppController::deleteChatSession(qint64 sessionId) {
@@ -387,6 +452,7 @@ void AppController::ingestFiles(const QStringList &fileUrls) {
     m_ingestAnimMs = 0;
     m_ingestStatusText = tr("Preparing...");
     emit ingestStateChanged();
+    emit canRetryLastAnswerChanged();
 
     m_activeWorker = new IngestWorker(m_connInfo, m_activeCorpusId, localPaths, m_stopwords,
                                        m_wordnet, m_lemmatizer, this);
@@ -403,6 +469,7 @@ void AppController::cancelIngest() {
     m_activeWorker->requestCancel();
     m_ingestStatusText = tr("Cancelling...");
     emit ingestStateChanged();
+    emit canRetryLastAnswerChanged();
 }
 
 void AppController::onIngestProgress(int filesDone, int filesTotal, qint64 indexEtaMs) {
@@ -424,6 +491,7 @@ void AppController::onIngestProgress(int filesDone, int filesTotal, qint64 index
                          : tr("Building the search index (about %1 minutes)...").arg((seconds + 30) / 60);
     }
     emit ingestStateChanged();
+    emit canRetryLastAnswerChanged();
 }
 
 void AppController::onIngestFinished(bool ok, bool cancelled, qint64 totalPassages, QStringList skipped,
@@ -439,6 +507,7 @@ void AppController::onIngestFinished(bool ok, bool cancelled, qint64 totalPassag
     m_ingestAnimMs = 0;
     m_ingestStatusText.clear();
     emit ingestStateChanged();
+    emit canRetryLastAnswerChanged();
 
     if (ok && totalPassages > 0) {
         refreshDocumentModel();
@@ -515,10 +584,19 @@ void AppController::sendChatMessage(const QString &question) {
 
     m_chatBusy = true;
     emit chatBusyChanged();
+    m_lastQuestion = question;
+    m_lastAnswerWasSearch = false; // not known until the router picks a tool
+    m_retryingLiveAnswer = false;
+    emit canRetryLastAnswerChanged();
+    m_queryStageText = tr("Working...");
+    emit queryStageTextChanged();
 
     m_activeQueryWorker = new QueryWorker(m_connInfo, m_activeCorpusId, m_activeChatSessionId,
-                                           question, m_stopwords, m_wordnet, m_lemmatizer, this);
+                                           question, m_stopwords, m_wordnet, m_lemmatizer, /*forceRetry=*/false,
+                                           m_thinkingEnabled ? 1 : 0);
     connect(m_activeQueryWorker, &QueryWorker::queryFinished, this, &AppController::onQueryFinished);
+    connect(m_activeQueryWorker, &QueryWorker::queryStage, this, &AppController::onQueryStage);
+    connect(m_activeQueryWorker, &QueryWorker::queryToken, this, &AppController::onQueryToken);
     connect(m_activeQueryWorker, &QThread::finished, m_activeQueryWorker, &QObject::deleteLater);
     m_activeQueryWorker->start();
 }
@@ -527,6 +605,7 @@ void AppController::onModelLoadFinished(bool ok) {
     m_modelLoader = nullptr; // cleaned up by the QThread::finished->deleteLater() connection
     m_modelReady = ok;
     emit modelReadyChanged();
+    emit canRetryLastAnswerChanged();
     if (!ok) {
         emit notify(tr("Could not load the local model from %1.").arg(m_modelPath));
     }
@@ -537,18 +616,179 @@ void AppController::onQueryFinished(bool ok, QString answer, QVariantList source
     m_activeQueryWorker = nullptr; // cleaned up by the QThread::finished->deleteLater() connection
     m_chatBusy = false;
     emit chatBusyChanged();
+    m_queryStageText.clear();
+    emit queryStageTextChanged();
 
     if (!ok) {
+        if (m_retryingLiveAnswer) {
+            // A failed retry must not destroy the answer it was trying to
+            // improve: put the original back (the persisted row was never
+            // touched -- QueryWorker's replace runs only on success).
+            m_chatModel->restoreLastAssistant(m_lastAnswer, m_lastAnswerSources, m_lastAnswerTool,
+                                              m_lastAnswerSearchQuery, m_lastAnswerSearchTerms);
+            m_retryingLiveAnswer = false;
+            // m_lastAnswerWasSearch is deliberately NOT touched on this
+            // path: the original answer is back, unchanged, so a second
+            // "try harder" on the same exchange must still be offered.
+            // (A failed query reports an empty tool, so assigning from it
+            // here would silently disable the button.)
+            emit canRetryLastAnswerChanged();
+            emit notify(tr("Couldn't improve that answer -- the original is unchanged."));
+            return;
+        } else {
+            // A failed query leaves no trace in the conversation (same as
+            // before streaming: nothing was persisted) -- the live row, if
+            // one ever appeared, goes away with it.
+            m_chatModel->discardLive();
+        }
         emit notify(tr("Could not answer that question -- see the console for details."));
+        emit canRetryLastAnswerChanged();
         return;
     }
+    m_retryingLiveAnswer = false;
+    m_lastAnswerWasSearch = (tool == QStringLiteral("search"));
+    m_lastAnswer = answer;
+    m_lastAnswerSources = sources;
+    m_lastAnswerTool = tool;
+    m_lastAnswerSearchQuery = searchQuery;
+    m_lastAnswerSearchTerms = searchTerms;
     // QueryWorker always sends a real, displayable answer on ok == true
     // now -- "nothing to search for" and "no matching passages" are
     // themselves the answer text (and already persisted to
     // chat_messages by QueryWorker), not a sentinel this slot has to
     // special-case into a synthesized message of its own; doing that
     // here would desync what's shown live from what's actually stored.
-    m_chatModel->addMessage(answer, false, sources, tool, searchQuery, searchTerms);
+    // The live row (created on the first streamed token) is finalized
+    // with the authoritative text; when no token ever arrived (empty
+    // reply, or a stage that answers before generation) finishLive()
+    // falls back to an ordinary append internally.
+    m_chatModel->finishLive(answer, sources, tool, searchQuery, searchTerms);
+    emit canRetryLastAnswerChanged();
+}
+
+void AppController::onQueryStage(int stage, int payload) {
+    switch (stage) {
+    case StageRouting:
+        m_queryStageText = tr("Working...");
+        break;
+    case StageRewriting:
+        m_queryStageText = tr("Refining the question...");
+        break;
+    case StageSearching:
+        m_queryStageText = tr("Searching the group...");
+        break;
+    case StageReading:
+        m_queryStageText = payload > 0 ? tr("Reading %1 passages...").arg(payload) : tr("Reading passages...");
+        break;
+    case StageWriting:
+        m_queryStageText = tr("Writing...");
+        break;
+    case StageRetrying:
+        m_queryStageText = tr("Trying again with a deeper search...");
+        // The first attempt's refusal text was already streamed into the
+        // live row; the retry regenerates from scratch, so clear it --
+        // leaving the refusal on screen under the new answer would read
+        // as two answers stacked in one message.
+        m_chatModel->resetLiveText();
+        break;
+    case StageSummarizing:
+        m_queryStageText = tr("Summarizing the group...");
+        break;
+    default:
+        return;
+    }
+    emit queryStageTextChanged();
+}
+
+void AppController::onQueryToken(QString piece) {
+    if (!m_chatModel->hasLiveAnswer()) {
+        m_chatModel->beginLiveAnswer();
+    }
+    m_chatModel->appendLiveText(piece);
+}
+
+void AppController::copyToClipboard(const QString &text) {
+    QGuiApplication::clipboard()->setText(text);
+}
+
+void AppController::setThinkingEnabled(bool enabled) {
+    if (enabled == m_thinkingEnabled) {
+        return;
+    }
+    ConfigManager manager(QString::fromUtf8(lexis_paths_config_file()));
+    if (!manager.setThinkingEnabled(enabled)) {
+        emit notify(tr("Could not save the setting: %1").arg(manager.lastError()));
+        return;
+    }
+    m_thinkingEnabled = enabled;
+    emit settingsChanged();
+    // No live call needed: every QueryWorker takes m_thinkingEnabled as
+    // its explicit per-query override (see sendChatMessage()).
+}
+
+void AppController::setRerankerEnabled(bool enabled) {
+    if (enabled == m_rerankerEnabled) {
+        return;
+    }
+    ConfigManager manager(QString::fromUtf8(lexis_paths_config_file()));
+    if (!manager.setRerankerEnabled(enabled)) {
+        emit notify(tr("Could not save the setting: %1").arg(manager.lastError()));
+        return;
+    }
+    // The write already succeeded; apply the live gate. Off means the
+    // model is never even loaded (see retrieval.c's reranker_user_enabled).
+    retrieval_set_reranker_enabled(enabled ? 1 : 0);
+    m_rerankerEnabled = enabled;
+    emit settingsChanged();
+}
+
+QString AppController::configDirectoryUrl() const {
+    const QString configPath = QString::fromUtf8(lexis_paths_config_file());
+    const QString dir = QFileInfo(configPath).absolutePath();
+    return QUrl::fromLocalFile(dir).toString();
+}
+
+// A query is already running, nothing was ever asked, the newest answer
+// didn't come from SEARCH (a CHAT reply has no retrieval to deepen; a
+// SUMMARY answer is about the overview, not the passages), or the group
+// itself isn't in a state to answer.
+bool AppController::canRetryLastAnswer() const {
+    return m_activeQueryWorker == nullptr && !m_lastQuestion.isEmpty() && m_lastAnswerWasSearch &&
+           m_activeCorpusId >= 0 && m_modelReady && m_activeChatSessionId >= 0 &&
+           m_activeCorpusId != m_ingestingCorpusId;
+}
+
+void AppController::retryLastAnswer() {
+    if (!canRetryLastAnswer()) {
+        return;
+    }
+
+    // Convert the newest answer's row into the live row up front: the
+    // retry replaces that answer in the UI (QueryWorker replaces it in
+    // history too -- same single row before and after, whether tokens
+    // streamed or not). m_lastAnswerWasSearch stays true, so a second
+    // "try harder" click on the same exchange keeps working.
+    m_chatModel->makeLastAssistantLive();
+    if (!m_chatModel->hasLiveAnswer()) {
+        // Nothing to replace (shouldn't happen given the guards above).
+        return;
+    }
+    m_retryingLiveAnswer = true;
+
+    m_chatBusy = true;
+    emit chatBusyChanged();
+    emit canRetryLastAnswerChanged();
+    m_queryStageText = tr("Trying again with a deeper search...");
+    emit queryStageTextChanged();
+
+    m_activeQueryWorker = new QueryWorker(m_connInfo, m_activeCorpusId, m_activeChatSessionId, m_lastQuestion,
+                                           m_stopwords, m_wordnet, m_lemmatizer, /*forceRetry=*/true,
+                                           m_thinkingEnabled ? 1 : 0);
+    connect(m_activeQueryWorker, &QueryWorker::queryFinished, this, &AppController::onQueryFinished);
+    connect(m_activeQueryWorker, &QueryWorker::queryStage, this, &AppController::onQueryStage);
+    connect(m_activeQueryWorker, &QueryWorker::queryToken, this, &AppController::onQueryToken);
+    connect(m_activeQueryWorker, &QThread::finished, m_activeQueryWorker, &QObject::deleteLater);
+    m_activeQueryWorker->start();
 }
 
 void AppController::refreshCorpusModel() {
@@ -566,8 +806,44 @@ void AppController::refreshChatSessionModel() {
 }
 
 void AppController::refreshDocumentModel() {
-    QVector<QString> names;
-    if (m_engine->listDocumentNames(&names)) {
-        m_documentModel->setDocumentNames(names);
+    QVariantList stats;
+    if (!m_engine->listDocumentStats(&stats)) {
+        return;
     }
+    QVector<DocumentEntry> documents;
+    documents.reserve(stats.size());
+    for (const QVariant &entryVar : stats) {
+        const QVariantMap entry = entryVar.toMap();
+        documents.append({entry.value(QStringLiteral("name")).toString(),
+                          entry.value(QStringLiteral("passageCount")).toLongLong(),
+                          entry.value(QStringLiteral("tokenCount")).toLongLong()});
+    }
+    m_documentModel->setDocuments(documents);
+}
+
+QVariantMap AppController::openDocument(const QString &documentName) {
+    QVariantMap result;
+    QString text;
+    QVariantList chunks;
+    if (!m_engine->getDocument(documentName, &text, &chunks)) {
+        return result;
+    }
+    result[QStringLiteral("name")] = documentName;
+    result[QStringLiteral("text")] = text;
+    result[QStringLiteral("chunks")] = chunks;
+    return result;
+}
+
+void AppController::removeDocument(const QString &documentName) {
+    if (m_activeCorpusId < 0 || m_activeWorker != nullptr || m_activeCorpusId == m_ingestingCorpusId) {
+        // No group open, or an ingest/rebuild is in flight for it -- the
+        // removal writes to the live schema and would race the rebuild's
+        // swap (same reasoning as deleteGroup()'s ingest guard).
+        return;
+    }
+    if (!m_engine->removeDocument(documentName)) {
+        emit notify(tr("Could not remove \"%1\": %2").arg(documentName, m_engine->lastError()));
+        return;
+    }
+    refreshDocumentModel();
 }

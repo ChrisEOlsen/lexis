@@ -7,6 +7,13 @@
 // passages) -> persists the assistant's answer -> fetches each result
 // passage's document name/chunk id for source citations.
 //
+// Live progress: queryStage() reports each pipeline step as it starts
+// (see QueryStage below), and queryToken() streams the answer's text
+// piece by piece as the model writes it -- the answer still arrives in
+// full via queryFinished() (the streamed pieces are display plumbing;
+// the finished signal's `answer` is the authoritative text, identical to
+// what a non-streaming run would have produced).
+//
 // Generation is the slow part (see SPEED.md) -- this entire pipeline
 // still runs off the UI thread, same discipline as IngestWorker. Opens
 // its own PgStore connection, scoped to `corpusId` via
@@ -34,17 +41,54 @@
 
 extern "C" {
 #include "lemmatizer.h"
+#include "local_llm_client.h"
 #include "stopwords.h"
 #include "wordnet.h"
 }
+
+// Pipeline stages, reported as they begin so the UI can say what is
+// happening during the seconds before tokens exist (the whole point:
+// a bare "Thinking..." over a multi-second silent gap reads as a hang).
+// Every query starts with Routing; which stages follow depends on the
+// routed tool (SEARCH: Rewriting -> Searching -> Reading -> Writing;
+// SUMMARY: Summarizing -> Writing; CHAT: Writing). Retrying is emitted
+// instead of a second Writing when a refusal triggered the deeper
+// retry, so the UI can clear the streamed refusal text it just showed.
+// `payload` carries a count where one exists (Reading: passages handed
+// to the model), -1 otherwise.
+enum QueryStage {
+    StageRouting = 0,
+    StageRewriting,
+    StageSearching,
+    StageReading,
+    StageWriting,
+    StageRetrying,
+    StageSummarizing,
+};
 
 class QueryWorker : public QThread {
     Q_OBJECT
 
 public:
+    // forceRetry: run the SEARCH pipeline with the deeper retrieval
+    // policy (score floor off, full passage budget) and the reasoning
+    // pass forced on from the start -- the same parameters the automatic
+    // refusal retry uses (see runSearchPipeline()), exposed as the
+    // answer's "Try harder" action. Skips the refusal pre-check (the
+    // user just asked for it) and tool routing (the question was already
+    // routed to SEARCH).
+    //
+    // thinkingOverride: forwarded to the generation calls -- -1 follows
+    // config/lexis.conf's `thinking` (the historical behavior, and what
+    // the eval harness passes), 0/1 force the reasoning pass off/on for
+    // every answer-producing call in this query. Exists so the app's
+    // Settings toggle applies live without a restart (generation.c
+    // caches its config read once per process, so live changes have to
+    // arrive as explicit overrides). Ignored when forceRetry is set
+    // (a retry always thinks).
     QueryWorker(QString conninfo, qint64 corpusId, qint64 sessionId, QString question,
                 const StopwordSet *stopwords, const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
-                QObject *parent = nullptr);
+                bool forceRetry = false, int thinkingOverride = -1, QObject *parent = nullptr);
 
 signals:
     // Named queryFinished, not finished -- same QThread::finished()
@@ -78,6 +122,14 @@ signals:
     void queryFinished(bool ok, QString answer, QVariantList sources, QString tool,
                        QString searchQuery, QString searchTerms);
 
+    // Progress, emitted from the worker thread (delivered queued).
+    // queryToken's piece is one increment of the final answer text --
+    // concatenated in order they reproduce it exactly; the first token
+    // is a UI's signal that the answer has started (create the live
+    // message row), and StageRetrying tells it to clear what it showed.
+    void queryStage(int stage, int payload);
+    void queryToken(QString piece);
+
 protected:
     void run() override;
 
@@ -89,6 +141,8 @@ private:
     const StopwordSet *m_stopwords;
     const WordNetTable *m_wordnet;
     const Lemmatizer *m_lemmatizer;
+    bool m_forceRetry;
+    int m_thinkingOverride;
 };
 
 #endif // LEXIS_APP_QUERYWORKER_H

@@ -13,13 +13,18 @@ file, so the script and the code can't disagree.
 
 **`reranker_model_path`** -- the small embedding model that re-orders
 search results by meaning. Unset = re-ranking off. Shipped setting:
-`data/models/bge-small-en-v1.5-f16.gguf` (67MB).
+`data/models/bge-small-en-v1.5-f16.gguf` (67MB). Also settable in the
+app's Settings panel (live, no restart); disabling comments the line
+out so the path survives for re-enabling. With no path in the file at
+all there is nothing to enable, and the panel says so rather than
+turning a switch on that would do nothing.
 
 **`thinking`** -- `on` or `off`. Whether the chat model runs a
 reasoning pass before answering. On is ~3x slower per answer; measured
 quality on our test sets was the same with it off, so the shipped
 setting is `off`. Only affects final answers -- routing and synonym
-selection never use it.
+selection never use it. Settable in the app's Settings panel, where it
+applies immediately (no restart) and is persisted back to this file.
 
 **`db_conninfo`** -- the PostgreSQL connection string (host, port,
 database, user, password). Required; there is no built-in default,
@@ -31,8 +36,12 @@ is in git.
 step (prompts, responses, timings) to the database for debugging;
 production skips that logging.
 
-Settings are read once at startup. Restart the app after changing
-them.
+`thinking` and the reranker are settable from the app's Settings panel
+and apply immediately -- except while a question is being answered, when
+both switches are disabled: the reranker's live gate is read by the
+query thread mid-search, so it is only changed between queries.
+Everything else is read once at startup -- restart the app after
+changing those by hand.
 
 ## Environment overrides (tuning experiments only)
 

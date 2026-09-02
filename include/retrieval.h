@@ -59,6 +59,15 @@ typedef struct {
  * (QueryWorker.cpp) can use it too. */
 RetrievalPolicy retrieval_default_policy(void);
 
+/* User-facing reranker on/off switch (the app's Settings panel). This
+ * is a second gate on top of config `reranker_model_path`: disabled
+ * means the model is never loaded and retrieval stays pure BM25,
+ * enabled means whatever the config's model line would have done.
+ * Thread contract: call before (or between) retrieval_run() calls,
+ * never during one -- the app only calls it from the UI thread while
+ * no query is running (chatBusy), same rule as every other setting. */
+void retrieval_set_reranker_enabled(int enabled);
+
 /* Everything one retrieval produced -- the ranked passages AND the
  * per-stage artifacts. Fields are named for what they ARE, not for who
  * consumes them; a new observer should find what it needs here rather
