@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LEXIS — Chat with very large documents, completely offline</title>
+<meta name="description" content="LEXIS is a macOS app that lets you chat with very large documents completely offline. Drop in manuals, papers, contracts — ask questions in plain language, get grounded answers with sources one click away.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230a0f1a'/%3E%3Cpath d='M9 8v16h14v-3.4H12.6V8z' fill='%234d9fff'/%3E%3C/svg%3E">
+</head>
+<body>
+<div class="bg" aria-hidden="true">
+  <div class="glow glow-a"></div>
+  <div class="glow glow-b"></div>
+  <div class="glow glow-c"></div>
+  <div class="grid-overlay"></div>
+</div>
+
+<nav class="nav" id="nav">
+  <div class="nav-inner">
+    <a href="#top" class="brand">
+      <span class="brand-mark">L</span>
+      <span class="brand-name">LEXIS</span>
+    </a>
+    <div class="nav-links">
+      <a href="#how">How it works</a>
+      <a href="#pipeline">Under the hood</a>
+      <a href="#why">Why Lexis</a>
+      <a href="#faq">FAQ</a>
+    </div>
+    <a href="#" class="btn btn-primary btn-sm download-btn">Download for macOS</a>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="hero-inner">
+    <div class="hero-copy">
+      <div class="eyebrow reveal"><span class="pulse"></span>macOS &middot; Apple Silicon &middot; 100% offline</div>
+      <h1 class="reveal">Chat with very large documents.<br><span class="grad">Completely offline.</span></h1>
+      <p class="lede reveal">Drop your documents into a group — manuals, papers, contracts, scanned files — and ask questions in plain language. LEXIS finds the right passages and writes a grounded answer, with the sources one click away. Nothing leaves your machine: no API keys, no cloud, no per-question cost.</p>
+      <div class="hero-cta reveal">
+        <a href="#" class="btn btn-primary btn-lg download-btn">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Download for macOS
+        </a>
+        <a href="#how" class="btn btn-ghost btn-lg">See how it works</a>
+      </div>
+      <div class="sysreq reveal">
+        <span>Apple Silicon</span><i></i><span>16 GB RAM recommended</span><i></i><span>~80 MB download</span>
+      </div>
+    </div>
+    <div class="hero-visual reveal">
+      <div class="app-window">
+        <div class="app-titlebar">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="app-title">LEXIS</span>
+        </div>
+        <div class="app-body">
+          <div class="app-side">
+            <div class="side-label">Groups</div>
+            <div class="side-item active">Employee Handbook</div>
+            <div class="side-item">Research Papers</div>
+            <div class="side-item">Contracts</div>
+          </div>
+          <div class="app-main">
+            <div class="msg user">What is the parental leave policy?</div>
+            <div class="msg assistant">
+              <p>Employees are eligible for <strong>12 weeks</strong> of paid parental leave following birth or adoption, starting after 6 months of continuous employment <span class="cite">[1]</span>. Leave can be taken continuously or in two blocks within the first year <span class="cite">[2]</span>.</p>
+              <div class="sources">
+                <div class="source"><span class="src-n">1</span> handbook.pdf · p. 34 — "Parental leave is available to all full-time…"</div>
+                <div class="source"><span class="src-n">2</span> handbook.pdf · p. 35 — "Leave may be split into no more than two…"</div>
+              </div>
+            </div>
+            <div class="msg user typing"><span></span><span></span><span></span></div>
+          </div>
+        </div>
+      </div>
+      <div class="hero-badge">Every answer shows its sources.<br>No black box.</div>
+    </div>
+  </div>
+</header>
+
+<section class="stats">
+  <div class="stats-inner">
+    <div class="stat reveal">
+      <div class="stat-num"><span class="count" data-target="97">0</span>%</div>
+      <div class="stat-label">of questions reach the right passage<br><span>913-question benchmark, 900-page manual</span></div>
+    </div>
+    <div class="stat reveal">
+      <div class="stat-num"><span class="count" data-target="99">0</span>%</div>
+      <div class="stat-label">of answers faithful to their sources<br><span>measured, not estimated</span></div>
+    </div>
+    <div class="stat reveal">
+      <div class="stat-num">~<span class="count" data-target="8.6" data-dec="1">0</span>s</div>
+      <div class="stat-label">per answer, all local<br><span>no cloud round-trip, ever</span></div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="how">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <div class="kicker">How it works</div>
+      <h2>From download to answers<br>in three steps.</h2>
+    </div>
+    <div class="steps">
+      <div class="step reveal">
+        <div class="step-n">01</div>
+        <h3>Download &amp; install</h3>
+        <p>Grab the disk image, drag LEXIS into Applications. That's the whole install — no Homebrew, no terminal, no database to configure.</p>
+      </div>
+      <div class="step reveal">
+        <div class="step-n">02</div>
+        <h3>Drop in your documents</h3>
+        <p>Create a group and drop in manuals, papers, contracts, scanned files. Indexing is pure text processing — a thousand documents take minutes, not hours.</p>
+      </div>
+      <div class="step reveal">
+        <div class="step-n">03</div>
+        <h3>Ask anything</h3>
+        <p>Ask in plain language. LEXIS searches, re-ranks, and writes a grounded answer from the passages it found — with every source one click away.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="pipeline">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <div class="kicker">Under the hood</div>
+      <h2>Classic search, sharpened<br>with local models.</h2>
+      <p class="sec-sub">Most document-chat tools embed everything into vectors and search those. LEXIS uses classic full-text search — the same family of algorithms behind real search engines — and applies models only where they help.</p>
+    </div>
+    <div class="flow">
+      <div class="flow-step reveal">
+        <div class="flow-icon">◈</div>
+        <h4>Rewrite</h4>
+        <p>A small local model refines your question and picks meaning-appropriate synonyms before searching.</p>
+      </div>
+      <div class="flow-arrow" aria-hidden="true">→</div>
+      <div class="flow-step reveal">
+        <div class="flow-icon">≣</div>
+        <h4>Search</h4>
+        <p>Full-text lexical search over the index. Exact terms — part numbers, codes, names — always match.</p>
+      </div>
+      <div class="flow-arrow" aria-hidden="true">→</div>
+      <div class="flow-step reveal">
+        <div class="flow-icon">⇅</div>
+        <h4>Re-rank</h4>
+        <p>A tiny embedding model re-orders candidates by meaning, so the best passage leads.</p>
+      </div>
+      <div class="flow-arrow" aria-hidden="true">→</div>
+      <div class="flow-step reveal">
+        <div class="flow-icon">✦</div>
+        <h4>Answer</h4>
+        <p>A local chat model writes the answer from those passages and nothing else. Fully grounded.</p>
+      </div>
+    </div>
+    <p class="flow-note reveal">The index never needs rebuilding when models change — swap models freely, your index stays valid.</p>
+  </div>
+</section>
+
+<section class="section" id="why">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <div class="kicker">Why Lexis</div>
+      <h2>LEXIS vs. embedding-based RAG.</h2>
+      <p class="sec-sub">The standard local RAG recipe embeds every chunk of every document into vectors at ingest time. LEXIS searches by words instead and applies models only at the edges.</p>
+    </div>
+    <div class="table-card reveal">
+      <table>
+        <thead>
+          <tr><th></th><th class="hl">LEXIS <span>lexical + models at the edges</span></th><th>Embedding RAG <span>vectors</span></th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Ingest speed</td><td class="hl">Word counting — thousands of passages/sec</td><td>Neural net over every chunk — ~100× slower</td></tr>
+          <tr><td>Exact terms</td><td class="hl">Exact match, always found</td><td>Compressed into "meaning" — rare identifiers blur</td></tr>
+          <tr><td>Pure paraphrase</td><td class="hl">Covered by query rewrite, synonyms &amp; reranker</td><td>Strongest case</td></tr>
+          <tr><td>Changing models</td><td class="hl">Index untouched</td><td>Vectors are model-specific — re-embed everything</td></tr>
+          <tr><td>Why this answer?</td><td class="hl">Visible search terms and passages</td><td>A similarity score</td></tr>
+          <tr><td>Index at scale</td><td class="hl">Postgres on disk</td><td>Vector index, typically in RAM</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="table-note reveal">Paraphrase-only questions are the one real advantage vectors hold — and on our benchmarks, the questions where a full vector index would still have helped came to about 2%.</p>
+  </div>
+</section>
+
+<section class="section" id="requirements">
+  <div class="wrap">
+    <div class="req-grid">
+      <div class="reveal">
+        <div class="kicker">First launch</div>
+        <h2>One download.<br>Then it's yours.</h2>
+        <p class="sec-sub">The installer is ~80 MB. On first launch, LEXIS downloads the models it needs (~5.1 GB) with a progress bar — interrupted downloads resume. Your documents, config, and database live in <code>~/Library/Application Support/LEXIS/</code>; the app runs its own private database that only your macOS user can reach.</p>
+      </div>
+      <div class="req-card reveal">
+        <h4>System requirements</h4>
+        <ul>
+          <li><span>Mac</span><strong>Apple Silicon</strong></li>
+          <li><span>Memory</span><strong>16 GB recommended</strong></li>
+          <li><span>Disk</span><strong>~11 GB free</strong></li>
+          <li><span>Network</span><strong>Only for the one-time model download</strong></li>
+        </ul>
+        <p class="req-note">After setup, LEXIS works fully offline — on a plane, in a vault, anywhere.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="faq">
+  <div class="wrap narrow">
+    <div class="sec-head reveal">
+      <div class="kicker">FAQ</div>
+      <h2>Questions, answered.</h2>
+    </div>
+    <div class="faq">
+      <div class="faq-item reveal">
+        <button class="faq-q">Does any of my data leave my Mac?<span>+</span></button>
+        <div class="faq-a"><p>No. Everything — the search index, the models, the database — runs locally on your machine. There are no accounts, no API keys, and no network calls after the one-time model download.</p></div>
+      </div>
+      <div class="faq-item reveal">
+        <button class="faq-q">Do I need API keys or a subscription?<span>+</span></button>
+        <div class="faq-a"><p>No. The models ship with the app's first-launch download and run on your hardware. There is no per-question cost and nothing to sign up for.</p></div>
+      </div>
+      <div class="faq-item reveal">
+        <button class="faq-q">Will it run on my Intel Mac?<span>+</span></button>
+        <div class="faq-a"><p>No — LEXIS is Apple Silicon only for now. The local models are built and tuned for Apple Silicon Macs.</p></div>
+      </div>
+      <div class="faq-item reveal">
+        <button class="faq-q">How big is the download, really?<span>+</span></button>
+        <div class="faq-a"><p>The installer is about 80 MB. On first launch the app downloads ~5.1 GB of models (with progress and resume). Plan on ~11 GB of disk total for the app, models, and database.</p></div>
+      </div>
+      <div class="faq-item reveal">
+        <button class="faq-q">How do I completely remove it?<span>+</span></button>
+        <div class="faq-a"><p>Delete LEXIS.app from Applications, then delete <code>~/Library/Application Support/LEXIS/</code> to remove your models, documents index, and settings. Nothing else is touched.</p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="cta-band">
+  <div class="wrap narrow reveal">
+    <h2>Your documents,<br><span class="grad">answerable.</span></h2>
+    <p>Free to download. Yours to keep. Nothing leaves your Mac.</p>
+    <a href="#" class="btn btn-primary btn-lg download-btn">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      Download LEXIS for macOS
+    </a>
+    <div class="sysreq center"><span>Apple Silicon</span><i></i><span>macOS</span><i></i><span>~80 MB</span></div>
+  </div>
+</section>
+
+<footer class="footer">
+  <div class="wrap foot-inner">
+    <div class="brand"><span class="brand-mark">L</span><span class="brand-name">LEXIS</span></div>
+    <div class="foot-links">
+      <a href="privacy.html">Privacy Policy</a>
+      <a href="terms.html">Terms of Use</a>
+    </div>
+    <div class="foot-copy">© 2026 LEXIS. macOS only, for now.</div>
+  </div>
+</footer>
+
+<script src="script.js"></script>
+</body>
+</html>
