@@ -6,7 +6,7 @@
 // this to the R2 public URL, e.g.
 //   https://downloads.<domain>/LEXIS-signed.dmg
 // ---------------------------------------------------------------------------
-const DOWNLOAD_URL = 'https://github.com/ChrisEOlsen/lexis/releases';
+const DOWNLOAD_URL = 'https://pub-7a84f9c1213f46d2bf2d696712dc9f29.r2.dev/LEXIS-signed.dmg';
 
 document.querySelectorAll('.download-btn').forEach((a) => {
   a.setAttribute('href', DOWNLOAD_URL);
