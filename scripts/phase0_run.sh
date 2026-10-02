@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
-# Phase 0: measure where BM25 ranks the correct passage across DelucionQA.
-# No language model is loaded -- see scripts/phase0_retrieval.c.
-#
-# usage: scripts/phase0_run.sh <corpus_id>
+# Phase 0: where BM25 ranks the correct passage (no model loaded). Usage: phase0_run.sh <corpus_id>
 set -euo pipefail
 
 CORPUS_ID="${1:?usage: scripts/phase0_run.sh <corpus_id>}"
@@ -18,8 +15,7 @@ PG_INC="$($PG_CONFIG --includedir)"
 PG_LIB="$($PG_CONFIG --libdir)"
 LLAMA_DIR=/opt/homebrew/Cellar/llama.cpp/10180
 GGML_DIR=/opt/homebrew/Cellar/ggml/0.18.0
-# Connection string comes from the untracked config file (embeds the
-# password -- see config/lexis.conf.example).
+# Conninfo (embeds password) comes from the untracked config/lexis.conf.
 CONNINFO="$(sed -n 's/^db_conninfo[[:space:]]*=[[:space:]]*//p' config/lexis.conf | tail -1)"
 [ -n "$CONNINFO" ] || { echo "set db_conninfo in config/lexis.conf" >&2; exit 1; }
 
@@ -49,8 +45,7 @@ echo "2/4 dumping ingested passages"
 echo "    $(wc -l < "$WORK/passages.tsv") passages"
 
 echo "3/4 building + running retrieval (no model loaded)"
-# jinja_chat_template.o comes from the normal `make` build; the core sources
-# link it in even though this harness never reaches the model path.
+# jinja_chat_template.o comes from `make`; linked though never reached here.
 clang -std=c11 -O2 -Iinclude -Iinclude/vendor -I"$PG_INC" \
   -I"$LLAMA_DIR/include" -I"$GGML_DIR/include" \
   -o "$WORK/phase0_retrieval" scripts/phase0_retrieval.c \

@@ -1,7 +1,7 @@
 # Pipeline configuration template (spec sections 5.2.1, 6).
-# Copy to lexis.conf and fill in. Settings not yet wired up (chunk
-# size/overlap for ingestion, the Unix socket path for the deferred
-# Python sidecar) are tracked in LIMITATIONS.md.
+# Copy to lexis.conf and fill in. Any key left out falls back to its
+# compiled default; LEXIS_* env vars (see docs/configuration.md) win
+# over this file for tuning sweeps.
 
 # mode = testing | production
 #   testing (default if unset): full pipeline observability logging
@@ -9,7 +9,7 @@
 #     generation_runs -- see query_log.c) is active on every query.
 #   production: that logging is skipped entirely. Measured overhead is
 #     small (~2.5ms p50 on top of a ~5ms bare BM25 search, see
-#     LIMITATIONS.md) but non-zero, so production traffic can opt out
+#     dev/LIMITATIONS.md) but non-zero, so production traffic can opt out
 #     rather than pay it.
 mode=testing
 
@@ -22,7 +22,7 @@ model_path=data/models/gemma-4-E4B-it-Q4_K_M.gguf
 
 # thinking = on | off
 #   Whether answer generation runs the model's reasoning pass (roughly
-#   3x answer latency when on; see LIMITATIONS.md's generation.c row).
+#   3x answer latency when on; see dev/LIMITATIONS.md's generation.c row).
 #   Only gates the user-facing answer steps -- routing, expansion, and
 #   summarization never think. Default if unset: on.
 thinking=on
@@ -39,3 +39,30 @@ reranker_model_path=data/models/bge-small-en-v1.5-f16.gguf
 #   example file is tracked in git; your real config/lexis.conf is not,
 #   so the password never enters version control.
 db_conninfo=host=127.0.0.1 port=5434 dbname=lexis user=lexis password=CHANGE_ME
+
+# chunk_size / chunk_overlap = ingestion chunking in words.
+#   chunk_size must be > 0; overlap should be < chunk size (0 = no
+#   overlap). A huge chunk size yields one passage per document.
+chunk_size=200
+chunk_overlap=40
+
+# ingest_threads = bulk-ingest worker threads (phase 2). Must be > 0.
+ingest_threads=6
+
+# candidate_ceiling = how deep BM25 ranks before the trim. Must be > 0.
+candidate_ceiling=40
+
+# max_passages = trimmed passages handed to the answer step. Must be > 0.
+max_passages=12
+
+# token_budget = trim cap on passage tokens sent to the model. Must be > 0.
+token_budget=1500
+
+# score_floor_ratio = drop passages scoring below this fraction of the
+#   top score (0.0 disables the floor).
+score_floor_ratio=0.6
+
+# bm25_k1 / bm25_b = BM25's ranking constants (TF saturation / length
+#   norm). k1 must be > 0; b must be >= 0.
+bm25_k1=1.2
+bm25_b=0.75

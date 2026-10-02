@@ -1,24 +1,6 @@
 #!/usr/bin/env bash
-# Signs and notarizes LEXIS.app with an Apple Developer ID, then
-# builds the final DMG. Run this on a Mac that has the Developer ID
-# Application certificate in its keychain (requires an Apple Developer
-# Program membership); this does not have to be the build machine.
-#
-# One-time setup on that Mac:
-#   1. Install the "Developer ID Application" certificate (Xcode ->
-#      Settings -> Accounts, or developer.apple.com).
-#   2. Store notary credentials once:
-#        xcrun notarytool store-credentials lexis-notary \
-#          --apple-id you@example.com --team-id TEAMID \
-#          --password <app-specific password from appleid.apple.com>
-#
-# Usage:
-#   ./sign_and_notarize.sh "Developer ID Application: Name (TEAMID)" /path/to/LEXIS.app
-#
-# Input: the UNSIGNED (ad-hoc) LEXIS.app out of package_app.sh's DMG --
-# mount the DMG and drag the app somewhere writable first.
-# Output: LEXIS-signed.dmg next to the app, notarized and stapled, safe
-# to hand to anyone.
+# Signs/notarizes LEXIS.app with a Developer ID, then builds LEXIS-signed.dmg.
+# Usage: sign_and_notarize.sh "Developer ID Application: Name (TEAMID)" /path/to/LEXIS.app
 set -euo pipefail
 
 if [ $# -ne 2 ]; then
@@ -31,9 +13,7 @@ KEYCHAIN_PROFILE="lexis-notary"
 OUT_DIR="$(dirname "$APP")"
 
 echo "== 1. Sign every binary, deepest first =="
-# Hardened runtime is required for notarization. No entitlements are
-# needed: the app only downloads models (plain network client, not
-# restricted by hardened runtime) and touches user-directory files.
+# Hardened runtime required for notarization; no entitlements needed (plain client).
 find "$APP" -type f \( -perm +111 -o -name '*.dylib' -o -name '*.so' \) | while read -r bin; do
     codesign --force --options runtime --timestamp -s "$IDENTITY" "$bin"
 done

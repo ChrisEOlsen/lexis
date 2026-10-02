@@ -1,7 +1,4 @@
-/*
- * Tests for src/core/bm25.c — corpus-wide statistics used by the BM25
- * formula (total passage count, average passage length).
- */
+/* Tests for bm25.c: corpus stats for the BM25 formula. */
 
 #include "bm25.h"
 #include "pg_store.h"
@@ -10,9 +7,7 @@
 #include <math.h>
 #include <stdio.h>
 
-/* Transcendental functions like log() accumulate floating-point rounding
- * error, so tests compare within a tolerance rather than for exact
- * equality. Expected values computed independently via Python's math.log. */
+/* Compare floats within tolerance; expected values from Python's math.log. */
 #define IDF_EPSILON 1e-9
 
 #define TEST_CONNINFO test_conninfo()
@@ -119,8 +114,7 @@ static void test_idf_typical_case(void) {
 }
 
 static void test_idf_rarer_term_scores_higher(void) {
-    /* Same N, smaller n(t) should always score higher — rarer terms are
-     * more informative. */
+    /* Rarer terms must score higher. */
     double rare_idf = bm25_idf(100, 2);
     double common_idf = bm25_idf(100, 50);
     TEST_ASSERT(rare_idf > common_idf,
@@ -129,7 +123,7 @@ static void test_idf_rarer_term_scores_higher(void) {
 }
 
 static void test_term_score_at_average_length(void) {
-    BM25Params params = {1.2, 0.75};
+    BM25Params params = {.k1 = 1.2, .b = 0.75};
     /* tf=3, passage exactly at average length (5/5.0 -> length_ratio 1) */
     double score = bm25_term_score(2.0, 3, 5, 5.0, params);
     double expected = 3.142857142857143;
@@ -138,7 +132,7 @@ static void test_term_score_at_average_length(void) {
 }
 
 static void test_term_score_penalizes_longer_passages(void) {
-    BM25Params params = {1.2, 0.75};
+    BM25Params params = {.k1 = 1.2, .b = 0.75};
     double at_avg_length = bm25_term_score(2.0, 3, 5, 5.0, params);
     double longer_than_avg = bm25_term_score(2.0, 3, 10, 5.0, params);
     TEST_ASSERT(longer_than_avg < at_avg_length,
@@ -152,10 +146,8 @@ static void test_term_score_penalizes_longer_passages(void) {
 }
 
 static void test_term_score_tf_saturates(void) {
-    BM25Params params = {1.2, 0.75};
-    /* Doubling term frequency should NOT double the score -- TF's
-     * contribution saturates (diminishing returns), it doesn't scale
-     * linearly. */
+    BM25Params params = {.k1 = 1.2, .b = 0.75};
+    /* TF saturates: doubling tf must not double the score. */
     double tf1 = bm25_term_score(1.0, 1, 5, 5.0, params);
     double tf2 = bm25_term_score(1.0, 2, 5, 5.0, params);
     double tf4 = bm25_term_score(1.0, 4, 5, 5.0, params);
@@ -211,9 +203,7 @@ static void test_result_set_add_tracks_matched_terms(void) {
     BM25ResultSet *set = bm25_result_set_create();
     TEST_ASSERT(set != NULL, "expected bm25_result_set_create to succeed");
 
-    /* Each add call is one distinct query term's contribution (postings'
-     * PK means a term touches a passage at most once per search), so the
-     * counter the coordination bonus reads is simply the add count. */
+    /* Each add is one query term's contribution; counter is the add count. */
     bm25_result_set_add(set, 7, 2.0);
     TEST_ASSERT(set->items[0].matched_terms == 1,
                 "expected matched_terms 1 after first add, got %d", set->items[0].matched_terms);
@@ -251,10 +241,7 @@ static void test_result_set_add_grows_past_initial_capacity(void) {
     BM25ResultSet *set = bm25_result_set_create();
     TEST_ASSERT(set != NULL, "expected bm25_result_set_create to succeed");
 
-    /* Initial capacity is 8 -- add 20 distinct passages to force at least
-     * two reallocations, and verify every entry survives the growth
-     * intact (an old bug class: realloc into the wrong pointer would
-     * silently lose everything already stored). */
+    /* Capacity starts at 8; add 20 to force reallocs and verify entries survive. */
     for (int64_t i = 0; i < 20; i++) {
         int result = bm25_result_set_add(set, i, (double)i);
         TEST_ASSERT(result == 0, "expected add %lld to succeed", (long long)i);
@@ -277,15 +264,7 @@ static void test_result_set_add_merges_correctly_across_index_growth(void) {
     BM25ResultSet *set = bm25_result_set_create();
     TEST_ASSERT(set != NULL, "expected bm25_result_set_create to succeed");
 
-    /* The internal hash index starts at capacity 16 and grows past a 0.7
-     * load factor -- 500 distinct passages forces several resizes.
-     * Interleave a second and third score contribution for every
-     * passage_id (simulating multiple query terms matching the same
-     * passages) so a lookup miss after a resize (an old bug class: probe
-     * sequences depend on capacity, so re-inserting at the old slot
-     * position after growing would silently break lookups) would show up
-     * as a wrong accumulated score or a duplicate entry, not just a
-     * crash. */
+    /* 500 passages force index resizes; interleaved adds catch lookup misses after growth. */
     const int64_t distinct_passages = 500;
     for (int64_t i = 0; i < distinct_passages; i++) {
         TEST_ASSERT(bm25_result_set_add(set, i, 1.0) == 0, "expected first add %lld to succeed",
@@ -325,9 +304,7 @@ static void test_result_set_free_null_is_safe(void) {
     bm25_result_set_free(NULL);
 }
 
-/* Seeds a small realistic corpus: P1 matches both query terms, P2 and P4
- * match only "hypertension", P3 matches neither -- for search-level tests
- * further down (bm25_accumulate_term_scores, bm25_search). */
+/* P1 matches both terms; P2/P4 match one; P3 matches none. */
 static void seed_search_corpus(PgStore *store, int64_t *hypertension_id,
                                 int64_t *treatment_id, int64_t *p1,
                                 int64_t *p2, int64_t *p3, int64_t *p4) {
@@ -339,10 +316,7 @@ static void seed_search_corpus(PgStore *store, int64_t *hypertension_id,
     *hypertension_id = pg_store_get_or_create_term(store, "hypertension");
     *treatment_id = pg_store_get_or_create_term(store, "treatment");
 
-    /* token_count here must match the passage's own token_count above --
-     * it's denormalized onto postings now (see pg_store.c's schema
-     * comment), not read back via a join, so nothing enforces this
-     * consistency automatically the way a single source of truth would. */
+    /* token_count is denormalized on postings (see pg_store.c); keep it consistent here. */
     pg_store_insert_posting(store, *hypertension_id, *p1, 1, 3);
     pg_store_insert_posting(store, *hypertension_id, *p2, 1, 6);
     pg_store_insert_posting(store, *hypertension_id, *p4, 1, 6);
@@ -357,7 +331,7 @@ static void test_accumulate_term_scores_matches_only_relevant_passages(void) {
     seed_search_corpus(store, &hypertension_id, &treatment_id, &p1, &p2, &p3, &p4);
 
     BM25CorpusStats stats = bm25_corpus_stats(store);
-    BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B};
+    BM25Params params = {.k1 = BM25_DEFAULT_K1, .b = BM25_DEFAULT_B};
     BM25ResultSet *results = bm25_result_set_create();
     TEST_ASSERT(results != NULL, "expected bm25_result_set_create to succeed");
 
@@ -385,13 +359,12 @@ static void test_search_ranks_multi_term_match_highest(void) {
     seed_search_corpus(store, &hypertension_id, &treatment_id, &p1, &p2, &p3, &p4);
 
     const char *query_terms[] = {"hypertension", "treatment"};
-    BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B};
+    BM25Params params = {.k1 = BM25_DEFAULT_K1, .b = BM25_DEFAULT_B};
     BM25CorpusStats stats = bm25_corpus_stats(store);
     BM25ResultSet *results = bm25_search(store, query_terms, 2, 10, stats, params);
     TEST_ASSERT(results != NULL, "expected bm25_search to succeed");
 
-    /* p1 matches both query terms; p2/p4 match only one; p3 matches
-     * neither and should never appear. */
+    /* p1 matches both; p2/p4 match one; p3 never appears. */
     TEST_ASSERT(results->count == 3, "expected 3 matching passages, got %zu", results->count);
     TEST_ASSERT(results->items[0].passage_id == p1,
                 "expected p1 (matches both terms) to rank first, got passage_id %lld",
@@ -402,7 +375,6 @@ static void test_search_ranks_multi_term_match_highest(void) {
                     "passage p3 should never appear in results");
     }
 
-    /* Results must be sorted strictly descending by score. */
     for (size_t i = 1; i < results->count; i++) {
         TEST_ASSERT(results->items[i - 1].score >= results->items[i].score,
                     "expected descending order at index %zu: %f then %f",
@@ -421,7 +393,7 @@ static void test_search_respects_top_k(void) {
     seed_search_corpus(store, &hypertension_id, &treatment_id, &p1, &p2, &p3, &p4);
 
     const char *query_terms[] = {"hypertension", "treatment"};
-    BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B};
+    BM25Params params = {.k1 = BM25_DEFAULT_K1, .b = BM25_DEFAULT_B};
     BM25CorpusStats stats = bm25_corpus_stats(store);
     BM25ResultSet *results = bm25_search(store, query_terms, 2, 1, stats, params);
     TEST_ASSERT(results != NULL, "expected bm25_search to succeed");
@@ -443,7 +415,7 @@ static void test_search_skips_unindexed_query_terms(void) {
     seed_search_corpus(store, &hypertension_id, &treatment_id, &p1, &p2, &p3, &p4);
 
     const char *query_terms[] = {"nonexistentword"};
-    BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B};
+    BM25Params params = {.k1 = BM25_DEFAULT_K1, .b = BM25_DEFAULT_B};
     BM25CorpusStats stats = bm25_corpus_stats(store);
     BM25ResultSet *results = bm25_search(store, query_terms, 1, 10, stats, params);
     TEST_ASSERT(results != NULL,
@@ -460,7 +432,7 @@ static void test_search_empty_corpus_returns_empty_results(void) {
     TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
     const char *query_terms[] = {"anything"};
-    BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B};
+    BM25Params params = {.k1 = BM25_DEFAULT_K1, .b = BM25_DEFAULT_B};
     BM25CorpusStats stats = bm25_corpus_stats(store);
     BM25ResultSet *results = bm25_search(store, query_terms, 1, 10, stats, params);
     TEST_ASSERT(results != NULL, "expected an empty corpus to return an empty result set, not NULL");

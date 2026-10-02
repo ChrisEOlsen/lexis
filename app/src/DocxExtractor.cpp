@@ -5,13 +5,8 @@
 
 namespace {
 
-// Reads the full uncompressed contents of `entryName` from an already-
-// open zip archive. Returns an empty QByteArray if the entry doesn't
-// exist or can't be read -- callers that require the entry to exist
-// (word/document.xml) check for that themselves; callers for optional
-// parts (headers/footers/footnotes/endnotes) just get nothing to
-// append, which is the correct behavior for a part that's legitimately
-// absent from a given document.
+// Full uncompressed contents of `entryName`. Empty when the entry is missing or
+// unreadable (required callers check; optional parts just append nothing).
 QByteArray readZipEntry(zip_t *archive, const char *entryName) {
     zip_int64_t index = zip_name_locate(archive, entryName, 0);
     if (index < 0) {
@@ -38,15 +33,8 @@ QByteArray readZipEntry(zip_t *archive, const char *entryName) {
     return buffer;
 }
 
-// Appends every <w:p> paragraph's <w:t> run text (in document order) to
-// `out`, one paragraph per line. Matched by local-name(), not a literal
-// "w:p"/"w:t" name, so this doesn't depend on which namespace prefix a
-// given file's XML happens to bind to the wordprocessingml namespace
-// (virtually always "w" in practice, but not guaranteed by the XML
-// namespace spec, and not worth trusting when local-name() matching is
-// just as simple). <w:delText> (tracked-changes deletions) has a
-// different local name than <w:t> and is excluded automatically as a
-// consequence, not via explicit exclusion logic.
+// Appends every paragraph's run text to `out`, one paragraph per line. Matched by
+// local-name() (prefix-independent); tracked-changes <w:delText> is excluded implicitly.
 void appendParagraphText(const pugi::xml_document &xml, QString *out) {
     pugi::xpath_node_set paragraphs = xml.select_nodes("//*[local-name()='p']");
     for (const pugi::xpath_node &paragraphNode : paragraphs) {
@@ -99,10 +87,8 @@ QString extractDocxText(const QString &path, QString *errorOut) {
     QString result;
     appendParagraphText(mainDoc, &result);
 
-    // Headers/footers/footnotes/endnotes are optional and their count
-    // varies (a document can have a default/first-page/even-page
-    // variant of each) -- enumerate every archive entry and match by
-    // name pattern rather than guessing specific filenames.
+    // Optional parts vary in count (default/first-page/even-page variants); enumerate
+    // entries and match by name pattern rather than guessing filenames.
     zip_int64_t entryCount = zip_get_num_entries(archive, 0);
     for (zip_int64_t i = 0; i < entryCount; i++) {
         const char *name = zip_get_name(archive, i, 0);

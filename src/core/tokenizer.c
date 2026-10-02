@@ -1,13 +1,6 @@
-/*
- * Implementation of text normalization and tokenization.
- * See include/tokenizer.h for the module's role (spec 5.2.1, Stage 1).
- */
+/* Text normalization and tokenization (spec 5.2.1, Stage 1); see tokenizer.h. */
 
-/* Exposes POSIX.1-2008 declarations (e.g. strdup) in <string.h> even under
- * strict -std=c11, where glibc otherwise hides non-ISO-C extensions. Must
- * be defined before any header is included — if a header pulls in
- * <string.h> first via its own include chain, that header's include guard
- * makes a later inclusion a no-op and this macro would arrive too late. */
+/* Before any #include: exposes strdup under strict -std=c11; later would be too late via include guards. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "tokenizer.h"
@@ -18,10 +11,7 @@
 
 #define TOKEN_LIST_INITIAL_CAPACITY 8
 
-/* Longest word tokenize() will buffer before truncating (silently drops
- * any excess bytes rather than growing without bound). Generous relative
- * to real English words (~45 chars max) — exists as a safety cap against
- * pathological input, e.g. a wall of non-space characters. */
+/* Max buffered word length; truncates overflow. Safety cap vs pathological input. */
 #define WORD_BUFFER_SIZE 256
 
 TokenList *token_list_create(void) {
@@ -74,9 +64,7 @@ int token_list_append(TokenList *list, const char *term) {
     return 0;
 }
 
-/* '\'', '-', '.', ',' -- the punctuation bytes that don't split a word when
- * they appear internally (see tokenize()'s doc comment for the exact rule
- * and worked examples). */
+/* Punctuation kept word-internal (see tokenize() doc in tokenizer.h). */
 static int is_internal_connector(unsigned char c) {
     return c == '\'' || c == '-' || c == '.' || c == ',';
 }
@@ -92,8 +80,7 @@ TokenList *tokenize(const char *text) {
 
     for (const unsigned char *p = (const unsigned char *)text;; p++) {
         unsigned char c = *p;
-        /* Only safe to peek at p[1] when c itself isn't the NUL terminator
-         * -- otherwise p[1] reads one byte past the allocated buffer. */
+        /* Peek p[1] only when c isn't NUL, else reads past the buffer. */
         int is_internal_punct = c != '\0' && word_len > 0 && is_internal_connector(c) &&
                                  p[1] < 0x80 && isalnum(p[1]);
         int is_word_char = ((c < 0x80) && isalnum(c)) || is_internal_punct;

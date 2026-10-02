@@ -1,10 +1,6 @@
-/*
- * Implementation of pipeline observability logging.
- * See include/query_log.h for the module's role.
- */
+/* Pipeline observability logging; see query_log.h. */
 
-/* See tokenizer.c for why this must come before any #include (strdup is a
- * POSIX extension hidden by glibc under strict -std=c11 otherwise). */
+/* Before any #include: exposes strdup under strict -std=c11 (see tokenizer.c). */
 #define _POSIX_C_SOURCE 200809L
 
 #include "query_log.h"
@@ -13,9 +9,7 @@
 #include <stdlib.h>
 #include <time.h>
 
-/* Schema uses BIGINT GENERATED ALWAYS AS IDENTITY (see pg_store.c) in
- * place of SQLite's INTEGER PRIMARY KEY rowid-aliasing trick; REAL becomes
- * DOUBLE PRECISION -- otherwise identical to the SQLite version's shape. */
+/* BIGINT IDENTITY replaces SQLite rowid aliasing; REAL -> DOUBLE PRECISION (see pg_store.c). */
 #define LEXIS_QUERY_LOG_SCHEMA_SQL                                                            \
     "CREATE TABLE IF NOT EXISTS queries ("                                                    \
     "    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"                                 \

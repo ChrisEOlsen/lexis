@@ -1,10 +1,4 @@
-/*
- * Tests for src/core/query_formulation.c — gathering WordNet candidates
- * for a query's surviving (post-stopword) terms. Uses the real committed
- * stopword list and WordNet data, same pattern as wordnet.c's end-to-end
- * tests, since this module's whole job is orchestrating those two real
- * pieces together.
- */
+/* Tests for query_formulation.c using real stopwords and WordNet data. */
 
 #include "query_formulation.h"
 #include "lemmatizer.h"
@@ -32,8 +26,7 @@ static void test_gather_candidates_hypertension_example(void) {
                                              stopwords, wordnet, lemmatizer);
     TEST_ASSERT(candidates != NULL, "expected query_formulation_gather_candidates to succeed");
 
-    /* "what", "is", "the", "for" are stopwords -- only "treatment" and
-     * "hypertension" should survive. */
+    /* Only "treatment" and "hypertension" survive stopword filtering. */
     TEST_ASSERT(candidates->count == 2, "expected 2 surviving terms, got %zu", candidates->count);
     TEST_ASSERT_STR_EQ(candidates->terms[0].term, "treatment");
     TEST_ASSERT_STR_EQ(candidates->terms[1].term, "hypertension");
@@ -42,8 +35,7 @@ static void test_gather_candidates_hypertension_example(void) {
     TEST_ASSERT(candidates->terms[0].candidates != NULL, "expected \"treatment\" to have candidates");
     TEST_ASSERT(candidates->terms[1].candidates != NULL, "expected \"hypertension\" to have candidates");
 
-    /* Same fact confirmed earlier in wordnet.c's own tests -- confirming
-     * it survives the tokenize + stopword-filter + lookup chain intact. */
+    /* Same fact as wordnet.c tests, via the full gather chain. */
     const WordNetLookupResult *hypertension = candidates->terms[1].candidates;
     int found_high_blood_pressure = 0;
     for (size_t i = 0; i < hypertension->synonyms->count; i++) {
@@ -150,10 +142,7 @@ static void test_build_prompt_caps_candidates(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    /* "dog" has 29 real synonyms (confirmed in wordnet.c's own tests) --
-     * well over the 8-per-category cap. Isolate just dog's synonym line
-     * and count commas to confirm it was actually capped, not dumped
-     * wholesale into the prompt. */
+    /* "dog" has >8 real synonyms; count commas on its line to confirm the cap. */
     QueryFormulationCandidates *candidates =
         query_formulation_gather_candidates("dog", stopwords, wordnet, lemmatizer);
     TEST_ASSERT(candidates != NULL, "expected gather_candidates to succeed");
@@ -199,11 +188,7 @@ static void test_parse_selected_terms_valid_json(void) {
     QueryFormulationCandidates *fallback = make_two_term_candidates(stopwords, wordnet, lemmatizer);
     TEST_ASSERT(fallback != NULL, "expected setup to succeed");
 
-    /* Originals-first contract: "dog" and "cat" are present regardless
-     * of the response. "canine" is an offered hypernym of dog -> kept.
-     * "domestic_dog" is offered but contains an underscore -- no such
-     * token can exist in the tokenized terms table -> dropped. The
-     * response's own "dog" is already an original -> deduplicated. */
+    /* Originals-first: "canine" kept, underscore terms dropped, dupes removed. */
     size_t original_count = 0;
     TokenList *result = query_formulation_parse_selected_terms(
         "[\"dog\", \"canine\", \"domestic_dog\"]", fallback, &original_count);
@@ -305,10 +290,7 @@ static void test_gather_candidates_from_terms(void) {
     WordNetTable *wordnet = wordnet_table_load(WORDNET_DIR);
     TEST_ASSERT(wordnet != NULL, "expected setup to succeed");
 
-    /* The shared entry the app's QueryWorker uses: terms in as given (no
-     * tokenization/lemmatization), candidates out. "dog" is a real
-     * WordNet word; "zzyzzva" is not and must carry NULL candidates
-     * while still appearing as a term. */
+    /* Terms in as given, no tokenization; unknown words carry NULL candidates. */
     TokenList *terms = token_list_create();
     token_list_append(terms, "dog");
     token_list_append(terms, "zzyzzva");
@@ -333,9 +315,7 @@ static void test_parse_selected_terms_rejects_uninvented_and_dedups(void) {
     QueryFormulationCandidates *fallback = make_two_term_candidates(stopwords, wordnet, lemmatizer);
     TEST_ASSERT(fallback != NULL, "expected setup to succeed");
 
-    /* "elephant" was never offered as a candidate for dog/cat -- an
-     * invented term must not enter the query. "canine" repeated must
-     * appear once. */
+    /* Invented terms rejected; repeats deduped. */
     TokenList *result = query_formulation_parse_selected_terms(
         "[\"canine\", \"elephant\", \"canine\"]", fallback, NULL);
     TEST_ASSERT(result != NULL, "expected parse to succeed");
@@ -357,10 +337,7 @@ static void test_parse_selected_terms_lowercases_expansions(void) {
     QueryFormulationCandidates *fallback = make_two_term_candidates(stopwords, wordnet, lemmatizer);
     TEST_ASSERT(fallback != NULL, "expected setup to succeed");
 
-    /* The terms table is all-lowercase (the ingest tokenizer lowercases),
-     * so an expansion kept as "CANINE" could never match a posting. The
-     * offered-candidate check is case-insensitive; the stored term must
-     * come out lowercase. */
+    /* Terms table is lowercase; match is case-insensitive, stored term lowercase. */
     TokenList *result = query_formulation_parse_selected_terms("[\"CANINE\"]", fallback, NULL);
     TEST_ASSERT(result != NULL, "expected parse to succeed");
     TEST_ASSERT(result->count == 3, "expected 2 originals + 1 expansion, got %zu", result->count);
@@ -379,10 +356,7 @@ static void test_formulate_query_falls_back_without_local_model(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    /* local_llm_chat_completion() returns NULL immediately when
-     * local_llm_client_init() hasn't been called -- no model load
-     * happens. This exercises the real generation-failure fallback path
-     * without needing a loaded model in this test binary. */
+    /* No local_llm_client_init() here, so the model call fails and fallback fires. */
     TokenList *result = query_formulation_formulate_query(
         "What is the treatment for hypertension?", stopwords, wordnet, lemmatizer, NULL);
     TEST_ASSERT(result != NULL, "expected a fallback result, not NULL, when the API call fails");

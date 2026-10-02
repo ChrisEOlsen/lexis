@@ -1,86 +1,69 @@
-/*
- * Centralized runtime settings (config/lexis.conf). Lets pipeline behavior
- * be toggled from one place rather than scattered per-feature flags --
- * `mode` gates query_log.c's pipeline observability logging (a real, if
- * small, per-query cost production traffic shouldn't pay), and
- * `model_path` names the local GGUF model every binary loads (previously
- * hardcoded separately in the CLI, the app, the eval harness, and the
- * depth_ab script, which drifted every model swap). See LIMITATIONS.md
- * for what config/lexis.conf.example still doesn't wire up (chunk size
- * etc.) -- this module deliberately parses exactly the settings something
- * needs today, one getter per key, not a general key-value config system.
- */
+/* Centralized runtime settings (config/lexis.conf): one getter per key. */
 
 #ifndef LEXIS_CONFIG_H
 #define LEXIS_CONFIG_H
 
-/* Testing: query_log.c's full pipeline observability logging is active on
- * every query. Production: logging is skipped entirely -- no queries/
- * query_formulation_runs/search_runs/search_results/generation_runs
- * writes, avoiding their latency cost. */
+#include <stddef.h>
+
+/* TESTING logs every query via query_log; PRODUCTION skips logging entirely. */
 typedef enum {
     LEXIS_MODE_TESTING,
     LEXIS_MODE_PRODUCTION
 } LexisMode;
 
-/* Reads a "mode = testing|production" line from the config file at `path`
- * (see config/lexis.conf.example for the format). A missing config file is
- * a normal, expected state (not every checkout has copied the example into
- * a real config/lexis.conf yet) and quietly defaults to LEXIS_MODE_TESTING
- * -- preserving today's always-on logging behavior. Production is an
- * explicit opt-in via the config file, never a silent default. */
+/* Read "mode = testing|production" from path. Missing file/line defaults to TESTING. */
 LexisMode config_load_mode(const char *path);
 
-/* Fallback when the config file is missing or has no model_path line.
- * Settled on Gemma-4-E4B after, in order: Llama-3.2-3B (no tool-routing
- * support in mind at the time) -> Qwen3.5-4B (reverted -- a genuine
- * "thinking" model, unprompted <think>...</think> before every answer,
- * real latency cost) -> Qwen3.5-2B (thinking suppressed via a prefill
- * hack; measured 86.7% on a 30-question SEARCH/READ tool-routing test)
- * -> Gemma-4-E2B (native tool-calling model; its chat template is real
- * Jinja2, too sophisticated for llama_chat_apply_template()'s built-in
- * matcher, which is why src/core/jinja_chat_template.cpp/minja exist at
- * all; no prefill hack needed; measured 96.7% on the identical
- * 30-question test) -> Gemma-4-E4B (same family one size up, adopted
- * when the 8GB-RAM machine that forced E2B was replaced by a 24GB one).
- * Keep scripts/download_model.sh's fallback in sync when this changes. */
+/* model_path fallback. Keep scripts/download_model.sh's fallback in sync when this changes. */
 #define LEXIS_DEFAULT_MODEL_PATH "data/models/gemma-4-E4B-it-Q4_K_M.gguf"
 
-/* Reads the "model_path = <path to .gguf>" line from the config file at
- * `path`, falling back to LEXIS_DEFAULT_MODEL_PATH when the file or the
- * line is missing -- same quiet-fallback philosophy as config_load_mode.
- * Returns a malloc'd string the caller owns (free() it), or NULL only on
- * allocation failure. */
+/* Read "model_path" from path, else LEXIS_DEFAULT_MODEL_PATH. Caller frees; NULL on alloc failure. */
 char *config_load_model_path(const char *path);
 
-/* The default config file location, relative to the project root every
- * binary already requires as its working directory. Shared so modules
- * that read a setting lazily (generation.c's thinking gate) name the
- * same file the CLI and app load explicitly. */
+/* Default config location, relative to the project root working directory. */
 #define LEXIS_CONFIG_PATH_DEFAULT "config/lexis.conf"
 
-/* Reads the "thinking = on|off" line: whether the model's reasoning
- * pass runs for user-facing answer generation (see generation.c -- the
- * ONLY consumer; routing/expansion/summarization never think). Missing
- * file, missing line, or an unrecognized value default to 1 (on) --
- * preserving the measured-quality behavior; turning the ~3x answer
- * latency saving on is an explicit opt-in via `thinking=off`. */
+/* Read "thinking = on|off" (answer generation only). Missing/unrecognized defaults to 1 (on). */
 int config_load_thinking(const char *path);
 
-/* Reads the "reranker_model_path = <path to .gguf>" line: the optional
- * embedding model that reorders BM25 candidates by meaning (see
- * reranker.h). Returns a malloc'd string the caller owns, or NULL when
- * the line/file is missing -- NULL means the reranker is OFF, which is
- * the default; there is no baked-in fallback model path. */
+/* Read "reranker_model_path". Caller frees; NULL when missing = reranker off (the default). */
 char *config_load_reranker_model_path(const char *path);
 
-/* Reads the "db_conninfo = <libpq connection string>" line -- where the
- * index and chat history live. Returns a malloc'd string the caller
- * owns, or NULL when the line/file is missing. There is deliberately NO
- * baked-in fallback: the connection string embeds a password, and a
- * default here would put a working credential back into the public
- * repo (the exact thing this key exists to remove). Callers fail with
- * a message pointing at config/lexis.conf. */
+/* Read "db_conninfo". Caller frees; NULL when missing. No fallback: it embeds a password. */
 char *config_load_db_conninfo(const char *path);
+
+/* Ingest fallbacks (bulk-ingest chunking/workers). LEXIS_* env, when set, wins over these keys. */
+#define LEXIS_DEFAULT_CHUNK_SIZE 200
+#define LEXIS_DEFAULT_CHUNK_OVERLAP 40
+#define LEXIS_DEFAULT_INGEST_THREADS 6
+
+/* Read "chunk_size". Missing/invalid (not > 0) defaults to LEXIS_DEFAULT_CHUNK_SIZE. */
+size_t config_load_chunk_size(const char *path);
+
+/* Read "chunk_overlap". Missing/invalid (negative) defaults to LEXIS_DEFAULT_CHUNK_OVERLAP. */
+size_t config_load_chunk_overlap(const char *path);
+
+/* Read "ingest_threads". Missing/invalid (not > 0) defaults to LEXIS_DEFAULT_INGEST_THREADS. */
+int config_load_ingest_threads(const char *path);
+
+/* Retrieval fallbacks live in bm25.h (LEXIS_SEARCH_*, BM25_DEFAULT_*); these keys override them. */
+
+/* Read "candidate_ceiling". Missing/invalid (not > 0) defaults to LEXIS_SEARCH_CANDIDATE_CEILING. */
+size_t config_load_candidate_ceiling(const char *path);
+
+/* Read "max_passages". Missing/invalid (not > 0) defaults to LEXIS_SEARCH_MAX_PASSAGES. */
+size_t config_load_max_passages(const char *path);
+
+/* Read "token_budget". Missing/invalid (not > 0) defaults to LEXIS_SEARCH_TOKEN_BUDGET. */
+int config_load_token_budget(const char *path);
+
+/* Read "score_floor_ratio". Missing/invalid (negative) defaults to LEXIS_SEARCH_SCORE_FLOOR_RATIO. */
+double config_load_score_floor_ratio(const char *path);
+
+/* Read "bm25_k1". Missing/invalid (not > 0) defaults to BM25_DEFAULT_K1. */
+double config_load_bm25_k1(const char *path);
+
+/* Read "bm25_b". Missing/invalid (negative) defaults to BM25_DEFAULT_B. */
+double config_load_bm25_b(const char *path);
 
 #endif /* LEXIS_CONFIG_H */

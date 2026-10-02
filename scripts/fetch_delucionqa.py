@@ -1,35 +1,6 @@
 #!/usr/bin/env python3
-"""Fetch DelucionQA into data/eval/delucionqa/ for hands-on testing of LEXIS.
-
-DelucionQA is a retrieval-QA dataset built on the Jeep 2023 Gladiator owner's
-manual: specific, lookup-style questions against a long technical manual --
-structurally the same shape as the NY driver's manual this project has been
-tested against, but with human-annotated reference answers.
-
-It is fetched from the `delucionqa` subset of the RAGBench collection
-(https://huggingface.co/datasets/galileo-ai/ragbench) through HuggingFace's
-datasets-server JSON API rather than the parquet files, so this script needs
-no pandas/pyarrow -- only the standard library.
-
-What it writes:
-
-  corpus/*.txt      the manual passages, deduplicated, split across several
-                    files so a group has more than one document to retrieve
-                    across. These are what you ingest into LEXIS.
-  questions.md      every unique question with its reference answer, readable
-                    side-by-side while using the app.
-  starter.md        a 30-question subset to work through first.
-  raw/*.json        the untouched API rows, for the automated harness later.
-
-IMPORTANT -- what this corpus is, and is not. `documents` in DelucionQA are the
-passages that were RETRIEVED for each question, not the full owner's manual. So
-the corpus assembled here is the union of gold contexts: every question is
-answerable from it, and there are far fewer distractor sections than the real
-manual has. Retrieval will look easier here than against a complete document.
-That is the right trade for manual testing (you can always tell whether a wrong
-answer was the model's fault, since the supporting text is definitely present),
-but do not read good scores here as a measure of retrieval quality at scale.
-"""
+"""Fetch DelucionQA (RAGBench subset) into data/eval/delucionqa/ via datasets-server API.
+Note: corpus is the union of gold contexts, not the full manual -- retrieval looks easier here."""
 
 import json
 import os
@@ -89,24 +60,13 @@ def main():
     all_rows = []
     for split in SPLITS:
         rows = fetch_rows(split)
-        # Compact separators: these files carry every annotation column and
-        # are only ever read by a program, so pretty-printing them tripled
-        # the on-disk size for nothing.
+        # Compact: program-read only; pretty-printing tripled on-disk size.
         with open(os.path.join(OUT_ROOT, "raw", f"{split}.json"), "w") as handle:
             json.dump(rows, handle, separators=(",", ":"))
         all_rows.extend(rows)
 
-    # -- corpus: distinct passages, with contained fragments removed --
-    #
-    # Exact-match dedup alone is not enough. DelucionQA's `documents` are
-    # retrieval chunks with overlapping windows, so the same manual text shows
-    # up both as its own short passage and embedded inside longer ones. Left
-    # in, that text would be indexed several times over, inflating its BM25
-    # term frequencies and scattering provenance across near-identical chunks.
-    #
-    # Longest first, then drop any passage already contained in one that was
-    # kept. O(n^2) over ~1k passages runs instantly and needs no dependency;
-    # it catches whole containment, not near-duplicate paraphrase.
+    # Distinct passages minus fragments contained in longer ones (overlapping
+    # windows would otherwise inflate BM25 term frequencies).
     seen, unique = set(), []
     for row in all_rows:
         for doc in row.get("documents") or []:
@@ -179,9 +139,7 @@ def main():
         preamble,
     )
 
-    # Prefer questions whose reference answers were all judged adherent, so the
-    # starter set is not seeded with examples the dataset itself flagged as
-    # hallucinated.
+    # Starter: only questions whose references were all judged adherent.
     clean = [q for q in questions if q[1]["adherent"] == q[1]["total"]]
     write_questions(
         os.path.join(OUT_ROOT, "starter.md"),

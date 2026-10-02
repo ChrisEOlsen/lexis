@@ -1,20 +1,7 @@
-/*
- * Implementation of bulk TSV ingestion.
- * See include/bulk_ingest.h for the module's role and the three-phase
- * deferred-term-resolution design this implements (Phase 1: COPY raw
- * rows in; Phase 2: parallel, contention-free tokenize/lemmatize/stage;
- * Phase 3: single-pass, single-writer term resolution). See SPEED.md for
- * the full story of why this replaced the original per-document,
- * term-cache-based pipeline: every deadlock ever measured under real
- * write concurrency was Postgres's ON CONFLICT speculative insertion
- * racing on terms.term's unique index -- Phase 2 never touches that
- * table at all, so the contention is gone by construction rather than
- * tuned around.
- */
+/* Bulk TSV ingestion: 3-phase deferred-term-resolution pipeline (see bulk_ingest.h).
+ * Phase 2 never touches terms, so ON CONFLICT deadlocks are gone by design (see dev/SPEED.md). */
 
-/* See tokenizer.c for why this must come before any #include (strdup and
- * getline are POSIX extensions hidden by glibc under strict -std=c11
- * otherwise). */
+/* Must precede #includes: strdup/getline are POSIX, hidden under strict -std=c11. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "bulk_ingest.h"
@@ -22,6 +9,7 @@
 #include "ingest.h"
 #include "pg_store.h"
 #include "tokenizer.h"
+#include "time_util.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -31,32 +19,16 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Same helper as main.c's -- duplicated rather than shared across a
- * translation-unit boundary for four lines of code. */
-static long elapsed_ms(struct timespec start, struct timespec end) {
-    long seconds = end.tv_sec - start.tv_sec;
-    long nanoseconds = end.tv_nsec - start.tv_nsec;
-    return seconds * 1000 + nanoseconds / 1000000;
-}
-
-/* Rows claimed per round trip -- large enough to amortize the network
- * round trip across many documents, small enough that one worker
- * finishing early doesn't sit idle for long while another grinds through
- * an oversized final batch. Not tuned exhaustively; see SPEED.md for the
- * measured throughput this whole redesign achieves. */
+/* Rows claimed per round trip: amortizes network cost without stranding a worker on
+ * an oversized final batch (see dev/SPEED.md for measured throughput). */
 #define BULK_PHASE2_BATCH_SIZE 500
 
-/* A batch's documents are wrapped in one transaction -- safe to do here
- * (unlike the earlier, reverted attempt at batching the OLD per-document
- * pipeline, see SPEED.md) specifically because Phase 2 never touches
- * terms, the sole source of every deadlock this project has measured
- * under concurrency. passages' IDENTITY inserts and postings_staged's
- * unconstrained inserts don't lock across documents at all. */
+/* One transaction per batch: safe because Phase 2 never touches terms (the sole measured
+ * deadlock source); passages/staged inserts don't lock across documents. */
 #define BULK_PHASE2_BATCH_RETRIES 3
 
-/* Shared, read-only across all workers except next_row/range_mutex (the
- * shared cursor into documents_raw's row_num range) and the two output
- * fields, which only this worker's own thread ever writes. */
+/* Read-only across workers except next_row/range_mutex (shared row_num cursor);
+ * passages_ingested/failed are written only by the owning thread. */
 typedef struct {
     const char *conninfo;
     const char *schema_name;
@@ -72,14 +44,10 @@ typedef struct {
     int failed;
 } Phase2Worker;
 
-/* Claims the next batch of up to BULK_PHASE2_BATCH_SIZE row_nums under
- * w->range_mutex. Sets *start and *end to the claimed half-open range,
- * [*start, *end). Returns 0 if a (possibly empty, at the tail) range was
- * claimed, or 1 if the whole table has already been claimed by other
- * workers (nothing left to do). */
-/* See bulk_ingest.h's cancellation contract. Checked at every phase
- * boundary and per Phase 2 batch, so a cancel lands within one batch's
- * worth of work rather than after the whole run. */
+/* Claims up to BULK_PHASE2_BATCH_SIZE row_nums as [*start, *end). Returns 1 when
+ * the table is fully claimed, 0 otherwise. */
+/* See bulk_ingest.h's cancellation contract: checked per phase and per batch, so a
+ * cancel lands within one batch of work. */
 static atomic_int g_cancel_requested = 0;
 
 void bulk_ingest_request_cancel(void) {
@@ -107,12 +75,8 @@ static int phase2_claim_batch(Phase2Worker *w, int64_t *start, int64_t *end) {
     return 0;
 }
 
-/* Stages one already-tokenized/stopword-filtered/lemmatized chunk's
- * distinct terms (see ingest_count_distinct_terms()) into postings_staged
- * against `passage_id` -- writes raw term text rather than resolving a
- * terms.id, since Phase 2 never touches the terms table at all (that's
- * Phase 3's job, see pg_store_finalize_terms_and_postings()). Returns 0
- * on success, -1 on a database or allocation error. */
+/* Stages one chunk's distinct terms as raw text against passage_id; id resolution is
+ * Phase 3's job. 0 on success, -1 on error. */
 static int phase2_stage_chunk_terms(PgStore *store, const TokenList *terms, int64_t passage_id) {
     if (terms->count == 0) {
         return 0;
@@ -132,19 +96,13 @@ static int phase2_stage_chunk_terms(PgStore *store, const TokenList *terms, int6
     return result;
 }
 
-/* The real per-document work for one documents_raw row: chunk, tokenize,
- * lemmatize, insert the passage, stage its postings -- built on ingest.c's
- * chunking/lemmatizing primitives, but staging term text directly instead
- * of resolving term ids against Postgres. Returns the number of passages
- * ingested (>= 0) on success, or -1 on failure. */
+/* Per-documents_raw-row work: chunk, tokenize, lemmatize, insert passage, stage
+ * postings (term text, not ids). Returns passages ingested, or -1. */
 static long phase2_process_document(PgStore *store, const StopwordSet *stopwords,
                                      const WordNetTable *wordnet, const Lemmatizer *lemmatizer,
                                      const char *text, const char *pid, size_t chunk_size, size_t overlap) {
-    /* Once per source document, not once per chunk -- the original,
-     * un-chunked text, so a future rebuild-on-append can re-chunk every
-     * document (old and new) consistently instead of only ever having
-     * access to already-fragmented passage text. See
-     * pg_store_insert_document(). */
+    /* Original un-chunked text, once per document, so rebuild-on-append can re-chunk
+     * consistently (see pg_store_insert_document()). */
     if (pg_store_insert_document(store, pid, text) != 0) {
         return -1;
     }
@@ -198,13 +156,8 @@ static long phase2_process_document(PgStore *store, const StopwordSet *stopwords
     return passages_ingested;
 }
 
-/* Processes one claimed batch of documents_raw rows inside a single
- * transaction (see BULK_PHASE2_BATCH_RETRIES's comment for why this is
- * safe here, unlike the earlier reverted batching attempt). Any failure
- * partway through rolls back the WHOLE batch -- retried up to
- * BULK_PHASE2_BATCH_RETRIES times as a fresh transaction before giving
- * up and skipping it entirely. Returns the number of passages ingested
- * across the batch (>= 0), or -1 if every retry failed. */
+/* One batch in one transaction (safe here, see BULK_PHASE2_BATCH_RETRIES). Any failure
+ * rolls back the whole batch; retried, then skipped. Returns passages, or -1. */
 static long phase2_process_batch(PgStore *store, const StopwordSet *stopwords, const WordNetTable *wordnet,
                                   const Lemmatizer *lemmatizer, size_t chunk_size, size_t overlap,
                                   const PgStoreRawDocument *docs, size_t doc_count) {
@@ -245,9 +198,8 @@ static long phase2_process_batch(PgStore *store, const StopwordSet *stopwords, c
 static void *phase2_worker_run(void *arg) {
     Phase2Worker *w = (Phase2Worker *)arg;
 
-    /* Each worker owns its own connection -- a single PGconn isn't safe
-     * for concurrent use from multiple threads, and nothing stops N
-     * separate connections from all writing to the same tables at once. */
+    /* Each worker owns its connection: one PGconn isn't thread-safe, but N separate
+     * connections can write the same tables concurrently. */
     PgStore *store = pg_store_open(w->conninfo);
     if (store == NULL) {
         fprintf(stderr, "phase2_worker_run: failed to open a connection\n");
@@ -260,8 +212,7 @@ static void *phase2_worker_run(void *arg) {
         w->failed = 1;
         return NULL;
     }
-    /* Rebuildable index build, not live/irreplaceable data -- see
-     * pg_store_disable_synchronous_commit()'s doc comment. */
+    /* Rebuildable index data, not irreplaceable (see pg_store_disable_synchronous_commit()). */
     pg_store_disable_synchronous_commit(store);
 
     while (1) {
@@ -270,14 +221,8 @@ static void *phase2_worker_run(void *arg) {
             break;
         }
 
-        /* A failure here or below (a transient query error, or a batch
-         * that exhausts phase2_process_batch()'s retries) costs at most
-         * this one batch's documents, logged and skipped -- not fatal to
-         * the run. w->failed is reserved for "this worker could never do
-         * any work at all" (the connection-open check above), matching
-         * concurrent_worker_run()'s established convention: losing one
-         * batch out of thousands shouldn't discard every passage every
-         * other worker already committed. */
+        /* A failed batch costs at most its own documents (logged, skipped); w->failed is
+         * only for "could never do any work" (see concurrent_worker_run()'s convention). */
         size_t doc_count = 0;
         PgStoreRawDocument *docs = pg_store_get_raw_documents_range(store, start, end, &doc_count);
         if (docs == NULL) {
@@ -321,10 +266,8 @@ long bulk_ingest_tsv(const char *conninfo, const char *schema_name, const Stopwo
         return -1;
     }
 
-    /* Phase 1: one big COPY, not one INSERT per row -- see
-     * pg_store_copy_documents_raw() and SPEED.md for the format-safety
-     * investigation (real MS MARCO passages contain literal, unescaped
-     * backslash and double-quote characters) that led here. */
+    /* Phase 1: one COPY, not one INSERT per row (real MS MARCO text needs CSV
+     * quoting; see pg_store_copy_documents_raw(), dev/SPEED.md). */
     struct timespec phase1_start, phase1_end;
     clock_gettime(CLOCK_MONOTONIC, &phase1_start);
 
@@ -350,8 +293,7 @@ long bulk_ingest_tsv(const char *conninfo, const char *schema_name, const Stopwo
         return BULK_INGEST_CANCELLED;
     }
 
-    /* Phase 2: thread_count workers, each with its own connection,
-     * race-free by construction -- see this file's header comment. */
+    /* Phase 2: thread_count workers on separate connections; race-free by design. */
     struct timespec phase2_start, phase2_end;
     clock_gettime(CLOCK_MONOTONIC, &phase2_start);
 
@@ -407,22 +349,14 @@ long bulk_ingest_tsv(const char *conninfo, const char *schema_name, const Stopwo
     }
 
     if (cancel_requested()) {
-        /* Nothing to unwind here beyond the staging tables -- the caller
-         * (or the next run's defensive drop) owns any schema cleanup. */
+        /* Caller (or next run's defensive drop) owns schema cleanup; just drop staging. */
         pg_store_drop_staging_tables(coordinator);
         pg_store_close(coordinator);
         return BULK_INGEST_CANCELLED;
     }
 
-    /* Defer postings' PK/FK constraints and terms/postings' durability
-     * to one bulk pass at the very end, rather than paying for them
-     * per-row during Phase 3 -- measured directly as the single largest
-     * lever in this whole pipeline, bigger than the primary key alone
-     * (see SPEED.md). A failure anywhere between here and
-     * pg_store_finish_bulk_load() leaves the schema in this weakened
-     * state until the next successful run restores it -- an accepted
-     * trade-off, not a gap, matching this pipeline's existing
-     * "rebuildable, not crash-safe mid-run" philosophy. */
+    /* Defer PK/FK + durability to one bulk pass at the end (biggest measured lever; see
+     * dev/SPEED.md). Failure before finish leaves schema weakened until next run -- accepted. */
     struct timespec prepare_start, prepare_end;
     clock_gettime(CLOCK_MONOTONIC, &prepare_start);
 
@@ -434,9 +368,8 @@ long bulk_ingest_tsv(const char *conninfo, const char *schema_name, const Stopwo
 
     clock_gettime(CLOCK_MONOTONIC, &prepare_end);
 
-    /* Phase 3: single-threaded, set-based term resolution -- the only
-     * point in this whole pipeline that touches the terms table, and the
-     * only writer when it does. */
+    /* Phase 3: single-threaded set-based term resolution -- the only point touching
+     * terms, and the only writer while it does. */
     struct timespec phase3_start, phase3_end;
     clock_gettime(CLOCK_MONOTONIC, &phase3_start);
 
@@ -464,26 +397,20 @@ long bulk_ingest_tsv(const char *conninfo, const char *schema_name, const Stopwo
     pg_store_drop_staging_tables(coordinator);
     pg_store_close(coordinator);
 
-    /* Per-phase breakdown -- printed unconditionally on success, same
-     * convention as eval_run()'s own progress printing (see eval.h),
-     * since this pipeline is meant to be watched during a long real run,
-     * not just checked for a final pass/fail. */
+    /* Unconditional per-phase timing on success (same convention as eval_run()): long
+     * runs are meant to be watched, not just pass/failed. */
     printf("bulk_ingest_tsv: Phase 1 (raw append) %ldms, Phase 2 (parallel processing) %ldms, "
            "prepare (defer constraints) %ldms, Phase 3 (finalize) %ldms, "
            "restore (rebuild constraints) %ldms, %lld rows staged, %ld postings written\n",
-           elapsed_ms(phase1_start, phase1_end), elapsed_ms(phase2_start, phase2_end),
-           elapsed_ms(prepare_start, prepare_end), elapsed_ms(phase3_start, phase3_end),
-           elapsed_ms(restore_start, restore_end), (long long)total_rows, postings_written);
+           lexis_elapsed_ms(phase1_start, phase1_end), lexis_elapsed_ms(phase2_start, phase2_end),
+           lexis_elapsed_ms(prepare_start, prepare_end), lexis_elapsed_ms(phase3_start, phase3_end),
+           lexis_elapsed_ms(restore_start, restore_end), (long long)total_rows, postings_written);
 
     return total_passages;
 }
 
-/* Writes one RFC4180 CSV field -- always quoted (never conditionally, so
- * there's no "does this field need it" branch to get wrong), with
- * embedded double-quotes doubled per the standard escaping rule. Matches
- * exactly what pg_store_copy_documents_raw()'s COPY ... (FORMAT csv,
- * DELIMITER E'\t') expects on the other end. Returns 0 on success, -1 on
- * a write error. */
+/* One RFC4180 field (always quoted, quotes doubled) for COPY (FORMAT csv, DELIMITER
+ * E'\t'). 0 on success, -1 on write error. */
 static int write_rebuild_csv_field(FILE *fp, const char *field) {
     if (fputc('"', fp) == EOF) {
         return -1;
@@ -507,20 +434,8 @@ static int write_rebuild_csv_row(FILE *fp, const char *document_name, const char
     return 0;
 }
 
-/* Writes `existing` (a corpus's current documents) combined with
- * new_names[0..new_count)/new_texts[0..new_count) to a fresh temp file,
- * as the CSV bulk_ingest_tsv() expects -- the "combine old + new
- * documents" step of rebuild-on-append. A new document whose name
- * matches an existing one replaces it entirely (the existing copy is
- * skipped) rather than both ending up in the file, which the
- * documents table's document_name PRIMARY KEY would otherwise reject
- * on the rebuilt side anyway. O(existing_count * new_count) name
- * comparisons -- fine at this app's target scale (thousands of
- * documents, not millions, see APP_SPEC.md).
- *
- * Returns a newly malloc()'d path the caller must remove() and free(),
- * or NULL on any failure (the temp file, if created, is removed before
- * returning). */
+/* Existing + new docs to a temp CSV for bulk_ingest_tsv(); same-named new docs replace
+ * existing (PK would reject dupes). Returns malloc'd path (caller removes/frees) or NULL. */
 static char *materialize_combined_documents_csv(const PgStoreDocument *existing, size_t existing_count,
                                                   const char *const *new_names, const char *const *new_texts,
                                                   size_t new_count) {
@@ -611,12 +526,8 @@ long bulk_ingest_rebuild_corpus(const char *conninfo, int64_t corpus_id, const c
     char temp_schema[64];
     snprintf(temp_schema, sizeof(temp_schema), "corpus_%lld_rebuild", (long long)corpus_id);
 
-    /* Defensive drop before create: a previous rebuild attempt that
-     * crashed between here and the swap below would leave this schema
-     * name occupied, and CREATE SCHEMA has no IF NOT EXISTS -- clearing
-     * it first matches this pipeline's existing "rebuildable, not
-     * crash-safe mid-run" philosophy rather than failing on the
-     * collision. */
+    /* Defensive drop first: a crashed earlier rebuild would leave this name occupied
+     * (CREATE SCHEMA has no IF NOT EXISTS); matches the "rebuildable" philosophy. */
     if (pg_store_drop_bare_schema(coordinator, temp_schema) != 0 ||
         pg_store_create_bare_schema(coordinator, temp_schema) != 0) {
         fprintf(stderr, "bulk_ingest_rebuild_corpus: failed to prepare rebuild schema %s\n", temp_schema);
@@ -626,10 +537,8 @@ long bulk_ingest_rebuild_corpus(const char *conninfo, int64_t corpus_id, const c
         return -1;
     }
 
-    /* The actual ingest runs through the exact same fast pipeline as any
-     * fresh corpus -- targeting temp_schema, not corpus_id's real schema,
-     * so corpus_id's live data is never touched by this step no matter
-     * what happens here. */
+    /* Same fast pipeline as a fresh corpus, targeting temp_schema -- corpus_id's live
+     * data is untouched by this step no matter what happens. */
     long total_passages = bulk_ingest_tsv(conninfo, temp_schema, stopwords, wordnet, lemmatizer, csv_path, chunk_size,
                                            overlap, thread_count);
     remove(csv_path);

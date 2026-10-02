@@ -1,9 +1,4 @@
-/*
- * Tests for src/core/tokenizer.c — TokenList lifecycle and tokenize().
- * Standalone executable; exit code reflects pass/fail (spec build order
- * Stage 3 calls for validating correctness before building on top of a
- * module, and that applies just as well here in Stage 1).
- */
+/* Tests for tokenizer.c: TokenList lifecycle and tokenize(). */
 
 #include "tokenizer.h"
 #include "test_utils.h"
@@ -42,8 +37,7 @@ static void test_only_punctuation(void) {
 }
 
 static void test_apostrophe_stays_together(void) {
-    /* Internal apostrophe (letter on both sides) no longer fragments the
-     * word -- "don't" stays one token instead of spilling a stray "t". */
+    /* Internal apostrophe keeps "don't" as one token. */
     TokenList *list = tokenize("don't stop");
     TEST_ASSERT(list->count == 2, "expected 2 tokens, got %zu", list->count);
     TEST_ASSERT_STR_EQ(list->terms[0], "don't");
@@ -52,10 +46,7 @@ static void test_apostrophe_stays_together(void) {
 }
 
 static void test_possessive_apostrophe_stays_together(void) {
-    /* Deliberately NOT stripped to "okafor" -- see tokenizer.c's doc
-     * comment on why possessive-vs-contraction can't be told apart from
-     * spelling alone ("isn't" ends in "'t" too), so both are kept whole
-     * rather than risking silently inverting a negation. */
+    /* Possessive kept whole too (see tokenizer.c: can't tell from spelling alone). */
     TokenList *list = tokenize("Okafor's telescope");
     TEST_ASSERT(list->count == 2, "expected 2 tokens, got %zu", list->count);
     TEST_ASSERT_STR_EQ(list->terms[0], "okafor's");
@@ -72,8 +63,7 @@ static void test_hyphen_stays_together(void) {
 }
 
 static void test_decimal_number_stays_together(void) {
-    /* The real bug that started this: "2.4-meter" used to fragment into
-     * "2", "4", "meter", destroying the measurement entirely. */
+    /* "2.4-meter" must not fragment into "2", "4", "meter". */
     TokenList *list = tokenize("a 2.4-meter telescope");
     TEST_ASSERT(list->count == 3, "expected 3 tokens, got %zu", list->count);
     TEST_ASSERT_STR_EQ(list->terms[0], "a");
@@ -91,9 +81,7 @@ static void test_thousands_separator_stays_together(void) {
 }
 
 static void test_sentence_ending_punctuation_still_splits(void) {
-    /* The internal-punctuation rule must not swallow sentence-ending
-     * punctuation -- "telescope." still ends the word normally, since the
-     * period isn't followed by another alphanumeric byte. */
+    /* Trailing period still splits (not followed by alnum). */
     TokenList *list = tokenize("The telescope. It worked.");
     TEST_ASSERT(list->count == 4, "expected 4 tokens, got %zu", list->count);
     TEST_ASSERT_STR_EQ(list->terms[0], "the");
@@ -104,9 +92,7 @@ static void test_sentence_ending_punctuation_still_splits(void) {
 }
 
 static void test_quoted_word_still_strips_quotes(void) {
-    /* Leading/trailing single quotes used as quotation marks, not
-     * apostrophes, must still be stripped -- neither is "internal" since
-     * there's no alphanumeric byte on the outward-facing side. */
+    /* Quotation-mark quotes still strip (not internal apostrophes). */
     TokenList *list = tokenize("'hello' world");
     TEST_ASSERT(list->count == 2, "expected 2 tokens, got %zu", list->count);
     TEST_ASSERT_STR_EQ(list->terms[0], "hello");
@@ -114,9 +100,7 @@ static void test_quoted_word_still_strips_quotes(void) {
     token_list_free(list);
 }
 
-/* 12 tokens crosses the initial capacity of 8 (TOKEN_LIST_INITIAL_CAPACITY
- * in tokenizer.c), forcing token_list_append's realloc-doubling path to
- * actually run rather than just being compiled and never exercised. */
+/* 12 tokens force token_list_append's realloc path (initial cap 8). */
 static void test_many_tokens_grows_capacity(void) {
     TokenList *list = tokenize(
         "one two three four five six seven eight nine ten eleven twelve");

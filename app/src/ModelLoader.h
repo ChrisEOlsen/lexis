@@ -1,10 +1,5 @@
-// Loads the local GGUF model exactly once, on a background thread --
-// local_llm_client_init() blocks for roughly 9-19 seconds (measured
-// directly, see SPEED.md/LIMITATIONS.md), so it can't run on the UI
-// thread. AppController kicks this off proactively as soon as the app
-// starts, not deferred to the first chat message -- the cost then
-// overlaps with whatever the user does first (browsing groups,
-// ingesting documents) instead of stalling their first question.
+// Loads the local GGUF once, on a background thread (init blocks ~9-19s).
+// Started proactively at launch so the cost overlaps with first use.
 
 #ifndef LEXIS_APP_MODELLOADER_H
 #define LEXIS_APP_MODELLOADER_H

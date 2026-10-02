@@ -1,18 +1,5 @@
-// Drill-down level 1: every group (corpus), via AppController.corpusModel.
-// Clicking a row selects that group and asks the StackView (in
-// GroupSidebar.qml) to push GroupDocumentsView -- this component only
-// emits `groupOpened`, it doesn't know about the StackView itself.
-//
-// Rows are stock ItemDelegates. Selection is `highlighted`, which under
-// FluentWinUI3 draws the blue left accent bar plus a subtle fill -- the
-// standard Fluent navigation-item treatment, and the reason this file no
-// longer contains any selected/pressed color logic of its own.
-//
-// Per-row actions live behind a "..." overflow menu rather than an
-// always-visible destructive button. A bare red X on every row shouts
-// "delete" at the user permanently, for an action taken approximately
-// never; the menu keeps the affordance one click away and lets more row
-// actions be added later without redesigning the row.
+// Drill-down level 1: every group. Clicking selects and emits `groupOpened`
+// (the StackView push lives in GroupSidebar.qml, not here).
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -48,10 +35,7 @@ Item {
             clip: true
             spacing: 2
             model: AppController.corpusModel
-            // Delegate reuse is off deliberately: these lists are a
-            // handful of rows, so reuse buys nothing, and a reused
-            // delegate briefly showing the previous row's state is a
-            // class of flicker not worth risking for no gain.
+            // No delegate reuse: a handful of rows gains nothing, and reuse can flicker.
             reuseItems: false
 
             delegate: ItemDelegate {
@@ -64,11 +48,7 @@ Item {
                     root.groupOpened()
                 }
 
-                // Custom contentItem for one reason only: the style's
-                // stock contentItem is an IconLabel, which does not
-                // elide, and group names are user-supplied. The stock
-                // `background` is untouched, so the accent bar and press
-                // feedback remain the style's.
+                // Custom contentItem only to elide (IconLabel doesn't); background stays stock.
                 contentItem: RowLayout {
                     spacing: Theme.spacingXS
 
@@ -85,10 +65,7 @@ Item {
                         font.pixelSize: 16
                         implicitWidth: 28
                         implicitHeight: 28
-                        // The menu is opened explicitly rather than via
-                        // ItemDelegate's own click, and this button
-                        // consumes the press, so opening the menu does
-                        // not also select the group.
+                        // Consumes the press: opening the menu must not also select the group.
                         onClicked: rowMenu.popup()
 
                         Menu {
@@ -114,10 +91,7 @@ Item {
             text: qsTr("+  New Group")
             // highlighted is Fluent's accent (primary action) button.
             highlighted: true
-            // White regardless of theme -- the accent fill is dark enough
-            // in both light and dark modes for white to read. A custom
-            // contentItem, because FluentWinUI3 ignores palette.buttonText
-            // on highlighted buttons (verified: the text stayed black).
+            // White custom contentItem: the style ignores palette.buttonText when highlighted.
             contentItem: Text {
                 text: newGroupButton.text
                 font: newGroupButton.font
@@ -133,10 +107,7 @@ Item {
         }
     }
 
-    // Both dialogs are stock: no background override, no hand-built
-    // footer button. DialogButtonBox is one of the 49 controls the style
-    // implements, so Ok/Cancel come out correct, keyboard-navigable, and
-    // consistent with the rest of the app for free.
+    // Both dialogs are stock (the style implements DialogButtonBox).
     Dialog {
         id: deleteConfirm
         title: qsTr("Delete group")
@@ -148,14 +119,7 @@ Item {
             deleteConfirm.close()
         }
 
-        // Names the chat history explicitly. "everything in it" is
-        // accurate but reads as "the documents" -- and the chats really do
-        // go: public.chat_sessions.corpus_id references public.corpora
-        // ON DELETE CASCADE, and chat_messages cascades from the sessions,
-        // so deleting the group's registry row takes every conversation
-        // and every message with it in the same transaction. There is no
-        // soft delete and no export, so this dialog is the only warning
-        // the user gets.
+        // Names chat history explicitly: it cascades away with the group, no undo.
         ColumnLayout {
             width: deleteConfirm.availableWidth
             spacing: Theme.spacingS
@@ -181,8 +145,7 @@ Item {
         modal: true
         anchors.centerIn: Overlay.overlay
         standardButtons: Dialog.Cancel | Dialog.Ok
-        // Ok is disabled until the name is non-empty -- the guard used to
-        // live on a hand-built Create button.
+        // Ok stays disabled until the name is non-empty.
         onAccepted: AppController.createGroup(nameField.text)
         Component.onCompleted: okButton.enabled = false
 

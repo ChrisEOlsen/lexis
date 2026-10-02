@@ -18,9 +18,7 @@ void PostgresManager::configure(const QString &binDir, const QString &dataDir,
 
 int PostgresManager::run(const QString &program, const QStringList &args, QString *output) const {
     QProcess proc;
-    // pg_ctl and friends fail on a missing/unset locale when launched
-    // outside a login shell (a real failure seen with the Homebrew
-    // install in non-interactive shells) -- pin one explicitly.
+    // Pin a locale: pg_ctl fails without one outside a login shell (seen with Homebrew).
     QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
     env.insert("LC_ALL", "en_US.UTF-8");
     proc.setProcessEnvironment(env);
@@ -43,10 +41,7 @@ bool PostgresManager::ensureStarted(QString *error) {
     QString out;
 
     if (!QFileInfo::exists(m_dataDir + "/PG_VERSION")) {
-        // -A peer: the OS user is the credential, for every local
-        // connection; the default superuser is the OS user, matching
-        // the conninfo AppEnvironment generates. locale C keeps initdb
-        // independent of whatever the user's system locale is.
+        // -A peer: the OS user is the credential (matches AppEnvironment's conninfo).
         if (run("initdb", {"-D", m_dataDir, "-A", "peer", "-E", "UTF8", "--locale=C"}, &out) != 0) {
             if (error != nullptr) {
                 *error = QStringLiteral("initdb failed: %1").arg(out.right(500));
@@ -55,10 +50,7 @@ bool PostgresManager::ensureStarted(QString *error) {
         }
     }
 
-    // Force socket-only every launch, not just after initdb -- appended
-    // last, so these win over anything earlier in postgresql.conf, and
-    // an upgrade that changes this policy takes effect without touching
-    // the user's data directory.
+    // Force socket-only every launch (appended last, so these win over older policy).
     QFile conf(m_dataDir + "/postgresql.conf");
     if (conf.open(QIODevice::ReadOnly | QIODevice::Text)) {
         const QString marker = QStringLiteral("# LEXIS socket-only overrides");
@@ -74,9 +66,7 @@ bool PostgresManager::ensureStarted(QString *error) {
         }
     }
 
-    // Already running (this launch raced a slow quit, or a previous run
-    // crashed without stopping it) counts as started -- it is the same
-    // private data directory either way.
+    // Already running (slow quit or crashed run) counts as started: same data dir.
     if (run("pg_ctl", {"-D", m_dataDir, "status"}, nullptr) != 0) {
         if (run("pg_ctl",
                 {"-D", m_dataDir, "-w", "-t", "30", "-l", m_dataDir + "/server.log", "start"},

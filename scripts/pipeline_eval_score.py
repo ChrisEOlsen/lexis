@@ -1,35 +1,6 @@
 #!/usr/bin/env python3
-"""Score a lexis_eval run against DelucionQA's reference answers.
-
-What is measured, and what each measure is worth:
-
-  tool          which tool the router picked. Reported, not scored -- there
-                is no ground truth for it in DelucionQA, but the
-                distribution is diagnostic on its own (every one of these
-                questions is a specific lookup, so anything other than
-                SEARCH is worth looking at).
-
-  gold_sent     whether a passage containing the reference answer's
-                supporting text actually reached the model. This is the one
-                measure with real ground truth, and it separates "the model
-                failed" from "the passage was never there".
-
-  coverage      share of the reference answer's content words that appear in
-                the generated answer. Deliberately crude: DelucionQA's
-                references are prose, and the only local model available is
-                the same one under test, so using it as a judge would be
-                circular. Lexical overlap is at least deterministic and
-                applied identically everywhere. It UNDERCOUNTS correct
-                answers that paraphrase and OVERCOUNTS verbose ones that
-                restate the question, so treat it as a screening signal for
-                finding cases to read, not as a grade.
-
-  refusal      whether the answer looks like a non-answer ("I don't have
-                enough", "no matching passages", asking the user for
-                documents). Counted separately because a refusal scores low
-                on coverage for a completely different reason than a wrong
-                answer does.
-"""
+"""Score a lexis_eval run: tool distribution, gold_sent, lexical coverage, refusals.
+Coverage is a crude screening signal (undercounts paraphrase), not a grade."""
 
 import collections
 import json
@@ -37,37 +8,8 @@ import os
 import re
 import sys
 
-SHINGLE = 8
-
-REFUSAL_MARKERS = (
-    "don't have enough",
-    "do not have enough",
-    "not enough information",
-    "no matching passages",
-    "does not contain",
-    "doesn't contain",
-    "cannot answer",
-    "can't answer",
-    "please provide",
-    "could you rephrase",
-    "i only have",
-    "i don't have access",
-)
-
-
-def normalize(text):
-    return " ".join(text.lower().split())
-
-
-def shingles(text):
-    words = normalize(text).split()
-    if len(words) < SHINGLE:
-        return {" ".join(words)} if words else set()
-    return {" ".join(words[i : i + SHINGLE]) for i in range(len(words) - SHINGLE + 1)}
-
-
-def content_words(text, stopwords):
-    return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in stopwords and len(w) > 2}
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from eval_common import content_words, looks_like_refusal, shingles
 
 
 def main():
@@ -99,7 +41,7 @@ def main():
 
     rows = []
     with open(results_tsv) as fh:
-        fh.readline()  # header
+        fh.readline()
         for line in fh:
             parts = line.rstrip("\n").split("\t")
             if len(parts) < 7:
@@ -112,7 +54,6 @@ def main():
                 rw = content_words(ref, stopwords)
                 if rw:
                     best = max(best, len(rw & ans_words) / len(rw))
-            low = answer.lower()
             rows.append(
                 {
                     "i": int(idx),
@@ -123,7 +64,7 @@ def main():
                     "q": q,
                     "a": answer,
                     "coverage": best,
-                    "refusal": any(m in low for m in REFUSAL_MARKERS),
+                    "refusal": looks_like_refusal(answer),
                     "known": q in refs,
                 }
             )

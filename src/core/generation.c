@@ -1,7 +1,4 @@
-/*
- * Implementation of answer generation.
- * See include/generation.h for the module's role (spec 5.2.7).
- */
+/* Answer generation (spec 5.2.7); see generation.h. */
 
 #include "generation.h"
 
@@ -15,15 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Whether user-facing answer generation runs the model's reasoning pass
- * (config/lexis.conf `thinking = on|off`, default on -- see config.h).
- * Read once per process, lazily: every long-lived caller (the app, the
- * eval harnesses) already treats config as fixed for its lifetime, and
- * the LLM call sites this gates are serialized by contract
- * (local_llm_client.h), so there is no read race worth locking over.
- * Thinking roughly TRIPLES answer latency (measured 28.2s vs 9.9s, one
- * question) but rescued the crowded-topic disambiguation case that got
- * it re-enabled -- see LIMITATIONS.md's generation.c row. */
+/* Reasoning pass per config `thinking` (default on); lazy once-per-process, no lock (LLM calls serialized).
+ * Triples latency but rescued crowded-topic disambiguation (see dev/LIMITATIONS.md). */
 static int thinking_enabled(void) {
     static int cached = -1;
     if (cached == -1) {
@@ -32,26 +22,8 @@ static int thinking_enabled(void) {
     return cached;
 }
 
-/* Every prompt in this file lives in prompts.h.
- *
- * The two user-facing answer generators below -- from retrieved passages
- * and from a group summary -- run the model's reasoning pass per
- * config/lexis.conf's `thinking` setting (thinking_enabled() above,
- * default on). Passing prefill = NULL alone would not turn it on: that
- * leaves the template's enable_thinking override unset, and Gemma 4's
- * template defaults it to false on its own (see local_llm_client.c). Any
- * reasoning the model emits is stripped before the answer is returned.
- *
- * Thinking was originally off for latency, on the theory that a grounded
- * answer needs no deliberation; that failed on a retrieved passage set
- * where every candidate was legitimately on-topic and the model, given no
- * opportunity to weigh them, answered from whichever it read first.
- * Whether that quality holds across a distribution (not one case) is what
- * the config knob exists to measure -- see LIMITATIONS.md.
- *
- * The plain generation_generate_answer() below has no production caller
- * since the CLI moved onto the with-history entry point (zero turns); it
- * remains as tested API surface and the never-thinking reference path. */
+/* Prompts live in prompts.h. Passage/summary answers honor `thinking`; NULL prefill alone won't enable it (see local_llm_client.c).
+ * generate_answer() has no production caller; kept as tested never-thinking reference. */
 
 char *generation_build_prompt(const char *query_text, PgStore *store,
                                const BM25ResultSet *results) {
@@ -65,9 +37,7 @@ char *generation_build_prompt(const char *query_text, PgStore *store,
         goto fail;
     }
 
-    /* A passage_id failing to load is skipped, not fatal -- track how
-     * many actually made it in, since a prompt with zero real context
-     * (every passage failed to load) isn't a grounded answer at all. */
+    /* Skipped loads aren't fatal, but zero included passages means no grounded answer. */
     size_t passages_included = 0;
     for (size_t i = 0; i < results->count; i++) {
         PgStorePassage *passage = pg_store_get_passage(store, results->items[i].passage_id);
@@ -123,30 +93,11 @@ char *generation_generate_answer(const char *query_text, PgStore *store,
     return answer;
 }
 
-/* Headroom held back from the history budget for the model's own output.
- *
- * Derived from LOCAL_LLM_MAX_NEW_TOKENS rather than written as a literal,
- * because the two must move together and once did not: this was 600, chosen
- * when the generation cap was 512, and stayed at 600 after the cap became
- * 2048 for thinking mode. That combination is silently lossy -- history is
- * allowed to fill the window to within 600 tokens of the end, generation then
- * runs out of context part-way through (it stops cleanly, see
- * local_llm_client.c's n_ctx_used check) and the user gets a truncated answer
- * with nothing indicating it was cut short. Reasoning traces alone have been
- * measured past 512 tokens, so the old margin was not close to enough.
- *
- * The extra slack on top covers the chat template's own markup: this budget
- * is computed from local_llm_count_tokens() on the pre-template prompt, which
- * undercounts what the real call ends up tokenizing. */
+/* History-budget headroom for model output; derived from MAX_NEW_TOKENS so they move together.
+ * +256 covers template markup, which token counting undercounts. */
 #define GENERATION_RESERVED_OUTPUT_TOKENS (LOCAL_LLM_MAX_NEW_TOKENS + 256)
 
-/* Same windowing algorithm as query_formulation.c's own window_history()
- * -- kept as two small copies rather than one shared helper, since each
- * call site's budget is computed differently (this one reserves room for
- * an already-built passage context block; query_formulation's doesn't
- * have one yet) and the walking logic itself is short enough that
- * sharing it would cost more in indirection than it'd save. See that
- * file's copy for the full behavior doc comment. */
+/* Same windowing as query_formulation.c; separate copies since each budget differs (see there). */
 static LocalLlmTurn *window_history(const LocalLlmTurn *history, size_t history_count, int budget_tokens,
                                      size_t *out_count) {
     size_t start = history_count;
@@ -179,10 +130,7 @@ char *generation_generate_answer_with_history_stream(const char *query_text, PgS
                                                       const LocalLlmTurn *history, size_t history_count,
                                                       int thinking_override, LocalLlmStreamFn on_piece,
                                                       void *user_data) {
-    /* thinking_override: -1 = follow config/lexis.conf's `thinking`
-     * setting; 0/1 force it off/on for this one call. The refusal-retry
-     * path forces it ON: the measured case thinking rescued was exactly
-     * a model declining/misreading passages it already had. */
+    /* -1 follows config `thinking`; 0/1 force off/on. Refusal retry forces ON (thinking rescued that case). */
     int think = (thinking_override < 0) ? thinking_enabled() : thinking_override;
     char *prompt = generation_build_prompt(query_text, store, results);
     if (prompt == NULL) {
@@ -238,182 +186,7 @@ char *generation_generate_answer_with_history(const char *query_text, PgStore *s
                                                            thinking_override, NULL, NULL);
 }
 
-/* Room reserved for history + the question + the model's output, held
- * out of the document-text budget below BEFORE any document text gets
- * included -- unlike generation_build_prompt()'s passages (already
- * capped at TOP_K=5 small chunks, so naturally bounded), document text
- * is effectively unbounded, so this function has to reserve room for
- * everything else up front rather than measuring an already-built
- * prompt afterward the way generation_generate_answer_with_history()
- * does for history. */
-#define GENERATION_DOCUMENT_CONTEXT_RESERVED_TOKENS 3000
-
-/* Only used to size a byte-length truncation of a single oversized
- * document (see generation_build_document_prompt()) -- an estimate, not
- * an exact token count. Conservative (real English text averages closer
- * to 4 bytes/token) so the truncated text undershoots its token budget
- * rather than overshoots it; the real formatted prompt still gets
- * checked against LOCAL_LLM_N_CTX before generation runs regardless, so
- * this only needs to be roughly right, not exact. */
-#define GENERATION_BYTES_PER_TOKEN_ESTIMATE 3
-
-/* Builds the "read the whole group" context prompt: every document
- * currently in the active corpus (pg_store_get_all_documents(), the same
- * call rebuild-on-append uses), included whole and in the order returned
- * until the next one wouldn't fit `budget_tokens`, then stops -- document
- * order has no inherent recency the way chat turns do, so unlike
- * window_history() this doesn't walk backward, it just stops once full.
- * If NO document has been included yet and even the first one alone
- * doesn't fit, that document is truncated to fit rather than returning
- * an empty context -- see LIMITATIONS.md for why this is a byte-length
- * estimate, not exact. Returns NULL if the corpus has no documents, on
- * allocation failure, or if the DB read itself fails. */
-static char *generation_build_document_prompt(const char *query_text, PgStore *store, int budget_tokens) {
-    size_t doc_count = 0;
-    PgStoreDocument *docs = pg_store_get_all_documents(store, &doc_count);
-    if (docs == NULL) {
-        return NULL;
-    }
-    if (doc_count == 0) {
-        pg_store_documents_free(docs, doc_count);
-        return NULL;
-    }
-
-    StringBuilder builder = {NULL, 0, 0};
-    if (string_builder_append(&builder, LEXIS_PROMPT_ANSWER_FROM_DOCUMENTS_HEAD) != 0) {
-        goto fail;
-    }
-
-    int running_tokens = 0;
-    size_t documents_included = 0;
-    for (size_t i = 0; i < doc_count; i++) {
-        int doc_tokens = local_llm_count_tokens(docs[i].text);
-        if (doc_tokens < 0) {
-            doc_tokens = 0;
-        }
-
-        const char *text_to_include = docs[i].text;
-        char *truncated = NULL;
-        if (running_tokens + doc_tokens > budget_tokens) {
-            if (documents_included > 0) {
-                /* Already have at least one whole document in -- stop
-                 * here rather than dilute it with a truncated fragment
-                 * of the next one. */
-                break;
-            }
-            size_t max_bytes = (size_t)budget_tokens * GENERATION_BYTES_PER_TOKEN_ESTIMATE;
-            size_t text_len = strlen(docs[i].text);
-            if (max_bytes < text_len) {
-                truncated = malloc(max_bytes + 1);
-                if (truncated == NULL) {
-                    goto fail;
-                }
-                memcpy(truncated, docs[i].text, max_bytes);
-                truncated[max_bytes] = '\0';
-                text_to_include = truncated;
-            }
-        }
-
-        int appended = string_builder_append(&builder, "[Source: ") != 0 ||
-                        string_builder_append(&builder, docs[i].document_name) != 0 ||
-                        string_builder_append(&builder, "]\n") != 0 ||
-                        string_builder_append(&builder, text_to_include) != 0 ||
-                        string_builder_append(&builder, "\n\n") != 0;
-        free(truncated);
-        if (appended) {
-            goto fail;
-        }
-
-        running_tokens += doc_tokens;
-        documents_included++;
-        if (running_tokens >= budget_tokens) {
-            break;
-        }
-    }
-    pg_store_documents_free(docs, doc_count);
-
-    if (documents_included == 0) {
-        free(builder.data);
-        return NULL;
-    }
-
-    if (string_builder_append(&builder, "Question: ") != 0 ||
-        string_builder_append(&builder, query_text) != 0 ||
-        string_builder_append(&builder, "\n\nAnswer:") != 0) {
-        goto fail_no_docs;
-    }
-
-    return builder.data;
-
-fail:
-    pg_store_documents_free(docs, doc_count);
-fail_no_docs:
-    free(builder.data);
-    return NULL;
-}
-
-char *generation_generate_answer_from_documents(const char *query_text, PgStore *store, const LocalLlmTurn *history,
-                                                 size_t history_count) {
-    char *prompt = generation_build_document_prompt(query_text, store,
-                                                      LOCAL_LLM_N_CTX - GENERATION_DOCUMENT_CONTEXT_RESERVED_TOKENS);
-    if (prompt == NULL) {
-        return NULL;
-    }
-
-    if (history_count == 0) {
-        LocalLlmTurn turn = {.role = "user", .content = prompt};
-        char *answer = local_llm_chat_completion_multi(&turn, 1, LEXIS_PREFILL_NO_THINK);
-        free(prompt);
-        return answer;
-    }
-
-    int prompt_tokens = local_llm_count_tokens(prompt);
-    if (prompt_tokens < 0) {
-        prompt_tokens = LOCAL_LLM_N_CTX;
-    }
-    int budget = LOCAL_LLM_N_CTX - prompt_tokens - GENERATION_RESERVED_OUTPUT_TOKENS;
-    if (budget < 0) {
-        budget = 0;
-    }
-
-    size_t windowed_count = 0;
-    LocalLlmTurn *windowed = window_history(history, history_count, budget, &windowed_count);
-    if (windowed == NULL) {
-        free(prompt);
-        return NULL;
-    }
-
-    LocalLlmTurn *turns = malloc(sizeof(LocalLlmTurn) * (windowed_count + 1));
-    if (turns == NULL) {
-        free(windowed);
-        free(prompt);
-        return NULL;
-    }
-    for (size_t i = 0; i < windowed_count; i++) {
-        turns[i] = windowed[i];
-    }
-    free(windowed);
-    turns[windowed_count] = (LocalLlmTurn){.role = "user", .content = prompt};
-
-    char *answer = local_llm_chat_completion_multi(turns, windowed_count + 1, LEXIS_PREFILL_NO_THINK);
-    free(turns);
-    free(prompt);
-    return answer;
-}
-
-/* Builds the SUMMARY-tool prompt. Small by construction -- a group summary
- * is a few hundred tokens regardless of corpus size, which is the entire
- * reason this path exists instead of re-reading documents.
- *
- * The two negative instructions are both there in response to observed
- * behavior, not as boilerplate. "Never ask the user to provide documents"
- * addresses a real answer -- "Please provide the documents you are
- * referring to" -- produced for a question about a corpus whose text was
- * already in the prompt: with chatty history ahead of it, the model
- * followed the conversational framing instead of the attached context.
- * "Don't mention the summary" stops the reply becoming "the summary says
- * ...", which tells the reader about the plumbing rather than answering
- * them. */
+/* SUMMARY-tool prompt; small by construction. Negative instructions address observed misbehavior (see prompts.h). */
 static char *generation_build_summary_prompt(const char *query_text, const char *summary_text) {
     StringBuilder builder = {NULL, 0, 0};
 
@@ -489,4 +262,135 @@ char *generation_generate_answer_from_summary(const char *query_text, const char
                                               const LocalLlmTurn *history, size_t history_count) {
     return generation_generate_answer_from_summary_stream(query_text, summary_text, history, history_count, -1, NULL,
                                                            NULL);
+}
+
+/* Full-text read: whole documents as attributed blocks (the retired READ prompt, revived
+ * as the SEARCH fallback for groups small enough to fit). Skipped NULL texts aren't
+ * fatal, but zero included documents means no grounded answer. */
+char *generation_build_documents_prompt(const char *query_text, const PgStoreDocument *docs,
+                                        size_t doc_count) {
+    if (doc_count == 0) {
+        return NULL;
+    }
+
+    StringBuilder builder = {NULL, 0, 0};
+
+    if (string_builder_append(&builder, LEXIS_PROMPT_ANSWER_FROM_DOCUMENTS_HEAD) != 0) {
+        goto fail;
+    }
+
+    size_t docs_included = 0;
+    for (size_t i = 0; i < doc_count; i++) {
+        if (docs[i].text == NULL) {
+            continue;
+        }
+        if (string_builder_append(&builder, "[Document: ") != 0 ||
+            string_builder_append(&builder, docs[i].document_name) != 0 ||
+            string_builder_append(&builder, "]\n") != 0 ||
+            string_builder_append(&builder, docs[i].text) != 0 ||
+            string_builder_append(&builder, "\n\n") != 0) {
+            goto fail;
+        }
+        docs_included++;
+    }
+
+    if (docs_included == 0) {
+        free(builder.data);
+        return NULL;
+    }
+
+    if (string_builder_append(&builder, "Question: ") != 0 ||
+        string_builder_append(&builder, query_text) != 0 ||
+        string_builder_append(&builder, "\n\nAnswer:") != 0) {
+        goto fail;
+    }
+
+    return builder.data;
+
+fail:
+    free(builder.data);
+    return NULL;
+}
+
+/* Conservative 3 bytes/token (real ~4, same as corpus_summary.c). Model-free on purpose:
+ * the fit decision must not depend on a loaded tokenizer. */
+#define GENERATION_BYTES_PER_TOKEN 3
+
+char *generation_generate_answer_from_documents_stream(const char *query_text, PgStore *store,
+                                                       const LocalLlmTurn *history, size_t history_count,
+                                                       int thinking_override, LocalLlmStreamFn on_piece,
+                                                       void *user_data, int *too_big_out) {
+    *too_big_out = 0;
+
+    size_t doc_count = 0;
+    PgStoreDocument *docs = pg_store_get_all_documents(store, &doc_count);
+    if (docs == NULL || doc_count == 0) {
+        pg_store_documents_free(docs, doc_count);
+        return NULL;
+    }
+
+    char *prompt = generation_build_documents_prompt(query_text, docs, doc_count);
+    pg_store_documents_free(docs, doc_count);
+    if (prompt == NULL) {
+        return NULL;
+    }
+
+    /* Whole corpora only: a partial read would present incomplete context as complete.
+     * Over-estimate is safe (falls through to the summary); under-estimate is not. */
+    size_t prompt_tokens_est = strlen(prompt) / GENERATION_BYTES_PER_TOKEN + 1;
+    if (prompt_tokens_est + GENERATION_RESERVED_OUTPUT_TOKENS > (size_t)LOCAL_LLM_N_CTX) {
+        free(prompt);
+        *too_big_out = 1;
+        return NULL;
+    }
+
+    const int think = (thinking_override < 0) ? thinking_enabled() : thinking_override;
+
+    if (history_count == 0) {
+        LocalLlmTurn turn = {.role = "user", .content = prompt};
+        char *answer = local_llm_chat_completion_multi_ex_stream(&turn, 1, NULL, think, on_piece, user_data);
+        free(prompt);
+        return answer;
+    }
+
+    int prompt_tokens = local_llm_count_tokens(prompt);
+    if (prompt_tokens < 0) {
+        prompt_tokens = LOCAL_LLM_N_CTX;
+    }
+    int budget = LOCAL_LLM_N_CTX - prompt_tokens - GENERATION_RESERVED_OUTPUT_TOKENS;
+    if (budget < 0) {
+        budget = 0;
+    }
+
+    size_t windowed_count = 0;
+    LocalLlmTurn *windowed = window_history(history, history_count, budget, &windowed_count);
+    if (windowed == NULL) {
+        free(prompt);
+        return NULL;
+    }
+
+    LocalLlmTurn *turns = malloc(sizeof(LocalLlmTurn) * (windowed_count + 1));
+    if (turns == NULL) {
+        free(windowed);
+        free(prompt);
+        return NULL;
+    }
+    for (size_t i = 0; i < windowed_count; i++) {
+        turns[i] = windowed[i];
+    }
+    free(windowed);
+    turns[windowed_count] = (LocalLlmTurn){.role = "user", .content = prompt};
+
+    char *answer = local_llm_chat_completion_multi_ex_stream(turns, windowed_count + 1, NULL, think, on_piece,
+                                                             user_data);
+    free(turns);
+    free(prompt);
+    return answer;
+}
+
+char *generation_generate_answer_from_documents(const char *query_text, PgStore *store,
+                                                const LocalLlmTurn *history, size_t history_count,
+                                                int thinking_override, int *too_big_out) {
+    return generation_generate_answer_from_documents_stream(query_text, store, history, history_count,
+                                                             thinking_override, NULL, NULL, too_big_out);
 }

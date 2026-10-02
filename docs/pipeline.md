@@ -55,10 +55,18 @@ What happens between hitting Enter and seeing an answer.
 
 9. **Retry on refusal.** If the answer is a refusal ("the material
    doesn't contain..."), the pipeline tries once more with a wider
-   passage cut and the model's reasoning mode on. Only then does the
-   user see a refusal.
+   passage cut and the model's reasoning mode on.
 
-10. **Record.** The answer is saved with its provenance: which tool
+10. **Fallback on recall failure.** When the search terms match nothing
+    at all -- or the answer still refuses after the retry, meaning the
+    retrieved passages were the wrong ones -- the pipeline stops
+    searching and reads instead: the documents' full text when the
+    whole group fits in context, otherwise the cached group overview.
+    This is what answers questions whose words can't reach the answer
+    ("who is this document referring to" on a page listing a name).
+    The Source panel records which leg answered.
+
+11. **Record.** The answer is saved with its provenance: which tool
     ran, the exact search terms, the rewritten question if any, and the
     full text of every passage used. The Source panel shows all
     of it.
@@ -70,7 +78,8 @@ streams in token by token as it is written rather than appearing all at
 once. The reasoning pass never streams -- if the model thinks, the
 stream holds until the thinking block closes. A refusal retry announces
 itself ("Trying again with a deeper search...") and restarts the
-answer.
+answer, as does the fallback ("Reading the documents..." or
+"Summarizing the group...").
 
 **On demand.** The newest SEARCH answer also carries a "Try harder"
 action: the same deeper retrieval and forced reasoning the automatic
@@ -82,10 +91,10 @@ original answer exactly as it was.
 ## In the CLI
 
 `./lexis query "..."` runs steps 3-8 identically (same code), minus
-routing and conversation history. It also logs every intermediate
-step -- prompts, raw model responses, timings -- to the database when
-`mode=testing` is set, which is how pipeline problems get diagnosed
-from records instead of guesswork.
+routing, conversation history, the refusal retry, and the fallback. It
+also logs every intermediate step -- prompts, raw model responses,
+timings -- to the database when `mode=testing` is set, which is how
+pipeline problems get diagnosed from records instead of guesswork.
 
 ## Time budget
 

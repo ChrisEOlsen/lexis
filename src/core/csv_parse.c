@@ -1,12 +1,5 @@
-/*
- * Implementation of strict RFC4180 CSV parsing.
- * See include/csv_parse.h for the module's role and exactly what counts
- * as malformed. One single-pass byte scanner over the whole file (via
- * ingest_read_file()) rather than splitting into lines first -- a
- * quoted field can legally contain a literal newline, so "lines" aren't
- * a meaningful unit to parse against; only a real state machine over
- * every byte gets this right.
- */
+/* Strict RFC4180 parsing; see csv_parse.h. Single-pass byte scan:
+ * quoted fields may contain newlines, so lines aren't parseable units. */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -22,22 +15,16 @@ typedef enum {
     CSV_FIELD_START,      /* nothing consumed yet for this field */
     CSV_UNQUOTED,         /* mid-field, not inside quotes */
     CSV_QUOTED,           /* mid-field, inside an opening " */
-    CSV_QUOTED_QUOTE_SEEN /* just saw a " while CSV_QUOTED -- ambiguous
-                            * until the next byte: another " means an
-                            * escaped literal quote, anything else means
-                            * the quoted field just closed */
+    CSV_QUOTED_QUOTE_SEEN /* " seen in quotes: next " = escaped quote, else field closed */
 } CsvState;
 
-/* string_builder_append() takes a whole C string; this is a
- * single-character append via a tiny 2-byte scratch buffer. */
+/* Single-char append via a 2-byte scratch buffer. */
 static int append_char(StringBuilder *builder, char c) {
     char buf[2] = {c, '\0'};
     return string_builder_append(builder, buf);
 }
 
-/* Appends the field currently accumulated in `field` (possibly empty)
- * to `row`, then resets `field` to empty for the next field. Returns 0
- * on success, -1 on allocation failure. */
+/* Append accumulated field to row, reset field. 0 ok, -1 alloc fail. */
 static int end_field(StringBuilder *field, TokenList *row) {
     int result = token_list_append(row, field->data == NULL ? "" : field->data);
     free(field->data);
@@ -45,17 +32,8 @@ static int end_field(StringBuilder *field, TokenList *row) {
     return result;
 }
 
-/* Finishes the last field of the current row, then the row itself: on
- * the very first row, records its field count as the required count
- * for every later row (the header's own values are discarded, only its
- * column count matters); every later row must match that count exactly
- * or the whole parse fails. A non-header row gets its fields
- * space-joined into one document string appended to `rows`. Always
- * resets `field` and `*row_ptr` (freeing the old row, allocating a
- * fresh empty one) for the row that follows, even on failure -- the
- * caller stops on the very next loop check regardless, and this keeps
- * every call site's cleanup uniform. Returns 0 on success, -1 on a
- * field-count mismatch or allocation failure. */
+/* Finish field+row; first row sets required field count, later rows must match.
+ * Always resets field/row for the next row, even on failure. 0 ok, -1 mismatch/alloc fail. */
 static int finish_row(StringBuilder *field, TokenList **row_ptr, TokenList *rows, int *have_header,
                        size_t *expected_field_count) {
     int ok = end_field(field, *row_ptr) == 0;
@@ -102,10 +80,7 @@ TokenList *csv_parse_file(const char *csv_path) {
     int failed = 0;
     int row_has_content = 0;
 
-    /* i == len (contents[len] == '\0', the NUL ingest_read_file() always
-     * appends) stands in for EOF -- one extra loop iteration lets EOF
-     * reuse exactly the same row/field-finishing logic as a real
-     * newline, instead of duplicating it after the loop. */
+    /* i == len stands in for EOF so it reuses the newline-finishing logic. */
     for (size_t i = 0; i <= len && !failed; i++) {
         int eof = (i == len);
         char c = eof ? '\0' : contents[i];
@@ -147,7 +122,6 @@ TokenList *csv_parse_file(const char *csv_path) {
             continue;
         }
 
-        /* state is CSV_FIELD_START or CSV_UNQUOTED here. */
         if (!eof && c == '"' && state == CSV_FIELD_START) {
             state = CSV_QUOTED;
             row_has_content = 1;
@@ -168,8 +142,7 @@ TokenList *csv_parse_file(const char *csv_path) {
                 i++;
             }
             if (state == CSV_FIELD_START && !row_has_content && field.length == 0 && row->count == 0) {
-                /* A blank line, or trailing EOF right after the last
-                 * row's newline -- nothing pending, not a row. */
+                /* Blank line or trailing EOF after last newline: not a row. */
                 if (eof) {
                     break;
                 }

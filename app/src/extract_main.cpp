@@ -1,17 +1,5 @@
-// Extraction verification tool: runs files through the SAME format
-// extractors the app's drag-and-drop ingestion uses (DocxExtractor,
-// PdfExtractor, OcrExtractor) and prints what came out -- so "does DOCX
-// work? does OCR work?" is answerable from the terminal, with real
-// files, without driving the GUI.
-//
-// usage: lexis_extract <file> [file...]
-//        lexis_extract --ingest "<group name>" <file> [file...]
-//
-// Plain mode prints each file's extracted text. --ingest additionally
-// creates a new group and indexes the extracted text through
-// bulk_ingest_rebuild_corpus() -- the identical call IngestWorker makes
-// -- and prints the new group's id, so the result can be queried with
-// lexis_eval or opened in the app.
+// Extraction verification tool: files through the SAME extractors ingestion uses, printed
+// to the terminal. --ingest also indexes into a new group via IngestWorker's identical call.
 
 #include <QCoreApplication>
 #include <QFileInfo>

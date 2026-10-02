@@ -71,8 +71,10 @@ Two builds share one core:
   streams the answer's text piece by piece as the model writes it
   (the answer still arrives in full via `queryFinished`; the stream
   is display plumbing). Also carries the "Try harder" retry mode
-  (deeper retrieval policy on demand) and an explicit per-query
-  thinking override so the Settings panel applies without a restart.
+  (deeper retrieval policy on demand), the SEARCH fallback (full-text
+  read when the group fits, else the cached overview), and an explicit
+  per-query thinking override so the Settings panel applies without a
+  restart.
 - `IngestWorker` -- turns dropped files into indexed passages.
 - `ConfigManager` -- line-preserving read/modify/write of
   config/lexis.conf for the Settings panel: rewrites only the lines

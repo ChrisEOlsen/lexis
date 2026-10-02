@@ -1,11 +1,6 @@
-/*
- * Implementation of the ingestion pipeline.
- * See include/ingest.h for the module's role (spec 5.2.1, Stages 1-2).
- */
+/* Ingestion pipeline (spec 5.2.1, Stages 1-2); see ingest.h. */
 
-/* See tokenizer.c for why this must come before any #include (strdup and
- * strtok_r are POSIX extensions hidden by glibc under strict -std=c11
- * otherwise). */
+/* Before any #include: exposes strdup/strtok_r under strict -std=c11 (see tokenizer.c). */
 #define _POSIX_C_SOURCE 200809L
 
 #include "ingest.h"

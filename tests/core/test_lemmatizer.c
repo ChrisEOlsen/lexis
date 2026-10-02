@@ -1,9 +1,4 @@
-/*
- * Tests for src/core/lemmatizer.c — reducing inflected words to their
- * WordNet base form. Uses the real committed WordNet data and exception
- * files, same pattern as wordnet.c's own end-to-end tests, since this
- * module's whole job is validating candidates against the real table.
- */
+/* Tests for lemmatizer.c against real WordNet data and exception files. */
 
 #include "lemmatizer.h"
 #include "wordnet.h"
@@ -19,10 +14,7 @@ static void test_lemmatize_regular_verb_suffix_rule(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    /* "called" has no exception entry (confirmed against the real file)
-     * -- this exercises the suffix-rule path: strip "ed", validate
-     * "call" against real WordNet (28 senses, confirmed earlier). This
-     * is the exact case that started this whole investigation. */
+    /* "called" has no exception entry; suffix rule must yield "call". */
     char *result = lemmatize(lemmatizer, wordnet, "called");
     TEST_ASSERT(result != NULL, "expected lemmatize to succeed");
     TEST_ASSERT_STR_EQ(result, "call");
@@ -37,8 +29,7 @@ static void test_lemmatize_irregular_exception(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    /* Classic irregular verb -- no suffix rule could ever derive "go"
-     * from "went". Must come from the exception list. */
+    /* Irregular verb; must come from the exception list. */
     char *result = lemmatize(lemmatizer, wordnet, "went");
     TEST_ASSERT(result != NULL, "expected lemmatize to succeed");
     TEST_ASSERT_STR_EQ(result, "go");
@@ -53,10 +44,7 @@ static void test_lemmatize_exception_with_spelling_variant(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    /* "installed" has an exception entry with TWO base forms ("instal",
-     * "install" -- British/American spelling, both separately indexed
-     * in WordNet pointing at the same synsets). lemmatize() takes the
-     * first-listed base form. */
+    /* "installed" maps to two bases ("instal", "install"); first one wins. */
     char *result = lemmatize(lemmatizer, wordnet, "installed");
     TEST_ASSERT(result != NULL, "expected lemmatize to succeed");
     TEST_ASSERT_STR_EQ(result, "instal");
@@ -71,9 +59,7 @@ static void test_lemmatize_already_base_form_unchanged(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    /* "install" doesn't end in any rule's suffix and has no exception
-     * entry of its own (it's the target, not the source) -- should pass
-     * through completely unchanged. */
+    /* Base form with no rule or exception; passes through unchanged. */
     char *result = lemmatize(lemmatizer, wordnet, "install");
     TEST_ASSERT(result != NULL, "expected lemmatize to succeed");
     TEST_ASSERT_STR_EQ(result, "install");
@@ -88,14 +74,7 @@ static void test_lemmatize_base_form_ending_in_rule_suffix_unchanged(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    /* Base-form words that merely LOOK inflected. "king" ends in "ing",
-     * and the verb rule {"ing", ""} strips it to "k" -- which validates,
-     * because "k" is a real WordNet noun (the letter/potassium/kelvin).
-     * Found in production: every singular "king" in the MS MARCO slice
-     * was indexed as "k" (1,719 postings), sinking the "king tut" query.
-     * Real morphy returns a word unchanged when it is already in the
-     * index; these assert that guard. Same class: "ring"->"r",
-     * "sing"->"s" (both letters are WordNet nouns too). */
+    /* "king"/"ring"/"sing" look inflected but are base forms; must not strip to letters. */
     char *result = lemmatize(lemmatizer, wordnet, "king");
     TEST_ASSERT(result != NULL, "expected lemmatize to succeed");
     TEST_ASSERT_STR_EQ(result, "king");
@@ -120,10 +99,7 @@ static void test_lemmatize_plural_of_ing_base_still_stripped(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    /* "kings" is genuinely inflected and must still strip to "king" --
-     * the unchanged-if-already-in-WordNet guard must not fire for words
-     * that are NOT in WordNet as given ("kings" isn't; only its base
-     * form is). */
+    /* Genuinely inflected "kings" must still strip to "king". */
     char *result = lemmatize(lemmatizer, wordnet, "kings");
     TEST_ASSERT(result != NULL, "expected lemmatize to succeed");
     TEST_ASSERT_STR_EQ(result, "king");
@@ -138,10 +114,7 @@ static void test_lemmatize_exception_beats_base_form_guard(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    /* Ordering constraint on the guard above: "saw" IS in WordNet as a
-     * noun (the tool), but verb.exc maps "saw" -> "see". The exception
-     * list must keep winning, so the already-in-WordNet check has to sit
-     * AFTER the exception lookup, not before it. */
+    /* Exception must beat the already-in-WordNet guard ("saw" -> "see"). */
     char *result = lemmatize(lemmatizer, wordnet, "saw");
     TEST_ASSERT(result != NULL, "expected lemmatize to succeed");
     TEST_ASSERT_STR_EQ(result, "see");
@@ -156,10 +129,7 @@ static void test_lemmatize_word_not_in_wordnet_unchanged(void) {
     Lemmatizer *lemmatizer = lemmatizer_load(WORDNET_DIR);
     TEST_ASSERT(wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
-    /* A fictional/made-up word -- no exception entry, and no
-     * rule-derived candidate would validate against real WordNet
-     * either. Must fall through to returning the word unchanged, not
-     * crash or return NULL. */
+    /* Unknown words return unchanged, not NULL. */
     char *result = lemmatize(lemmatizer, wordnet, "windhollow");
     TEST_ASSERT(result != NULL, "expected lemmatize to succeed even for an unrecognized word");
     TEST_ASSERT_STR_EQ(result, "windhollow");

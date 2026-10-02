@@ -1,7 +1,5 @@
-// Backs ChatPanel.qml's session switcher -- one row per chat session in
-// the active group. Never created directly from QML (QML_UNCREATABLE);
-// AppController owns the one instance and exposes it via its
-// chatSessionModel property. Mirrors CorpusListModel exactly.
+// One row per chat session in the active group (QML_UNCREATABLE; owned by
+// AppController). Mirrors CorpusListModel.
 
 #ifndef LEXIS_APP_CHATSESSIONLISTMODEL_H
 #define LEXIS_APP_CHATSESSIONLISTMODEL_H
@@ -30,15 +28,10 @@ public:
     QVariant data(const QModelIndex &index, int role) const override;
     QHash<int, QByteArray> roleNames() const override;
 
-    // Replaces the whole list and notifies bound QML views. Called by
-    // AppController after any operation that could change the set of
-    // sessions for the active group (create, delete, group switch).
+    // Replaces the whole list. Called after create, delete, or group switch.
     void setSessions(const QVector<ChatSession> &sessions);
 
-    // Linear scan (session counts per group are small -- tens, not
-    // thousands) -- used by AppController to resolve activeChatSessionId
-    // into a displayable title without QML having to scan roles itself.
-    // Returns an empty string if sessionId isn't in the current list.
+    // Linear scan (session counts are small). Empty string if sessionId isn't listed.
     QString titleForId(qint64 sessionId) const;
 
 private:

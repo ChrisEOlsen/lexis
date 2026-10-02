@@ -1,13 +1,5 @@
-// Backs GroupDocumentsView.qml's ListView -- one row per document in
-// the currently active group. Never created directly from QML
-// (QML_UNCREATABLE); AppController owns the one instance and exposes it
-// via its documentModel property.
-//
-// A document row is a name plus the stats a large-corpus user needs at
-// a glance: how many passages the document indexed into and how many
-// tokens those carry (from pg_store_list_document_stats()'s single
-// GROUP BY, so populating a 2,000-document group costs one round trip,
-// not 2,000).
+// One row per document in the active group (QML_UNCREATABLE; owned by AppController).
+// Rows carry name + passage/token stats from pg_store_list_document_stats()' single round trip.
 
 #ifndef LEXIS_APP_DOCUMENTLISTMODEL_H
 #define LEXIS_APP_DOCUMENTLISTMODEL_H
@@ -42,9 +34,7 @@ public:
     QVariant data(const QModelIndex &index, int role) const override;
     QHash<int, QByteArray> roleNames() const override;
 
-    // Replaces the whole list and notifies bound views. Called by
-    // AppController after anything that changes the group's document
-    // set (group switch, ingest, removal).
+    // Replaces the whole list. Called after group switch, ingest, or removal.
     void setDocuments(const QVector<DocumentEntry> &documents);
 
 private:

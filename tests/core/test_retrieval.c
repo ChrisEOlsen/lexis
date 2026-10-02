@@ -1,11 +1,4 @@
-/*
- * Tests for src/core/retrieval.c — the shared retrieval orchestrator.
- * Uses the real committed WordNet/stopword data and the lexis_test
- * database, like the other DB-backed suites. The local model is never
- * loaded here: expansion's model call returns NULL without
- * local_llm_client_init(), which is exactly the fallback path worth
- * pinning (expansion degrades to plain terms, never blocks retrieval).
- */
+/* Tests for retrieval.c; model never loaded, expansion falls back to plain terms. */
 
 #include "retrieval.h"
 #include "test_utils.h"
@@ -88,9 +81,7 @@ static void test_expansion_without_model_degrades_to_plain_terms(void) {
     TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL && store != NULL,
                 "expected setup to succeed");
 
-    /* No local_llm_client_init() in this binary: the model call inside
-     * expansion returns NULL. The run must still search -- on the plain
-     * question terms -- and record that the fallback fired. */
+    /* No model here; run must still search on plain terms with fallback set. */
     RetrievalPolicy policy = retrieval_default_policy();
     RetrievalRun *run = retrieval_run(store, "What is the treatment for hypertension?", NULL,
                                        stopwords, wordnet, lemmatizer, &policy);
@@ -124,8 +115,7 @@ static void test_rewritten_question_terms_are_unioned(void) {
     RetrievalRun *run = retrieval_run(store, "what about the dog", "tell me about the dog breed",
                                        stopwords, wordnet, lemmatizer, &policy);
     TEST_ASSERT(run != NULL, "expected retrieval to succeed");
-    /* Union, raw question's terms first, deduplicated: dog (both), then
-     * the rewrite-only terms. */
+    /* Union, raw terms first, deduped. */
     TEST_ASSERT(run->terms->count == 3, "expected 3 unioned terms, got %zu", run->terms->count);
     TEST_ASSERT_STR_EQ(run->terms->terms[0], "dog");
     TEST_ASSERT(run->original_count == run->terms->count,

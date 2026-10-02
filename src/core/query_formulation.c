@@ -1,10 +1,6 @@
-/*
- * Implementation of small-model query formulation.
- * See include/query_formulation.h for the module's role (spec 5.2.4, Stage 7).
- */
+/* Small-model query formulation (spec 5.2.4, Stage 7; see query_formulation.h). */
 
-/* See tokenizer.c for why this must come before any #include (strdup is a
- * POSIX extension hidden by glibc under strict -std=c11 otherwise). */
+/* Must precede #includes: strdup is POSIX, hidden under strict -std=c11. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "query_formulation.h"
@@ -21,14 +17,11 @@
 #include <string.h>
 #include <strings.h>
 
-/* Cap on how many words from each candidate category (synonyms/
- * hypernyms/hyponyms) go into the prompt per term. Arbitrary first-N,
- * not a ranked top-N -- TokenList carries no relevance ordering, just
- * synset-iteration order. See LIMITATIONS.md. */
+/* Words per category (syn/hyper/hypo) per term in the prompt. Arbitrary first-N, not
+ * ranked (TokenList has no relevance order; see dev/LIMITATIONS.md). */
 #define QUERY_FORMULATION_MAX_CANDIDATES 8
 
-/* Appends up to QUERY_FORMULATION_MAX_CANDIDATES words from `list`,
- * comma-separated. */
+/* Appends up to QUERY_FORMULATION_MAX_CANDIDATES words from list, comma-separated. */
 static int append_capped_word_list(StringBuilder *builder, const TokenList *list) {
     size_t limit = (list->count < QUERY_FORMULATION_MAX_CANDIDATES)
                        ? list->count
@@ -67,10 +60,8 @@ QueryFormulationCandidates *query_formulation_gather_candidates_from_terms(
     result->count = 0;
     result->terms = NULL;
 
-    /* terms->count == 0 is a valid outcome, not a failure -- guard the
-     * malloc explicitly rather than calling malloc(0), which is
-     * implementation-defined and could return NULL, getting misread as
-     * an allocation failure below. */
+    /* count==0 is valid, not failure: return before malloc(0), whose NULL-or-not is
+     * implementation-defined and would misread as allocation failure. */
     if (terms->count == 0) {
         return result;
     }
@@ -89,9 +80,8 @@ QueryFormulationCandidates *query_formulation_gather_candidates_from_terms(
         }
         result->terms[i].term = term;
         result->terms[i].candidates = wordnet_lookup(wordnet, term);
-        /* Learned neighbors, copied (the table owns its lists, this
-         * struct owns its own) -- NULL table or no entry both mean "no
-         * learned candidates", which every consumer handles. */
+        /* Learned neighbors, copied (table owns its lists, this struct its own). NULL
+         * table or no entry both mean "no learned candidates". */
         result->terms[i].learned = NULL;
         const TokenList *neighbors = synonym_table_lookup(learned, term);
         if (neighbors != NULL && neighbors->count > 0) {
@@ -126,10 +116,8 @@ QueryFormulationCandidates *query_formulation_gather_candidates(
     }
     stopwords_filter(terms, stopwords);
 
-    /* Lemmatize before lookup ("called" -> "call") so candidates come
-     * from the right WordNet entry, and so the eventual BM25 search term
-     * matches what bulk_ingest.c's Phase 2 worker stores in the index
-     * (also lemmatized). */
+    /* Lemmatize before lookup ("called"->"call") so candidates come from the right entry
+     * and search terms match the (lemmatized) index. */
     TokenList *lemmas = token_list_create();
     if (lemmas == NULL) {
         token_list_free(terms);
@@ -215,12 +203,8 @@ char *query_formulation_build_prompt(const char *query_text,
                     goto fail;
                 }
             }
-            /* Hyponyms are deliberately NOT offered. They enumerate the
-             * answer space rather than paraphrase the question -- "which
-             * dynasty?" expanded with Bourbon_dynasty/Han_dynasty pulls
-             * passages about the wrong dynasties up the ranking. Measured
-             * as part of the expansion-hurts-retrieval finding in
-             * LIMITATIONS.md. */
+            /* Hyponyms deliberately NOT offered: they enumerate answers, not paraphrases
+             * ("which dynasty?" + Bourbon_dynasty ranks wrong dynasties; see dev/LIMITATIONS.md). */
         }
 
         if (string_builder_append(&builder, "\n") != 0) {
@@ -244,11 +228,8 @@ static int token_list_contains(const TokenList *list, const char *word) {
     return 0;
 }
 
-/* Case-insensitive "was this word actually offered as a candidate?"
- * check across every term's synonym/hypernym lists. Constrains the
- * model to vetoing/keeping what it was shown -- an invented term can't
- * enter the query. Hyponyms aren't checked because build_prompt() no
- * longer offers them. */
+/* Case-insensitive "was this word offered?" across syn/hyper/learned lists: the model
+ * can only keep/veto shown terms, never invent new ones. */
 static int is_offered_candidate(const QueryFormulationCandidates *candidates, const char *word) {
     for (size_t i = 0; i < candidates->count; i++) {
         const TokenList *learned = candidates->terms[i].learned;
@@ -275,12 +256,8 @@ static int is_offered_candidate(const QueryFormulationCandidates *candidates, co
     return 0;
 }
 
-/* Lowercase copy of `word`, or NULL if it contains anything but ASCII
- * letters/digits. Rejects WordNet collocations ("family_line") and
- * hyphenations outright: the ingest tokenizer strips punctuation, so no
- * such string can ever exist in the terms table -- they'd be dead
- * weight in the query. Lowercasing is what lets "Rex" match the
- * all-lowercase index. */
+/* Lowercase copy of word, or NULL unless pure ASCII alnum. Rejects WordNet "a_b"/
+ * hyphen strings (tokenizer strips punctuation, so they can't exist in the index). */
 static char *normalize_expansion(const char *word) {
     size_t len = strlen(word);
     if (len == 0) {
@@ -305,11 +282,8 @@ static char *normalize_expansion(const char *word) {
 TokenList *query_formulation_parse_selected_terms(
     const char *response_text, const QueryFormulationCandidates *candidates,
     size_t *original_count_out) {
-    /* The original question terms are searched unconditionally -- the
-     * model's selection can only ADD sense-checked expansions, never
-     * remove the question itself from its own search. (The old contract
-     * let the model drop original terms, and it did: see the king-tut
-     * postmortem in LIMITATIONS.md.) */
+    /* Original question terms are searched unconditionally; the model can only ADD
+     * expansions, never remove the question (see dev/LIMITATIONS.md king-tut postmortem). */
     TokenList *result = token_list_create();
     if (result == NULL) {
         return NULL;
@@ -327,10 +301,8 @@ TokenList *query_formulation_parse_selected_terms(
         *original_count_out = result->count;
     }
 
-    /* Expansions: accepted only if parseable, offered in the prompt,
-     * index-shaped (single lowercase word), and not already present. An
-     * unparseable response degrades to originals-only -- same graceful
-     * floor the old fallback provided. */
+    /* Expansions need: parseable, offered, index-shaped, not present. Unparseable
+     * degrades to originals-only (same graceful floor as the old fallback). */
     cJSON *parsed = cJSON_Parse(response_text);
     if (parsed != NULL && cJSON_IsArray(parsed)) {
         int array_size = cJSON_GetArraySize(parsed);
@@ -374,8 +346,7 @@ TokenList *query_formulation_formulate_query(const char *query_text,
     }
 
     if (candidates->count == 0) {
-        /* Nothing survived stopword filtering -- nothing to expand or
-         * search for. A valid empty outcome, not a failure. */
+        /* Nothing survived stopword filtering: valid empty outcome, not failure. */
         query_formulation_candidates_free(candidates);
         if (original_count_out != NULL) {
             *original_count_out = 0;
@@ -392,8 +363,7 @@ TokenList *query_formulation_formulate_query(const char *query_text,
     char *response = local_llm_chat_completion(prompt);
     free(prompt);
 
-    /* A NULL response flows through unchanged -- cJSON_Parse treats NULL
-     * as unparseable, and the parser's originals-first contract already
+    /* NULL flows through: cJSON_Parse(NULL) is unparseable, and originals-first
      * degrades that to plain question terms. */
     TokenList *selected_terms =
         query_formulation_parse_selected_terms(response, candidates, original_count_out);
@@ -448,11 +418,8 @@ TokenList *query_formulation_terms_only(const char *query_text, const StopwordSe
         return NULL;
     }
 
-    /* Same "nothing survived stopword filtering" empty-outcome handling
-     * as query_formulation_formulate_query() -- no prompt, no model call.
-     * parse_selected_terms(NULL, ...) is the originals-only path: a NULL
-     * response contributes no expansions, leaving exactly the plain
-     * deduplicated lemmatized terms. */
+    /* Same empty-outcome handling as formulate_query(). parse_selected_terms(NULL, ...)
+     * contributes no expansions: exactly the deduped lemmatized terms. */
     TokenList *terms = (candidates->count == 0)
                            ? token_list_create()
                            : query_formulation_parse_selected_terms(NULL, candidates, NULL);
@@ -460,25 +427,12 @@ TokenList *query_formulation_terms_only(const char *query_text, const StopwordSe
     return terms;
 }
 
-/* Reserves room for this call's own prompt wrapper + the question itself
- * + the model's reformulated-question output -- generous since a
- * rewritten question is always short, unlike generation's own budget
- * (see generation.c's equivalent constant), which also has to leave room
- * for a much longer answer. */
+/* Headroom for prompt wrapper + question + rewritten question (short, unlike
+ * generation.c's answer-sized reservation). */
 #define QUERY_FORMULATION_CONTEXTUALIZE_RESERVED_TOKENS 1000
 
-/* Trims `history` to the newest suffix that fits within `budget_tokens`
- * (measured via local_llm_count_tokens() per turn's own content -- the
- * per-turn chat-template markup itself is a small, roughly fixed
- * overhead this doesn't bother accounting for separately), walking
- * backward from the most recent turn so oldest turns are the ones
- * dropped. Sets *out_count to the number of turns kept (0 is valid --
- * the whole history got dropped because even the single most recent
- * turn alone doesn't fit). Returns a newly allocated array of
- * *out_count entries whose contents are borrowed from `history` (safe
- * since `history` outlives the caller's use of the result) -- caller
- * must free() the array itself, not its entries -- or NULL on
- * allocation failure. */
+/* Newest history suffix fitting budget_tokens (content only; markup negligible). Returns
+ * malloc'd borrowed-entry array, *out_count kept (0 valid); NULL on alloc failure. */
 static LocalLlmTurn *window_history(const LocalLlmTurn *history, size_t history_count, int budget_tokens,
                                      size_t *out_count) {
     size_t start = history_count; /* first surviving index; history_count itself means "keep nothing" */
@@ -520,8 +474,7 @@ char *query_formulation_contextualize_question(const char *question, const Local
         return NULL;
     }
     if (windowed_count == 0) {
-        /* Even the single most recent turn didn't fit the budget --
-         * nothing usable to contextualize against. */
+        /* Even the newest turn didn't fit: nothing usable to contextualize against. */
         free(windowed);
         return strdup(question);
     }
@@ -551,11 +504,8 @@ char *query_formulation_contextualize_question(const char *question, const Local
     free(builder.data);
 
     if (response == NULL || response[0] == '\0') {
-        /* Call failed or produced nothing usable -- fall back to the
-         * original question unresolved, same graceful-degradation shape
-         * as query_formulation_formulate_query()'s WordNet-selection
-         * fallback: an unreliable LLM step degrades search, doesn't
-         * break it. */
+        /* Failed/empty response: fall back to the original question (same graceful
+         * degradation as formulate_query()'s fallback). */
         free(response);
         return strdup(question);
     }

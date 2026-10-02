@@ -1,11 +1,6 @@
-/*
- * Implementation of the WordNet flat-file loader.
- * See include/wordnet.h for the module's role (spec 5.2.3, Stage 5).
- */
+/* WordNet flat-file loader (spec 5.2.3, Stage 5; see wordnet.h). */
 
-/* See tokenizer.c for why this must come before any #include (strdup and
- * strtok_r are POSIX extensions hidden by glibc under strict -std=c11
- * otherwise). */
+/* Must precede #includes: strdup/strtok_r are POSIX, hidden under strict -std=c11. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "wordnet.h"
@@ -36,16 +31,8 @@ void wordnet_synset_free(WordNetSynset *synset) {
     free(synset);
 }
 
-/* Field order (confirmed against real WordNet 3.0 data files and the
- * official wndb(5WN) format spec):
- *   synset_offset  lex_filenum  ss_type  w_cnt  [word  lex_id]*w_cnt
- *   p_cnt  [ptr_symbol  synset_offset  pos  source/target]*p_cnt
- *   [frame data for verbs...]  |  gloss
- *
- * w_cnt and lex_id are TWO-DIGIT HEXADECIMAL; synset_offset, lex_filenum,
- * and p_cnt are DECIMAL. Getting that backwards silently misparses every
- * line without crashing, so it's called out explicitly here rather than
- * left implicit in the strtol() base arguments below. */
+/* wndb(5WN): offset lex_filenum ss_type w_cnt [word lex_id]* p_cnt [ptr ...]* | gloss.
+ * w_cnt/lex_id are HEX, the rest DECIMAL -- backwards silently misparses every line. */
 WordNetSynset *wordnet_parse_data_line(const char *line, WordNetPOS pos) {
     char *mutable_line = strdup(line);
     if (mutable_line == NULL) {
@@ -90,10 +77,8 @@ WordNetSynset *wordnet_parse_data_line(const char *line, WordNetPOS pos) {
     if (synset->words == NULL) {
         goto fail;
     }
-    /* Zero every slot up front so a strdup failure partway through the
-     * loop below leaves the rest NULL -- free(NULL) is a safe no-op, so
-     * wordnet_synset_free() can unconditionally free every slot up to
-     * word_count without needing to track how far the loop actually got. */
+    /* NULL every slot up front so a mid-loop strdup failure still frees safely
+     * (free(NULL) is a no-op; no need to track loop progress). */
     for (size_t i = 0; i < synset->word_count; i++) {
         synset->words[i] = NULL;
     }
@@ -123,10 +108,8 @@ WordNetSynset *wordnet_parse_data_line(const char *line, WordNetPOS pos) {
         goto fail;
     }
 
-    /* Over-allocate to pointer_count -- at most this many pointers can be
-     * hypernyms and at most this many can be hyponyms; most pointers are
-     * neither (antonym, meronym, holonym, etc. are out of scope here), so
-     * actual counts are usually much smaller. Avoids a second counting pass. */
+    /* Over-allocate to pointer_count (avoids a second pass); most pointers are neither
+     * hypernyms nor hyponyms, so actual counts are usually much smaller. */
     if (pointer_count > 0) {
         synset->hypernym_offsets = malloc((size_t)pointer_count * sizeof(long));
         synset->hyponym_offsets = malloc((size_t)pointer_count * sizeof(long));
@@ -186,9 +169,7 @@ void wordnet_synset_index_free(WordNetSynsetIndex *index) {
     free(index);
 }
 
-/* qsort() comparator: array elements are WordNetSynset*, so each `const
- * void *` argument actually points at a WordNetSynset* slot in the
- * array -- hence the double pointer cast. */
+/* Elements are WordNetSynset*, so args point at slots -- hence the double cast. */
 static int wordnet_compare_synset_offsets(const void *a, const void *b) {
     const WordNetSynset *const *synset_a = (const WordNetSynset *const *)a;
     const WordNetSynset *const *synset_b = (const WordNetSynset *const *)b;
@@ -201,10 +182,8 @@ static int wordnet_compare_synset_offsets(const void *a, const void *b) {
     return 0;
 }
 
-/* bsearch() comparator: the key is a bare `long` (the offset being
- * searched for), while each array element is still a WordNetSynset* --
- * key and element are different types here, which bsearch() supports as
- * long as the comparator treats each side correctly. */
+/* Key is a bare long, elements are WordNetSynset* (bsearch allows mixed types when
+ * the comparator handles each side). */
 static int wordnet_compare_offset_to_synset(const void *key, const void *element) {
     long target_offset = *(const long *)key;
     const WordNetSynset *const *synset_ptr = (const WordNetSynset *const *)element;
@@ -242,9 +221,8 @@ WordNetSynsetIndex *wordnet_load_data_file(const char *path, WordNetPOS pos) {
     char *saveptr;
     char *line = strtok_r(text, "\n", &saveptr);
     while (line != NULL) {
-        /* Real data lines always start with a digit (the synset_offset);
-         * the file's leading copyright comment lines start with a space.
-         * Skip both those and any blank line the split might produce. */
+        /* Data lines start with a digit, copyright headers with a space; skip headers
+         * and blank lines. */
         if (line[0] != ' ' && line[0] != '\0') {
             WordNetSynset *synset = wordnet_parse_data_line(line, pos);
             if (synset == NULL) {
@@ -291,10 +269,8 @@ void wordnet_index_entry_free(WordNetIndexEntry *entry) {
     free(entry);
 }
 
-/* Field order (index.<pos>, confirmed against the official wndb(5WN)
- * spec): lemma pos synset_cnt p_cnt [ptr_symbol]*p_cnt sense_cnt
- * tagsense_cnt synset_offset*synset_cnt -- every field here is decimal,
- * unlike data.<pos>'s w_cnt/lex_id, so no base-16 parsing is needed. */
+/* index.<pos> (wndb(5WN)): lemma pos synset_cnt p_cnt [ptr]* sense_cnt tagsense_cnt
+ * offsets. All decimal here (unlike data.<pos>'s hex w_cnt/lex_id). */
 WordNetIndexEntry *wordnet_parse_index_line(const char *line) {
     char *mutable_line = strdup(line);
     if (mutable_line == NULL) {
@@ -468,25 +444,12 @@ WordNetWordIndex *wordnet_load_index_file(const char *path) {
     return index;
 }
 
-/* Bucket count for the final table -- WordNet has roughly 150K distinct
- * words across all four parts of speech combined (fewer than the sum of
- * each file's entry count, since many words appear in more than one),
- * so this gives a load factor of roughly 1-2 entries per bucket. Fixed
- * rather than configurable: WordNet's size doesn't vary at runtime, so
- * there's nothing for a caller to actually tune. */
+/* ~150K distinct words across all POS => load factor ~1-2/bucket. Fixed, not
+ * configurable: WordNet's size doesn't vary at runtime. */
 #define WORDNET_TABLE_BUCKET_COUNT 100003
 
-/* djb2 (Dan Bernstein's well-known string hash): starts from an
- * arbitrary "magic" seed and repeatedly does hash = hash*33 + next_byte.
- * Cheap to compute, no real theory behind why 33 works well beyond
- * decades of empirical use, but it distributes ASCII text like word
- * lemmas into buckets evenly enough for a simple chained hash table --
- * the first hash function this project has needed, since every prior
- * lookup structure (StopwordSet, WordNetSynsetIndex, WordNetWordIndex)
- * used a sorted array + binary search instead. A hash table is the right
- * fit here because the final structure is queried over and over at
- * runtime by arbitrary query terms, rather than built once and then
- * mostly iterated in order like the sorted arrays above. */
+/* djb2 string hash (hash*33 + byte): distributes ASCII lemmas well enough for a
+ * chained table queried per query term (vs. the build-once sorted arrays above). */
 static unsigned long wordnet_hash_string(const char *str) {
     unsigned long hash = 5381;
     int c;
@@ -545,12 +508,8 @@ const WordNetLookupResult *wordnet_lookup(const WordNetTable *table, const char 
     return NULL;
 }
 
-/* Finds `word`'s entry in `table`, creating an empty one (three empty
- * TokenLists, chained into the right bucket) if this is the first time
- * `word` has been seen -- e.g. across different parts of speech, since
- * wordnet_table_load() (still to come) will call this once per word per
- * POS, and a word like "dog" appears in both index.noun and index.verb.
- * Returns NULL on allocation failure. */
+/* Finds word's entry, creating + chaining an empty one if new (e.g. "dog" in both
+ * index.noun and index.verb). NULL on allocation failure. */
 static WordNetLookupResult *wordnet_table_find_or_create(WordNetTable *table, const char *word) {
     size_t bucket = wordnet_hash_string(word) % table->bucket_count;
 
@@ -584,12 +543,8 @@ static WordNetLookupResult *wordnet_table_find_or_create(WordNetTable *table, co
     return entry;
 }
 
-/* Appends `word` to `list` only if it isn't already present -- a linear
- * scan, same tradeoff as bm25_result_set_add's and
- * ingest_count_distinct_terms's dedup checks: candidate lists here are a
- * handful of words at most, so O(n) per add is negligible. Returns 0 on
- * success (whether or not it was already present), -1 on allocation
- * failure. */
+/* Appends word if absent (linear scan; lists are a handful of words). 0 on success
+ * (present or added), -1 on allocation failure. */
 static int wordnet_token_list_add_unique(TokenList *list, const char *word) {
     for (size_t i = 0; i < list->count; i++) {
         if (strcmp(list->terms[i], word) == 0) {
@@ -599,15 +554,8 @@ static int wordnet_token_list_add_unique(TokenList *list, const char *word) {
     return token_list_append(list, word);
 }
 
-/* Resolves one word's candidates from `entry` (its synsets in one part
- * of speech) against `synsets` (every synset loaded for that SAME part
- * of speech), merging the result into `table`. Synonyms come from the
- * other words sharing a synset with this one; hypernyms/hyponyms come
- * from following each synset's hypernym/hyponym offsets to their target
- * synsets and collecting THEIR words. Merges into an existing table
- * entry (deduplicated) if `entry->lemma` was already added from a
- * different part of speech. Returns 0 on success, -1 on allocation
- * failure. */
+/* Resolves entry's synsets (in this POS's index) into table: synonyms from shared
+ * synsets, hyper/hyponyms via offsets; merges deduped across POS. 0 ok, -1 fail. */
 static int wordnet_resolve_and_merge(WordNetTable *table, const WordNetIndexEntry *entry,
                                       const WordNetSynsetIndex *synsets) {
     WordNetLookupResult *result = wordnet_table_find_or_create(table, entry->lemma);
@@ -660,11 +608,8 @@ static int wordnet_resolve_and_merge(WordNetTable *table, const WordNetIndexEntr
     return 0;
 }
 
-/* Maps a part of speech to the filename suffix WordNet's own files use
- * (index.noun/data.noun, index.verb/data.verb, etc.). All four
- * WordNetPOS values are covered; the trailing return is unreachable in
- * practice but keeps the function well-defined for any value regardless
- * of whether a given compiler can prove the switch is exhaustive. */
+/* POS -> WordNet filename suffix (noun/verb/adj/adv). Trailing return keeps the
+ * function well-defined even if the switch isn't proven exhaustive. */
 static const char *wordnet_pos_suffix(WordNetPOS pos) {
     switch (pos) {
         case WORDNET_NOUN:
@@ -679,11 +624,8 @@ static const char *wordnet_pos_suffix(WordNetPOS pos) {
     return NULL;
 }
 
-/* Loads one part of speech's index.<pos>/data.<pos> pair and resolves
- * every word in it into `table`. Both the index and synset scaffolding
- * are freed before returning, regardless of success or failure -- only
- * `table` needs to survive past this call. Returns 0 on success, -1 on
- * any load or allocation failure. */
+/* Loads one POS's index/data pair into table; scaffolding is freed either way.
+ * 0 on success, -1 on any failure. */
 static int wordnet_load_pos_into_table(WordNetTable *table, const char *wordnet_dir, WordNetPOS pos) {
     const char *suffix = wordnet_pos_suffix(pos);
 

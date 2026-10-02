@@ -1,8 +1,4 @@
-/*
- * Implementation of Postgres-backed index/passage persistence.
- * See include/pg_store.h for the module's role and the SQLite-vs-Postgres
- * rationale.
- */
+/* Postgres-backed index/passage persistence; see pg_store.h. */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -12,32 +8,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Schema for the inverted index -- same shape as sqlite_store.c's, with
- * GENERATED ALWAYS AS IDENTITY in place of SQLite's INTEGER PRIMARY KEY
- * rowid-aliasing trick. IF NOT EXISTS makes this safe to run on every
- * open, not just the first.
- *
- * postings.token_count is a deliberate denormalization of
- * passages.token_count -- BM25 needs each matching passage's own length
- * for its length-normalization term (see bm25_term_score()), and at real
- * MS MARCO scale (measured directly, see LIMITATIONS.md) fetching it via
- * a JOIN against passages meant one random-access index lookup *per
- * matching posting row* -- 11-14+ seconds for a term with 100K+ matches,
- * worse for genuinely common words. Storing a copy directly on postings
- * turns that into a single index-only scan with no join at all, at the
- * cost of repeating a 4-byte int across every posting for a given
- * passage (acceptable; see LIMITATIONS.md's existing postings-storage
- * tradeoff discussion). */
-/* documents holds each source document's ORIGINAL, un-chunked text --
- * passages only ever stores post-chunking fragments (see
- * ingest_chunk_words()), and Phase 1's documents_raw is transient,
- * dropped at the end of every bulk_ingest_tsv() run. Without a permanent
- * copy of the original text, "rebuild this group with a few more
- * documents added" would have no way to re-chunk a document's existing
- * content consistently -- see APP_SPEC.md's rebuild-on-append design and
- * pg_store_insert_document(). One row per source document, not per
- * chunk -- document_name is the same natural key passages.document_name
- * already groups chunks by. */
+/* Same shape as sqlite_store.c (IDENTITY replaces rowid alias). postings.token_count
+ * denormalizes passages.token_count so BM25 avoids a per-row JOIN (see dev/LIMITATIONS.md). */
+/* documents holds each source's ORIGINAL un-chunked text (one row per document, keyed
+ * by document_name) so rebuild-on-append can re-chunk consistently (see dev/APP_SPEC.md). */
 #define LEXIS_SCHEMA_SQL                                                 \
     "CREATE TABLE IF NOT EXISTS documents ("                            \
     "    document_name TEXT PRIMARY KEY,"                                \
@@ -64,12 +38,8 @@
 
 static int exec_simple(PGconn *conn, const char *sql, const char *caller);
 
-/* Registry of corpora ("groups" in the app UI) -- lives permanently in
- * the public schema, one row per group. Maps a user-facing display_name
- * to the opaque, server-generated schema_name that actually holds that
- * group's own passages/terms/postings (see pg_store_create_corpus()).
- * schema_name is never built from user input -- see APP_SPEC.md's "Core
- * concept: groups" for why. */
+/* public.corpora maps display_name to the server-generated schema_name holding one
+ * group's tables. schema_name is never built from user input (see dev/APP_SPEC.md). */
 #define LEXIS_CORPORA_REGISTRY_SQL                                      \
     "CREATE TABLE IF NOT EXISTS public.corpora ("                       \
     "    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"           \
@@ -82,13 +52,8 @@ int pg_store_ensure_corpora_registry(PgStore *store) {
     return exec_simple(store->conn, LEXIS_CORPORA_REGISTRY_SQL, "pg_store_ensure_corpora_registry");
 }
 
-/* Issues "CREATE SCHEMA <name>" plus its documents/passages/terms/
- * postings tables -- the DDL pg_store_create_corpus() needs, and also
- * what rebuild-on-append's temporary schema needs (see
- * pg_store_create_bare_schema()), extracted so both share one copy of
- * it. schema_name must be a trusted, server-generated identifier, safe
- * to interpolate directly -- same constraint as everywhere else this
- * pattern appears in this file. Returns 0 on success, -1 on failure. */
+/* CREATE SCHEMA + tables, shared by create_corpus() and rebuild's temp schema.
+ * schema_name must be trusted/server-generated (safe to interpolate). 0 ok, -1 fail. */
 static int create_lexis_tables_in_schema(PGconn *conn, const char *schema_name) {
     char ddl[2048];
     int written = snprintf(
@@ -135,15 +100,8 @@ int64_t pg_store_create_corpus(PgStore *store, const char *display_name, char **
         return -1;
     }
 
-    /* schema_name is computed from the row's own freshly-assigned id, so
-     * it's only known after the INSERT -- genuinely two round trips, not
-     * one. A single WITH-CTE combining the INSERT and an UPDATE...FROM
-     * referencing it looks appealing but is wrong: every part of one
-     * statement (CTEs and the main query alike) scans its target table
-     * against the snapshot taken at the *start* of the statement, so the
-     * UPDATE can't see the row its sibling CTE just inserted -- confirmed
-     * directly against a real database (UPDATE matched 0 rows) before
-     * settling on this instead. */
+    /* Genuinely two round trips: a single WITH-CTE UPDATE can't see the row its sibling
+     * CTE inserted (same-statement snapshot; verified: UPDATE matched 0 rows). */
     const char *insert_params[1] = {display_name};
     PGresult *insert_res =
         PQexecParams(store->conn, "INSERT INTO public.corpora (display_name, schema_name) VALUES ($1, '') RETURNING id;",
@@ -192,11 +150,8 @@ int64_t pg_store_create_corpus(PgStore *store, const char *display_name, char **
     return id;
 }
 
-/* Shared by every operation that needs to go from a corpus_id to its
- * schema_name (pg_store_use_corpus(), pg_store_delete_corpus(), and the
- * schema-swap primitives below) -- one query, not three copies of it.
- * Returns a newly malloc()'d string the caller must free(), or NULL if
- * corpus_id doesn't exist or on a database/allocation error. */
+/* corpus_id -> schema_name lookup shared by use/delete/swap. Returns a malloc'd
+ * string the caller frees, or NULL if missing/error. */
 static char *lookup_corpus_schema_name(PGconn *conn, int64_t corpus_id) {
     char id_str[32];
     snprintf(id_str, sizeof(id_str), "%lld", (long long)corpus_id);
@@ -213,11 +168,8 @@ static char *lookup_corpus_schema_name(PGconn *conn, int64_t corpus_id) {
 }
 
 int pg_store_use_schema(PgStore *store, const char *schema_name) {
-    /* schema_name must be a trusted, server-generated identifier (e.g.
-     * "corpus_<id>" out of the registry, or "corpus_<id>_rebuild" from
-     * the rebuild-on-append primitives below) -- interpolated directly
-     * into a SET command, exactly like pg_store_create_corpus()'s DDL.
-     * Never call this with a string built from user input. */
+    /* schema_name must be trusted/server-generated (interpolated into SET);
+     * never call with user input. */
     char sql[128];
     snprintf(sql, sizeof(sql), "SET search_path TO %s, public;", schema_name);
     return exec_simple(store->conn, sql, "pg_store_use_schema");
@@ -294,9 +246,7 @@ int pg_store_delete_corpus(PgStore *store, int64_t corpus_id) {
         return -1;
     }
 
-    /* schema_name is our own registry's opaque, server-generated value
-     * (see pg_store_create_corpus()) -- safe to interpolate directly,
-     * same as everywhere else this pattern appears in this file. */
+    /* Our own server-generated value; safe to interpolate. */
     char drop_sql[128];
     snprintf(drop_sql, sizeof(drop_sql), "DROP SCHEMA %s CASCADE;", schema_name);
     if (exec_simple(store->conn, drop_sql, "pg_store_delete_corpus") != 0) {
@@ -319,13 +269,8 @@ int pg_store_delete_corpus(PgStore *store, int64_t corpus_id) {
     return exec_simple(store->conn, "COMMIT;", "pg_store_delete_corpus");
 }
 
-/* Lives in public, next to public.corpora -- see pg_store.h's "Chat
- * history" comment for why chat data can't live inside a corpus's own
- * per-corpus schema. sources is JSONB, not TEXT, so a caller could in
- * principle query into it later (e.g. "sessions that cited document X"),
- * though nothing does yet -- this module only ever stores/returns it
- * verbatim as text (see pg_store_append_chat_message()/
- * pg_store_get_chat_messages()). */
+/* Chat tables live in public (see pg_store.h). sources is JSONB for future queries;
+ * this module only stores/returns it verbatim. */
 #define LEXIS_CHAT_TABLES_SQL                                           \
     "CREATE TABLE IF NOT EXISTS public.chat_sessions ("                 \
     "    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"           \
@@ -379,11 +324,8 @@ PgStoreChatSession *pg_store_list_chat_sessions(PgStore *store, int64_t corpus_i
     char corpus_id_str[32];
     snprintf(corpus_id_str, sizeof(corpus_id_str), "%lld", (long long)corpus_id);
     const char *params[1] = {corpus_id_str};
-    /* created_at::text would follow the connection's DateStyle setting
-     * (space-separated, no 'T'/'Z' by default) rather than true ISO
-     * 8601 -- to_char() here pins the wire format so the app side
-     * (QDateTime::fromString(..., Qt::ISODate)) can parse it reliably
-     * regardless of server config. */
+    /* to_char() pins ISO 8601; created_at::text would follow DateStyle instead
+     * (unparseable by QDateTime::fromString(..., Qt::ISODate)). */
     PGresult *res = PQexecParams(
         store->conn,
         "SELECT id, title, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
@@ -441,8 +383,7 @@ int pg_store_delete_chat_session(PgStore *store, int64_t session_id) {
         PQclear(res);
         return -1;
     }
-    /* affected == 0 means session_id never existed -- same "nonexistent
-     * id is a failure" convention pg_store_delete_corpus() follows. */
+    /* 0 rows = session never existed (same convention as delete_corpus). */
     int affected = atoi(PQcmdTuples(res));
     PQclear(res);
     if (affected == 0) {
@@ -457,10 +398,8 @@ int pg_store_append_chat_message(PgStore *store, int64_t session_id, int is_user
     char id_str[32];
     snprintf(id_str, sizeof(id_str), "%lld", (long long)session_id);
     const char *is_user_str = is_user ? "true" : "false";
-    /* A NULL entry in paramValues means SQL NULL regardless of what's in
-     * paramLengths/paramFormats at that index -- libpq's documented
-     * convention, used here so a user message's sources column comes out
-     * NULL, not the literal string "null". */
+    /* NULL paramValues entry means SQL NULL (libpq convention): user messages get
+     * NULL sources, not the string "null". */
     const char *params[4] = {id_str, is_user_str, text, sources_json};
     PGresult *res = PQexecParams(
         store->conn,
@@ -527,12 +466,8 @@ int pg_store_update_last_assistant_message(PgStore *store, int64_t session_id, c
     char id_str[32];
     snprintf(id_str, sizeof(id_str), "%lld", (long long)session_id);
     const char *params[3] = {id_str, text, sources_json};
-    /* The WHERE guards make this safe by construction: only a session's
-     * single newest row is even a candidate (ORDER BY id DESC LIMIT 1
-     * inside the subselect), and only if that row is an assistant row --
-     * a session whose last message is the user's question has nothing
-     * for a retry to replace, and the 0-rows-affected result surfaces
-     * that as -1 below rather than silently updating some older answer. */
+    /* Only the session's newest row is a candidate, and only if it's an assistant
+     * row; 0 rows surfaces as -1 below instead of touching an older answer. */
     PGresult *res = PQexecParams(
         store->conn,
         "UPDATE public.chat_messages SET text = $2, sources = $3::jsonb "
@@ -669,9 +604,8 @@ int pg_store_remove_document(PgStore *store, const char *document_name) {
         return -1;
     }
 
-    /* Postings first -- they reference the passages rows being deleted.
-     * Everything runs in one transaction, so a failure at any step
-     * rolls the whole removal back (see pg_store.h's doc comment). */
+    /* Postings first (they reference passages). One transaction: any failure
+     * rolls the whole removal back (see pg_store.h). */
     PGresult *res = PQexecParams(
         store->conn,
         "DELETE FROM postings WHERE passage_id IN "
@@ -706,18 +640,14 @@ int pg_store_remove_document(PgStore *store, const char *document_name) {
     PQclear(res);
 
     if (documents_deleted == 0) {
-        /* Unknown document name -- nothing matched, so nothing was
-         * modified; roll back (the postings/passage deletes were no-ops
-         * against a name with no rows) and report failure. */
+        /* Unknown name: the deletes above were no-ops; roll back and fail. */
         fprintf(stderr, "pg_store_remove_document: no document named '%s'\n", document_name);
         pg_store_rollback_transaction(store);
         return -1;
     }
 
-    /* Sweep terms orphaned by the deletions (not just this document's --
-     * also any a PREVIOUS partial state left behind). NOT EXISTS is a
-     * plain anti-join against the live postings table, so it stays
-     * correct regardless of how many documents share a term. */
+    /* Sweep orphaned terms (NOT EXISTS anti-join stays correct however many documents
+     * shared a term, incl. leftovers from a previous partial state). */
     res = PQexec(store->conn,
                  "DELETE FROM terms WHERE NOT EXISTS "
                  "(SELECT 1 FROM postings WHERE postings.term_id = terms.id);");
@@ -736,11 +666,8 @@ int pg_store_remove_document(PgStore *store, const char *document_name) {
     return 0;
 }
 
-/* Lives in public next to public.corpora -- see pg_store.h's "Group
- * summaries" comment for why the cache can't live in the corpus's own
- * schema. PRIMARY KEY on corpus_id, not a generated id: there is exactly
- * one summary per group, which makes the write an upsert rather than an
- * insert-plus-cleanup. */
+/* One summary per group in public (see pg_store.h); PK on corpus_id makes the
+ * write an upsert rather than insert-plus-cleanup. */
 #define LEXIS_SUMMARY_TABLE_SQL                                              \
     "CREATE TABLE IF NOT EXISTS public.corpus_summaries ("                   \
     "    corpus_id BIGINT PRIMARY KEY REFERENCES public.corpora(id) ON DELETE CASCADE," \
@@ -769,8 +696,7 @@ char *pg_store_get_corpus_summary(PgStore *store, int64_t corpus_id, int *docume
         PQclear(res);
         return NULL;
     }
-    /* No row is the normal first-question case, not an error -- no
-     * diagnostic, the caller just builds one. */
+    /* No row yet is normal (first question), not an error. */
     if (PQntuples(res) != 1) {
         PQclear(res);
         return NULL;
@@ -798,8 +724,7 @@ int pg_store_set_corpus_summary(PgStore *store, int64_t corpus_id, const char *t
     snprintf(document_count_str, sizeof(document_count_str), "%d", document_count);
     const char *params[3] = {corpus_id_str, text, document_count_str};
 
-    /* Upsert: a regenerated summary replaces the stale one in place, so a
-     * group never accumulates historical summaries nobody reads. */
+    /* Upsert replaces the stale summary in place; no history accumulates. */
     PGresult *res = PQexecParams(store->conn,
                                   "INSERT INTO public.corpus_summaries (corpus_id, text, document_count) "
                                   "VALUES ($1, $2, $3) "
@@ -837,11 +762,8 @@ int pg_store_swap_corpus_schema(PgStore *store, int64_t corpus_id, const char *n
         return -1;
     }
 
-    /* Both DDL statements, in one transaction -- either both take effect
-     * (clean swap) or neither does (old_schema_name, and therefore the
-     * corpus's live data, is completely untouched). new_schema_name and
-     * old_schema_name are both trusted, server-generated identifiers --
-     * see pg_store_use_schema()'s doc comment for the same constraint. */
+    /* Both DDL statements in one transaction (clean swap or untouched live data).
+     * Both names are trusted/server-generated (see pg_store_use_schema()). */
     char sql[256];
     int written = snprintf(sql, sizeof(sql), "DROP SCHEMA %s CASCADE; ALTER SCHEMA %s RENAME TO %s;", old_schema_name,
                             new_schema_name, old_schema_name);
@@ -962,11 +884,8 @@ int64_t pg_store_insert_passage(PgStore *store, const char *document_name, int c
 
 int pg_store_insert_document(PgStore *store, const char *document_name, const char *text) {
     const char *params[2] = {document_name, text};
-    /* ON CONFLICT DO NOTHING, not a hard uniqueness error: Phase 2's
-     * batch retries (see bulk_ingest.c's BULK_PHASE2_BATCH_RETRIES) can
-     * legitimately re-process the same documents_raw row -- a retried
-     * document_name landing here a second time with identical content is
-     * expected, not a bug. */
+    /* DO NOTHING: Phase 2 batch retries can legitimately re-insert the same
+     * document_name with identical content (see BULK_PHASE2_BATCH_RETRIES). */
     static const char *sql = "INSERT INTO documents (document_name, text) VALUES ($1, $2) "
                               "ON CONFLICT (document_name) DO NOTHING;";
 
@@ -981,8 +900,7 @@ int pg_store_insert_document(PgStore *store, const char *document_name, const ch
 }
 
 int64_t pg_store_get_or_create_term(PgStore *store, const char *term) {
-    /* Fast path: a plain read, no write-lock contention, for the common
-     * case of an already-seen term. */
+    /* Fast path: plain read for the common already-seen term, no write lock. */
     {
         const char *params[1] = {term};
         static const char *select_sql = "SELECT id FROM terms WHERE term = $1;";
@@ -1001,17 +919,8 @@ int64_t pg_store_get_or_create_term(PgStore *store, const char *term) {
         PQclear(res);
     }
 
-    /* Not found on the fast-path read -- try to insert. DO NOTHING, not
-     * DO UPDATE: an earlier version used
-     * "ON CONFLICT (term) DO UPDATE SET term = EXCLUDED.term RETURNING id"
-     * specifically so RETURNING would yield a row on conflict too -- but
-     * DO UPDATE takes a row lock even for that no-op self-assignment, and
-     * under real concurrent writers racing on overlapping term sets that
-     * caused genuine Postgres deadlocks -- "deadlock detected ... while
-     * inserting index tuple ... in relation terms" -- silently dropping
-     * whole documents (verified directly, see SPEED.md). DO NOTHING
-     * skips the row lock entirely, at the cost of one extra round trip
-     * below to fetch the id when we lost the race. */
+    /* DO NOTHING, not DO UPDATE: the no-op self-assignment still took a row lock and
+     * deadlocked under concurrent writers (verified; see dev/SPEED.md). Costs one re-SELECT. */
     const char *params[1] = {term};
     static const char *insert_sql =
         "INSERT INTO terms (term) VALUES ($1) ON CONFLICT (term) DO NOTHING;";
@@ -1023,8 +932,7 @@ int64_t pg_store_get_or_create_term(PgStore *store, const char *term) {
         return -1;
     }
 
-    /* Either we just inserted it, or another connection won the race and
-     * DO NOTHING silently no-opped -- either way the row now exists. */
+    /* Either we inserted it or lost the race; either way the row exists now. */
     static const char *reselect_sql = "SELECT id FROM terms WHERE term = $1;";
     res = PQexecParams(store->conn, reselect_sql, 1, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
@@ -1039,17 +947,12 @@ int64_t pg_store_get_or_create_term(PgStore *store, const char *term) {
     return term_id;
 }
 
-/* Builds a Postgres array literal like {"a","b\"c","d,e"} from `items`,
- * double-quoting and backslash-escaping each element so any character --
- * including a literal comma, quote, or backslash -- round-trips correctly
- * through unnest(). Verified directly against the real server (comma,
- * apostrophe, embedded quote, backslash all confirmed). Caller must
- * free() the result. Returns NULL on allocation failure. */
+/* Builds a quoted/escaped {"a","b\"c"} array literal for unnest(). Caller frees;
+ * NULL on allocation failure. */
 static char *build_text_array_literal(const char *const *items, size_t count) {
     size_t capacity = 3;
     for (size_t i = 0; i < count; i++) {
-        /* Worst case every byte needs a backslash (2x), plus the two
-         * quote chars and a comma separator. */
+        /* Worst case: every byte escaped (2x) + quotes + comma. */
         capacity += strlen(items[i]) * 2 + 4;
     }
     char *buffer = malloc(capacity);
@@ -1128,11 +1031,8 @@ static char *build_int_array_literal(const int *items, size_t count) {
     return buffer;
 }
 
-/* Fills `ids[i]` (still -1) for every terms[i] matching a row in
- * `res` (columns: id, term) -- shared by every phase of
- * pg_store_get_or_create_terms() below. O(rows * count), fine at
- * chunk scale (a few dozen terms), same tradeoff already made for
- * ingest.c's ingest_count_distinct_terms()'s dedup loop. */
+/* Fills ids[i] for terms matching res rows (id, term). O(rows*count) is fine
+ * at chunk scale (dozens of terms). */
 static void fill_ids_from_result(PGresult *res, const char *const *terms, size_t count, int64_t *ids) {
     int rows = PQntuples(res);
     for (int r = 0; r < rows; r++) {
@@ -1146,13 +1046,8 @@ static void fill_ids_from_result(PGresult *res, const char *const *terms, size_t
     }
 }
 
-/* Collects the still-unresolved (ids[i] == -1) distinct terms from
- * `terms` into a freshly allocated array (caller must free() the array
- * itself, not its contents -- it borrows the original term pointers).
- * *out_count is set to how many. Returns NULL (with *out_count == 0) if
- * every term is already resolved, or on allocation failure (check
- * `count > 0 && result == NULL` to distinguish, mirroring the two ways
- * "nothing to do" can happen). */
+/* Collects still-unresolved distinct terms (borrows pointers; caller frees the array).
+ * NULL with *out_count == 0 means "all resolved" or allocation failure. */
 static const char **collect_unresolved(const char *const *terms, size_t count, const int64_t *ids,
                                         size_t *out_count) {
     const char **unresolved = malloc(sizeof(char *) * count);
@@ -1211,19 +1106,14 @@ int64_t *pg_store_get_or_create_terms(PgStore *store, const char *const *terms, 
         PQclear(res);
     }
 
-    /* Phase 2: one bulk INSERT ... ON CONFLICT DO NOTHING for whatever's
-     * still unresolved (genuinely new terms). DO NOTHING, not DO UPDATE --
-     * see pg_store_get_or_create_term() for why (concurrent speculative-
-     * insertion deadlocks, verified directly). */
+    /* Phase 2: one bulk INSERT ... ON CONFLICT DO NOTHING for the rest. DO NOTHING
+     * avoids concurrent speculative-insertion deadlocks (see get_or_create_term). */
     {
         size_t missing_count = 0;
         const char **missing = collect_unresolved(terms, count, ids, &missing_count);
         if (missing == NULL && missing_count == 0) {
-            /* Could be "nothing missing" (fine) or an allocation failure
-             * (not fine) -- collect_unresolved() can't distinguish these
-             * from its return alone when every term was already resolved
-             * in phase 1, so only treat it as fatal if phase 1 didn't
-             * actually resolve everything. */
+            /* NULL is ambiguous ("nothing missing" vs alloc failure); fatal only if
+             * phase 1 didn't actually resolve everything. */
             for (size_t i = 0; i < count; i++) {
                 if (ids[i] == -1) {
                     free(ids);
@@ -1259,9 +1149,8 @@ int64_t *pg_store_get_or_create_terms(PgStore *store, const char *const *terms, 
         }
     }
 
-    /* Phase 3: anything still unresolved lost the insert race to a
-     * concurrent writer (DO NOTHING silently no-opped for it) -- one more
-     * bulk re-SELECT picks up whatever's left. Rare in practice. */
+    /* Phase 3: re-SELECT stragglers that lost the insert race to a concurrent
+     * writer (rare in practice). */
     {
         size_t straggler_count = 0;
         const char **stragglers = collect_unresolved(terms, count, ids, &straggler_count);
@@ -1293,8 +1182,7 @@ int64_t *pg_store_get_or_create_terms(PgStore *store, const char *const *terms, 
 
     for (size_t i = 0; i < count; i++) {
         if (ids[i] == -1) {
-            /* Shouldn't happen -- nothing in this codebase deletes terms
-             * concurrently. Fail loudly rather than hand back a bogus id. */
+            /* Shouldn't happen (nothing deletes terms concurrently); fail loudly. */
             fprintf(stderr, "pg_store_get_or_create_terms: term \"%s\" unresolved after all phases\n",
                     terms[i]);
             free(ids);
@@ -1343,12 +1231,8 @@ int pg_store_insert_postings(PgStore *store, const int64_t *term_ids, int64_t pa
         return -1;
     }
 
-    /* unnest() on two arrays in the same target list runs in lock-step
-     * (zipped element-wise), not a cross product -- verified directly
-     * against the real server before relying on it here. $2/$4 are each
-     * bound once and reused for every row, not unnested themselves --
-     * every posting from this one call shares the same passage_id and
-     * therefore the same token_count. */
+    /* Same-target-list unnest()s zip lock-step, not cross product (verified). $2/$4 are
+     * bound once and reused: all postings here share passage_id/token_count. */
     const char *params[4] = {term_ids_literal, passage_id_str, freqs_literal, token_count_str};
     static const char *sql =
         "INSERT INTO postings (term_id, passage_id, term_frequency, token_count) "
@@ -1493,11 +1377,8 @@ int pg_store_disable_synchronous_commit(PgStore *store) {
     return exec_simple(store->conn, "SET synchronous_commit = off;", "pg_store_disable_synchronous_commit");
 }
 
-/* See pg_store.h's staging-tables comment for why these are UNLOGGED and
- * unconstrained. row_num is documents_raw's own ordering key (COPY does
- * not preserve any particular scan order for later readers, so Phase 2's
- * workers need something to range-partition on that isn't `pid` --
- * MS MARCO pids are arbitrary strings, not a dense/contiguous range). */
+/* UNLOGGED/unconstrained staging (see pg_store.h). row_num is the ordering key Phase 2
+ * workers range-partition on (COPY preserves no scan order; pids aren't contiguous). */
 #define LEXIS_STAGING_SCHEMA_SQL                                            \
     "CREATE UNLOGGED TABLE IF NOT EXISTS documents_raw ("                   \
     "    row_num BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"          \
@@ -1544,10 +1425,8 @@ int64_t pg_store_copy_documents_raw(PgStore *store, const char *tsv_path) {
     }
     PQclear(begin_res);
 
-    /* The CSV file is already in the exact wire format COPY expects --
-     * streamed straight through in fixed-size chunks, no parsing on this
-     * side. See SPEED.md for why the file must actually be CSV-quoted
-     * (not plain TSV) for this to be safe. */
+    /* The file is already in COPY's exact wire format: stream it through unparsed.
+     * It must be CSV-quoted, not plain TSV (see dev/SPEED.md). */
     char buffer[65536];
     size_t bytes_read;
     int read_failed = 0;
@@ -1579,9 +1458,8 @@ int64_t pg_store_copy_documents_raw(PgStore *store, const char *tsv_path) {
     }
     PQclear(end_res);
 
-    /* PQgetResult must be drained to NULL before this connection can run
-     * another command -- COPY's protocol leaves one more (empty) result
-     * queued after the command-status one. */
+    /* Drain PQgetResult to NULL: COPY queues one more empty result after the status
+     * one, and the connection can't run another command until drained. */
     PGresult *drain;
     while ((drain = PQgetResult(store->conn)) != NULL) {
         PQclear(drain);
@@ -1656,9 +1534,7 @@ int pg_store_insert_staged_postings(PgStore *store, int64_t passage_id, const ch
         return -1;
     }
 
-    /* Same lock-step unnest() zip as pg_store_insert_postings() -- see
-     * that function's comment for why $2/$4 are bound once and reused,
-     * not unnested themselves. */
+    /* Lock-step unnest() zip as in pg_store_insert_postings(). */
     const char *params[4] = {terms_literal, passage_id_str, freqs_literal, token_count_str};
     static const char *sql =
         "INSERT INTO postings_staged (passage_id, term, term_frequency, token_count) "
@@ -1676,11 +1552,8 @@ int pg_store_insert_staged_postings(PgStore *store, int64_t passage_id, const ch
 }
 
 long pg_store_finalize_terms_and_postings(PgStore *store) {
-    /* Session-local, not a global postgresql.conf change -- this
-     * connection is about to run a DISTINCT and a hash JOIN over
-     * hundreds of millions of staged rows, work no other connection in
-     * this process does, so there's no reason to pay for a larger
-     * work_mem anywhere else. */
+    /* Session-local work_mem bump: only this connection runs the DISTINCT + hash JOIN
+     * over hundreds of millions of staged rows. */
     if (exec_simple(store->conn, "SET work_mem = '1GB';", "pg_store_finalize_terms_and_postings") != 0) {
         return -1;
     }
@@ -1708,11 +1581,8 @@ long pg_store_finalize_terms_and_postings(PgStore *store) {
 }
 
 int pg_store_prepare_bulk_load(PgStore *store) {
-    /* Constraints dropped before the UNLOGGED conversion -- Postgres
-     * refuses to weaken a table's persistence while a still-LOGGED
-     * table holds a foreign key referencing it, and dropping postings'
-     * FK to terms is what removes that dependency. See this function's
-     * doc comment for why passages is deliberately left out. */
+    /* Drop constraints before UNLOGGED: Postgres refuses to weaken a table while a
+     * still-LOGGED table's FK references it. (passages deliberately left out.) */
     static const char *sql =
         "ALTER TABLE postings DROP CONSTRAINT IF EXISTS postings_pkey;"
         "ALTER TABLE postings DROP CONSTRAINT IF EXISTS postings_term_id_fkey;"
@@ -1723,18 +1593,8 @@ int pg_store_prepare_bulk_load(PgStore *store) {
 }
 
 int pg_store_finish_bulk_load(PgStore *store) {
-    /* Constraints rebuilt while still UNLOGGED (so their own build pays
-     * no WAL cost); SET LOGGED last, paying that cost once in bulk for
-     * the whole finished table -- see this function's doc comment.
-     * `terms` must go LOGGED before `postings`, the reverse of
-     * pg_store_prepare_bulk_load()'s drop order: by this point postings
-     * already has a live FK pointing at terms again, and Postgres
-     * refuses to make a table LOGGED while it references a still-
-     * UNLOGGED table (same rule pg_store_prepare_bulk_load() works
-     * around from the other direction). Got this backwards on the first
-     * attempt -- caught directly by
-     * test_finish_bulk_load_restores_constraints_and_durability_and_data_survives(),
-     * not assumed correct. */
+    /* Rebuild constraints while still UNLOGGED, then SET LOGGED (terms before postings:
+     * postings' FK can't point at a still-UNLOGGED terms). See the ordering test. */
     static const char *sql =
         "ALTER TABLE postings ADD PRIMARY KEY (term_id, passage_id);"
         "ALTER TABLE postings ADD CONSTRAINT postings_term_id_fkey "

@@ -1,16 +1,11 @@
-/*
- * Implementation of BM25 scoring.
- * See include/bm25.h for the module's role (spec 5.2.5, Stage 3).
- */
+/* BM25 scoring (spec 5.2.5, Stage 3); see bm25.h. */
 
 #include "bm25.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 
-/* Open-addressing (linear probing) hash table mapping passage_id -> its
- * index into the owning BM25ResultSet's items[] array. See bm25.h's
- * BM25ResultIndex forward declaration for why this exists. */
+/* passage_id -> items[] index; see BM25ResultIndex in bm25.h. */
 typedef struct {
     int64_t passage_id;
     size_t item_index;
@@ -23,21 +18,14 @@ struct BM25ResultIndex {
     size_t count;
 };
 
-/* Multiplicative hash (Knuth's method, the golden-ratio constant) --
- * passage_ids are sequential (GENERATED ALWAYS AS IDENTITY), so a naive
- * modulo would cluster badly; this scrambles the bits well regardless of
- * table size. */
+/* Knuth multiplicative hash: passage_ids are sequential, so plain modulo would cluster. */
 static uint64_t bm25_hash_passage_id(int64_t passage_id) {
     uint64_t x = (uint64_t)passage_id;
     x *= 0x9E3779B97F4A7C15ULL;
     return x;
 }
 
-/* Finds passage_id's slot via linear probing -- either an existing
- * occupied slot (already present) or the first empty slot found along
- * the probe sequence (not present, ready for insertion there). Assumes
- * the table is never allowed to fill completely (see the load-factor
- * check in bm25_result_index_insert()), so this always terminates. */
+/* Linear-probe lookup; terminates because the table never fills (see insert load check). */
 static size_t bm25_result_index_find_slot(const BM25IndexSlot *slots, size_t capacity,
                                            int64_t passage_id) {
     size_t slot = (size_t)(bm25_hash_passage_id(passage_id) % capacity);
@@ -70,10 +58,7 @@ static void bm25_result_index_free(BM25ResultIndex *index) {
     free(index);
 }
 
-/* Doubles the table and re-inserts every occupied slot at its new
- * position -- probe sequences depend on capacity, so old positions can't
- * just be copied over. Returns 0 on success, -1 on allocation failure
- * (the table is left unchanged). */
+/* Double capacity and rehash (probe positions depend on capacity). 0 ok, -1 alloc fail. */
 static int bm25_result_index_grow(BM25ResultIndex *index) {
     size_t new_capacity = index->capacity * 2;
     BM25IndexSlot *new_slots = calloc(new_capacity, sizeof(BM25IndexSlot));
@@ -93,8 +78,7 @@ static int bm25_result_index_grow(BM25ResultIndex *index) {
     return 0;
 }
 
-/* Returns 1 and sets *out_item_index if passage_id is already indexed, 0
- * if not (nothing to look up yet). */
+/* 1 + *out_item_index if present, else 0. */
 static int bm25_result_index_lookup(const BM25ResultIndex *index, int64_t passage_id,
                                      size_t *out_item_index) {
     size_t slot = bm25_result_index_find_slot(index->slots, index->capacity, passage_id);
@@ -105,9 +89,7 @@ static int bm25_result_index_lookup(const BM25ResultIndex *index, int64_t passag
     return 0;
 }
 
-/* Records that passage_id lives at item_index. Grows the table first if
- * inserting would push the load factor past 0.7 (kept low to keep probe
- * sequences short). Returns 0 on success, -1 on allocation failure. */
+/* Insert mapping; grows past 0.7 load to keep probes short. 0 ok, -1 alloc fail. */
 static int bm25_result_index_insert(BM25ResultIndex *index, int64_t passage_id, size_t item_index) {
     if ((index->count + 1) * 10 >= index->capacity * 7) {
         if (bm25_result_index_grow(index) != 0) {
@@ -133,9 +115,7 @@ BM25CorpusStats bm25_corpus_stats(PgStore *store) {
     }
 
     stats.total_passages = atol(PQgetvalue(res, 0, 0));
-    /* AVG() over an empty table returns SQL NULL -- PQgetvalue then
-     * returns an empty string, and atof("") is 0.0, exactly what we want
-     * when total_passages is 0. */
+    /* AVG() on empty table is NULL -> atof("") = 0.0, correct when count is 0. */
     stats.avg_passage_length = atof(PQgetvalue(res, 0, 1));
 
     PQclear(res);
@@ -238,9 +218,7 @@ void bm25_result_set_trim(PgStore *store, BM25ResultSet *set, size_t max_passage
         return;
     }
 
-    /* set->items is already sorted descending by bm25_search(), so the top
-     * score is item 0 and a single forward pass can apply all three
-     * limits. */
+    /* items[] already sorted desc, so one forward pass applies all limits. */
     double floor_score = (score_floor_ratio > 0.0) ? set->items[0].score * score_floor_ratio : 0.0;
 
     size_t kept = 0;
@@ -257,9 +235,7 @@ void bm25_result_set_trim(PgStore *store, BM25ResultSet *set, size_t max_passage
             pg_store_passage_free(passage);
         }
 
-        /* Always keep the top result, however long it is: returning zero
-         * passages because the single best match happens to exceed the
-         * budget would turn a good answer into no answer. */
+        /* Always keep top hit: exceeding budget must not yield zero passages. */
         if (kept > 0 && running_tokens + passage_tokens > token_budget) {
             break;
         }
@@ -297,13 +273,7 @@ int bm25_accumulate_term_scores_weighted(PgStore *store, int64_t term_id, BM25Co
     snprintf(term_id_str, sizeof(term_id_str), "%lld", (long long)term_id);
     const char *params_arr[1] = {term_id_str};
 
-    /* No JOIN against passages -- token_count is denormalized directly
-     * onto postings (see pg_store.c's schema comment) specifically so
-     * this stays a single index-only scan. Measured directly at real MS
-     * MARCO scale: the joined version cost 11-14+ seconds for a term
-     * with 100K+ matches (one random-access lookup into passages per
-     * matching row), worse for genuinely common words -- see
-     * LIMITATIONS.md. */
+    /* No JOIN: token_count is denormalized on postings for an index-only scan (see dev/LIMITATIONS.md). */
     static const char *sql =
         "SELECT passage_id, term_frequency, token_count FROM postings WHERE term_id = $1;";
 
@@ -314,8 +284,7 @@ int bm25_accumulate_term_scores_weighted(PgStore *store, int64_t term_id, BM25Co
         return -1;
     }
 
-    /* libpq hands back every matching row at once (no step-by-step
-     * cursor the way sqlite3_step() worked) -- iterate PQntuples(). */
+    /* libpq returns all rows at once; iterate PQntuples(). */
     int row_count = PQntuples(res);
     for (int i = 0; i < row_count; i++) {
         int64_t passage_id = atoll(PQgetvalue(res, i, 0));
@@ -335,10 +304,7 @@ int bm25_accumulate_term_scores_weighted(PgStore *store, int64_t term_id, BM25Co
     return 0;
 }
 
-/* Descending-score comparator for qsort(). Compares via < / > rather than
- * subtraction -- (a - b) cast through qsort's int return type would
- * truncate or overflow for doubles, giving wrong ordering for close or
- * very large/small scores. */
+/* Descending comparator; uses </> since subtracting doubles mis-orders via int truncation. */
 static int bm25_compare_score_desc(const void *a, const void *b) {
     const BM25ScoredPassage *pa = (const BM25ScoredPassage *)a;
     const BM25ScoredPassage *pb = (const BM25ScoredPassage *)b;
@@ -348,13 +314,7 @@ static int bm25_compare_score_desc(const void *a, const void *b) {
     if (pa->score > pb->score) {
         return -1;
     }
-    /* Tie-break on passage_id so equal scores rank deterministically --
-     * qsort is not stable, and score ties are common on short queries
-     * (measured: NFCorpus nDCG@10 wobbled ~0.02 between identical runs
-     * purely from tie ordering). Ranking is now reproducible for a given
-     * ingest; re-ingesting still reassigns ids across parallel workers,
-     * so cross-ingest tie order (and tie-heavy metrics with it) can
-     * still shift -- see TESTING.md's sweep notes. */
+    /* Tie-break on passage_id: qsort is unstable and ties wobble metrics (see dev/TESTING.md). */
     if (pa->passage_id < pb->passage_id) {
         return -1;
     }
@@ -396,9 +356,7 @@ BM25ResultSet *bm25_search_weighted(PgStore *store, const char **query_terms,
         }
     }
 
-    /* Coordination bonus (see BM25Params.coord_bonus): applied after all
-     * terms have accumulated, before ranking. num_terms == 1 means every
-     * passage matched the same single term -- nothing to coordinate. */
+    /* Coordination bonus after accumulation, before ranking; skipped for single-term queries. */
     if (params.coord_bonus > 0.0 && num_terms > 1) {
         for (size_t i = 0; i < results->count; i++) {
             double matched = (double)(results->items[i].matched_terms - 1);

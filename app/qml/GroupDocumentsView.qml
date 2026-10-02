@@ -1,8 +1,5 @@
-// Drill-down level 2: the active group's documents -- header (back +
-// name), document list (click to view a document's indexed text and
-// chunks, "..." menu to remove it), drag-and-drop ingestion, and an
-// "Add Documents" file picker. Emits `backRequested`, same "doesn't know
-// about its own StackView" shape as GroupsListView.
+// Drill-down level 2: the active group's documents (view, remove, ingest).
+// Emits `backRequested`; doesn't know about its own StackView.
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -26,11 +23,8 @@ Item {
         id: documentViewer
     }
 
-    // NOT `enabled: !AppController.busy` on the root. That froze this
-    // whole panel during an ingest -- including the back button, which
-    // is the only way to reach OTHER groups, whose chat is deliberately
-    // still available mid-ingest. Only the controls that would start a
-    // second ingest are gated, individually, below.
+    // Root stays enabled during ingest (back must reach other groups' chat);
+    // only the controls that would start a second ingest are gated.
 
     ColumnLayout {
         anchors.fill: parent
@@ -41,9 +35,7 @@ Item {
             spacing: Theme.spacingXS
 
             ToolButton {
-                // U+2039, a text-font glyph. Not an emoji: emoji
-                // codepoints resolve to Apple Color Emoji and render as
-                // full-color stickers against flat chrome.
+                // Text-font glyph, not emoji (emoji render as color stickers).
                 text: "‹"
                 font.pixelSize: Theme.fontSizeTitle
                 implicitWidth: 28
@@ -97,10 +89,7 @@ Item {
                             elide: Text.ElideRight
                         }
 
-                        // The at-a-glance corpus numbers: how much of the
-                        // index this document actually is. Placeholder
-                        // styling on purpose -- a caption, not a second
-                        // line competing with the name.
+                        // Caption-styled index stats (not a second line competing with the name).
                         Label {
                             visible: docDelegate.model.passageCount !== undefined
                             text: docDelegate.model.passageCount + " passages"
@@ -116,8 +105,7 @@ Item {
                         font.pixelSize: 16
                         implicitWidth: 28
                         implicitHeight: 28
-                        // Consumes the press, so opening the menu does
-                        // not also open the viewer.
+                        // Consumes the press: opening the menu must not also open the viewer.
                         onClicked: rowMenu.popup()
 
                         Menu {
@@ -134,13 +122,11 @@ Item {
                     }
                 }
 
-                // Click opens the document viewer (DocumentViewerDialog)
-                // -- the row is a real thing now, not a dead label.
+                // Click opens the document viewer.
                 onClicked: root.openDocumentViewer(docDelegate.model.name)
             }
 
-            // Empty state -- previously the list just showed nothing,
-            // which reads as "broken" rather than "drop files here".
+            // Empty state (a blank list reads as "broken").
             Label {
                 anchors.centerIn: parent
                 width: parent.width - 2 * Theme.spacingM
@@ -160,8 +146,7 @@ Item {
             }
         }
 
-        // Ingest progress. Reserved height, so the list above does not
-        // resize every time the status text appears and disappears.
+        // Ingest progress (reserved height, so the list doesn't resize).
         Label {
             text: AppController.statusText
             visible: AppController.busy
@@ -177,9 +162,7 @@ Item {
             indeterminate: true
         }
 
-        // Same accent-button treatment as GroupsListView's "+ New Group":
-        // custom white contentItem because FluentWinUI3 ignores
-        // palette.buttonText on highlighted buttons.
+        // White custom contentItem: the style ignores palette.buttonText when highlighted.
         Button {
             id: addDocumentsButton
             Layout.fillWidth: true
@@ -198,10 +181,7 @@ Item {
             onClicked: addDocumentsDialog.open()
         }
 
-        // The file picker above cannot select folders (FileDialog and
-        // FolderDialog are separate, mutually exclusive pickers -- Qt
-        // exposes no combined mode), so folders get their own button.
-        // Drag-and-drop remains the one place both work at once.
+        // Separate button: Qt has no combined file+folder picker.
         Button {
             id: addFolderButton
             Layout.fillWidth: true
@@ -242,15 +222,12 @@ Item {
         id: addFolderDialog
         title: qsTr("Add Folder")
         onAccepted: {
-            // ingestFiles walks a dropped-or-picked folder recursively and
-            // keeps only supported types -- same path as drag-and-drop.
+            // ingestFiles walks folders recursively (same as drag-and-drop).
             AppController.ingestFiles([selectedFolder.toString()])
         }
     }
 
-    // Removal confirm, same stock-dialog pattern as group deletion.
-    // Names the passages explicitly: what vanishes is this document's
-    // searchable text -- the source file on disk is untouched.
+    // Removal confirm (source file on disk is untouched).
     Dialog {
         id: removeConfirm
         title: qsTr("Remove document")

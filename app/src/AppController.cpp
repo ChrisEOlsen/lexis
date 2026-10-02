@@ -27,11 +27,8 @@ extern "C" {
 #include <QUrl>
 
 namespace {
-// Every path goes through the C core's paths module: relative to the
-// working directory in a dev build (the historical behavior), absolute
-// into the .app bundle's Resources / Application Support once main.cpp
-// has called lexis_paths_set(). The conninfo and model path come from
-// the config file either way.
+// Every path goes through the C core's paths module (dev-relative, or absolute once
+// main.cpp calls lexis_paths_set() in a bundle). Conninfo/model path come from config.
 const char *kStopwordsRelPath = "data/stopwords/english.txt";
 const char *kWordnetRelDir = "data/wordnet";
 } // namespace
@@ -69,12 +66,8 @@ AppController::AppController(QObject *parent)
         emit notify(tr("Could not load language data from data/stopwords or data/wordnet."));
     }
 
-    // Kicked off immediately, not deferred to first chat use -- see
-    // ModelLoader.h's own comment on why (~9-19s load time overlapping
-    // with whatever the user does first, instead of stalling their
-    // first question). Skipped quietly when the model file isn't there
-    // yet -- that is the fresh-install state the setup overlay handles;
-    // it calls retryModelLoad() when the download lands.
+    // Load immediately so the ~9-19s cost overlaps with first use (see ModelLoader.h).
+    // Skipped when the model file isn't there yet; setup calls retryModelLoad() later.
     char *modelPath = config_load_model_path(lexis_paths_config_file());
     m_modelPath = QString::fromUtf8(modelPath);
     free(modelPath);
@@ -82,10 +75,8 @@ AppController::AppController(QObject *parent)
         retryModelLoad();
     }
 
-    // Settings state (F5): read through the same file the Settings
-    // panel will rewrite. The reranker's live gate starts in whatever
-    // state the config implies -- the first query's lazy init reads the
-    // config line itself, so an absent line needs no explicit call.
+    // Settings state (see header). No explicit reranker call: the first query's lazy
+    // init reads the config line itself.
     const QString configPath = QString::fromUtf8(lexis_paths_config_file());
     m_thinkingEnabled = ConfigManager(configPath).thinkingEnabled();
     m_rerankerEnabled = ConfigManager(configPath).rerankerEnabled();
@@ -103,17 +94,9 @@ void AppController::retryModelLoad() {
 }
 
 AppController::~AppController() {
-    // Real operations already in progress on other threads -- waiting
-    // for them here (blocking app close briefly) is the correct, safe
-    // behavior; destroying the language data below, or calling
-    // local_llm_client_cleanup() while a query is still using the
-    // model, out from under a still-running worker would not be.
+    // Wait for in-flight workers before freeing the language data / model they use.
     if (m_activeWorker != nullptr) {
-        // Quitting mid-ingest: without the cancel this wait() blocked
-        // the UI thread for the rest of a possibly minutes-long ingest
-        // (observed as a beachball needing a force quit). Cancelling
-        // first makes the wait end at the pipeline's next checkpoint --
-        // moments, not minutes -- and is lossless (see cancelIngest()).
+        // Cancel first so the wait ends at the next checkpoint (moments, not minutes).
         m_activeWorker->requestCancel();
         m_activeWorker->wait();
     }
@@ -123,8 +106,7 @@ AppController::~AppController() {
     if (m_activeQueryWorker != nullptr) {
         m_activeQueryWorker->wait();
     }
-    // Safe to call even if init failed or was never reached (documented
-    // in local_llm_client.h) -- no need to track success state here.
+    // Safe even if init failed or never ran (see local_llm_client.h).
     local_llm_client_cleanup();
 
     stopword_set_free(m_stopwords);
@@ -200,8 +182,7 @@ bool AppController::createGroup(const QString &displayName) {
 
 bool AppController::deleteGroup(qint64 corpusId) {
     if (corpusId == m_ingestingCorpusId) {
-        // Deleting a group whose index is mid-rebuild would race the
-        // rebuild's final schema swap. Cancel first, delete after.
+        // Deleting mid-rebuild would race the rebuild's final schema swap.
         emit notify(tr("This group is still ingesting. Cancel the ingestion first, then delete it."));
         return false;
     }
@@ -213,15 +194,8 @@ bool AppController::deleteGroup(qint64 corpusId) {
         m_activeCorpusId = -1;
         m_activeCorpusName.clear();
         m_documentModel->setDocuments({});
-        // The chat state has to be torn down too, not just the documents.
-        // Deleting the active group used to leave the conversation sitting
-        // on screen and the deleted group's sessions still listed in the
-        // history drawer -- both referring to rows the ON DELETE CASCADE
-        // had already removed (public.chat_sessions.corpus_id references
-        // public.corpora ON DELETE CASCADE, so the sessions and every
-        // message in them go with the registry row). Clearing the session
-        // model is separate from startNewChat(), which only resets the
-        // active session and the message list.
+        // Tear down chat state too: ON DELETE CASCADE already removed the sessions and
+        // messages, so the models must not keep showing them.
         m_chatSessionModel->setSessions({});
         startNewChat();
         emit activeCorpusIdChanged();
@@ -250,21 +224,8 @@ void AppController::selectGroup(qint64 corpusId) {
 
     refreshDocumentModel();
 
-    // Opening a group always lands on a fresh chat, never on the tail of
-    // whatever conversation happened last. Resuming is an explicit act
-    // via the history drawer.
-    //
-    // This deliberately replaces the earlier "pick up where the user left
-    // off" behavior, which auto-selected the most recent session. That
-    // made the group's newest conversation load itself on every open,
-    // which is wrong in two ways: a new question typed straight after
-    // opening a group would silently append to an old conversation (and
-    // be sent with its history as context, see QueryWorker), and there
-    // was no way to reach the empty state at all without pressing
-    // "New chat" every single time.
-    //
-    // The session list is still loaded here -- the history drawer reads
-    // it, and it must reflect this group rather than the previous one.
+    // Opening a group always lands on a fresh chat; resuming is explicit via the
+    // history drawer (whose list must still reflect this group).
     QVector<ChatSession> sessions;
     m_engine->listChatSessions(corpusId, &sessions);
     m_chatSessionModel->setSessions(sessions);
@@ -283,11 +244,8 @@ void AppController::startNewChat() {
     emit canRetryLastAnswerChanged();
 }
 
-// The m_last* fields describe the newest exchange of the session on
-// screen. They must be cleared or re-derived on every session change:
-// left stale, retryLastAnswer()'s guards all pass and the retry runs the
-// PREVIOUS session's question against the current session's id, then
-// replaces this session's newest answer with the result.
+// m_last* must describe the session on screen; stale state would run one session's
+// question against another session's id and overwrite an unrelated answer.
 void AppController::clearLastExchange() {
     m_lastQuestion.clear();
     m_lastAnswerWasSearch = false;
@@ -298,11 +256,8 @@ void AppController::clearLastExchange() {
     m_lastAnswerSearchTerms.clear();
 }
 
-// Reads the newest exchange back out of a session loaded from history,
-// so "Try harder" works there exactly as it does on a fresh answer. Only
-// a trailing assistant message qualifies: the retry replaces the last
-// answer, so there has to be one, and the question it re-asks is the
-// user message immediately before it.
+// Re-derives the newest exchange from a history-loaded session so "Try harder" works
+// there too. Only a trailing assistant message qualifies.
 void AppController::adoptLastExchange(const QVector<ChatMessage> &messages) {
     clearLastExchange();
     if (messages.isEmpty() || messages.last().isUser) {
@@ -344,21 +299,13 @@ void AppController::selectChatSession(qint64 sessionId) {
         QString searchTerms;
         if (!entry.sourcesJson.isEmpty()) {
             QJsonDocument doc = QJsonDocument::fromJson(entry.sourcesJson.toUtf8());
-            // Two accepted shapes, deliberately. The current one is an
-            // object, {"tool": ..., "passages": [...]}, written by
-            // QueryWorker::provenanceToJson(). The bare array is the legacy
-            // shape from before the tool was recorded; rows in that form
-            // predate the CHAT path, and every one of them came from the
-            // search pipeline, so naming the tool "search" for them is a
-            // statement of fact rather than a guess. Reading them as an
-            // object instead would silently drop their citations.
+            // Two shapes: the current {"tool", "passages", ...} object, and the legacy bare
+            // array (predates the CHAT path, so every such row came from search).
             if (doc.isObject()) {
                 const QJsonObject root = doc.object();
                 tool = root.value(QStringLiteral("tool")).toString();
                 sources = root.value(QStringLiteral("passages")).toArray().toVariantList();
-                // Absent on CHAT/SUMMARY rows and anything stored before
-                // these fields existed -- .toString() yields empty, which
-                // is the QML hide condition.
+                // Missing keys yield empty strings, which is the QML hide condition.
                 searchQuery = root.value(QStringLiteral("searchQuery")).toString();
                 searchTerms = root.value(QStringLiteral("searchTerms")).toString();
             } else if (doc.isArray()) {
@@ -389,11 +336,7 @@ void AppController::deleteChatSession(qint64 sessionId) {
 
 void AppController::ingestFiles(const QStringList &fileUrls) {
     if (m_activeCorpusId < 0 || m_activeWorker != nullptr || fileUrls.isEmpty()) {
-        // No group selected, a previous ingest is still running
-        // (GroupContentView.qml disables drops while busy, so this
-        // shouldn't normally be reachable -- guarding anyway rather
-        // than starting two concurrent rebuilds of the same corpus), or
-        // nothing was actually dropped.
+        // No group selected, an ingest already running, or nothing dropped.
         return;
     }
 
@@ -405,19 +348,12 @@ void AppController::ingestFiles(const QStringList &fileUrls) {
             continue;
         }
         if (!QFileInfo(localPath).isDir()) {
-            // A directly-dropped file goes through as-is, whatever its
-            // type -- IngestWorker reports unsupported ones back as
-            // "skipped", which is the right feedback for a deliberate
-            // single-file drop.
+            // Dropped files go through as-is; IngestWorker reports unsupported ones as skipped.
             localPaths.append(localPath);
             continue;
         }
-        // A dropped folder: walk it recursively and keep only the
-        // types IngestWorker can extract (keep this list in sync with
-        // its suffix dispatch). Everything else is ignored SILENTLY --
-        // a real folder is full of incidental files (.DS_Store,
-        // installers, whatever), and listing them all as "skipped"
-        // would bury the useful part of the completion message.
+        // A dropped folder is walked recursively; only extractable types are kept (keep in
+        // sync with IngestWorker's suffix dispatch). The rest is ignored silently.
         static const QStringList kSupportedSuffixes = {
             QStringLiteral("txt"),  QStringLiteral("csv"), QStringLiteral("docx"),
             QStringLiteral("pdf"),  QStringLiteral("png"), QStringLiteral("jpg"),
@@ -432,8 +368,7 @@ void AppController::ingestFiles(const QStringList &fileUrls) {
         }
     }
     if (localPaths.isEmpty()) {
-        // Reachable by dropping a folder with nothing usable inside --
-        // silence here would read as the drop not registering at all.
+        // A folder with nothing usable: say so, or the drop reads as not registering.
         emit notify(tr("No supported documents found in the dropped folder."));
         return;
     }
@@ -443,10 +378,8 @@ void AppController::ingestFiles(const QStringList &fileUrls) {
     m_statusText = tr("Processing %1 file(s)...").arg(localPaths.size());
     emit statusTextChanged();
 
-    // Chat with THIS group is blocked until the ingest lands (the group
-    // is mid-rebuild; answers would come from a half-built index --
-    // observed: "there are no documents" while 33K documents were being
-    // ingested). Every other group stays fully usable meanwhile.
+    // Chat with THIS group is blocked until the ingest lands (answers would come from a
+    // half-built index). Every other group stays fully usable meanwhile.
     m_ingestingCorpusId = m_activeCorpusId;
     m_ingestProgress = 0.0;
     m_ingestAnimMs = 0;
@@ -474,15 +407,12 @@ void AppController::cancelIngest() {
 
 void AppController::onIngestProgress(int filesDone, int filesTotal, qint64 indexEtaMs) {
     if (indexEtaMs < 0) {
-        // Extraction phase: real per-file progress, scaled into the
-        // first 60% of the bar (the index rebuild owns the rest).
+        // Extraction: real per-file progress, scaled into the first 60% of the bar.
         m_ingestProgress = filesTotal > 0 ? 0.6 * double(filesDone) / double(filesTotal) : 0.0;
         m_ingestAnimMs = 250;
         m_ingestStatusText = tr("Reading documents (%1 of %2)...").arg(filesDone).arg(filesTotal);
     } else {
-        // Index rebuild: one C call with no progress hooks. The bar's
-        // target jumps to near-done and QML animates there over the
-        // estimated duration -- honest movement, estimated pace.
+        // Index rebuild: hook-less C call, so QML animates to near-done over the estimate.
         m_ingestProgress = 0.97;
         m_ingestAnimMs = int(qMin<qint64>(indexEtaMs, 30 * 60 * 1000));
         const qint64 seconds = indexEtaMs / 1000;
@@ -496,7 +426,7 @@ void AppController::onIngestProgress(int filesDone, int filesTotal, qint64 index
 
 void AppController::onIngestFinished(bool ok, bool cancelled, qint64 totalPassages, QStringList skipped,
                                       QStringList malformed, QStringList noTextFound) {
-    m_activeWorker = nullptr; // the object itself is cleaned up by the QThread::finished->deleteLater() connection
+    m_activeWorker = nullptr; // object deletes itself via QThread::finished -> deleteLater()
     m_busy = false;
     m_statusText = tr("Drag files here to add them to this group.");
     emit busyChanged();
@@ -514,8 +444,7 @@ void AppController::onIngestFinished(bool ok, bool cancelled, qint64 totalPassag
     }
 
     if (cancelled) {
-        // Nothing landed: the rebuild's temporary schema was dropped and
-        // the group is exactly as it was before the drop.
+        // Nothing landed: the temp schema was dropped, the group is unchanged.
         emit notify(tr("Ingestion cancelled. The group was left unchanged."));
         return;
     }
@@ -544,26 +473,18 @@ void AppController::onIngestFinished(bool ok, bool cancelled, qint64 totalPassag
 
 void AppController::sendChatMessage(const QString &question) {
     if (m_activeCorpusId < 0 || !m_modelReady || m_activeQueryWorker != nullptr || question.trimmed().isEmpty()) {
-        // No group selected, the model hasn't finished loading yet, a
-        // previous query is still running (only one at a time --
-        // local_llm_chat_completion() has no concurrency support of its
-        // own, see QueryWorker.h), or an empty/whitespace-only message.
+        // No group, model not ready, a query already running, or an empty message.
         return;
     }
     if (m_activeCorpusId == m_ingestingCorpusId) {
-        // This group's index is mid-rebuild; an answer now would come
-        // from a half-built (or momentarily empty) corpus. ChatPanel
-        // already swaps the chat for a progress panel -- this guard is
-        // the backstop in case a message slips through anyway.
+        // Mid-rebuild: an answer would come from a half-built corpus. Backstop behind
+        // ChatPanel's progress panel, in case a message slips through anyway.
         return;
     }
 
     if (m_activeChatSessionId < 0) {
-        // First message of a new chat -- create its session row now,
-        // titled from the question itself (truncated; no LLM call just
-        // for titling, kept simple until proven insufficient). See
-        // startNewChat()'s own comment on why this doesn't happen any
-        // earlier than this.
+        // First message of a new chat: create its session row now, titled from the
+        // (truncated) question itself.
         QString title = question.trimmed();
         constexpr int kMaxTitleLength = 60;
         if (title.length() > kMaxTitleLength) {
@@ -597,12 +518,13 @@ void AppController::sendChatMessage(const QString &question) {
     connect(m_activeQueryWorker, &QueryWorker::queryFinished, this, &AppController::onQueryFinished);
     connect(m_activeQueryWorker, &QueryWorker::queryStage, this, &AppController::onQueryStage);
     connect(m_activeQueryWorker, &QueryWorker::queryToken, this, &AppController::onQueryToken);
+    connect(m_activeQueryWorker, &QueryWorker::queryFailed, this, &AppController::onQueryFailed);
     connect(m_activeQueryWorker, &QThread::finished, m_activeQueryWorker, &QObject::deleteLater);
     m_activeQueryWorker->start();
 }
 
 void AppController::onModelLoadFinished(bool ok) {
-    m_modelLoader = nullptr; // cleaned up by the QThread::finished->deleteLater() connection
+    m_modelLoader = nullptr; // deletes itself via QThread::finished -> deleteLater()
     m_modelReady = ok;
     emit modelReadyChanged();
     emit canRetryLastAnswerChanged();
@@ -613,35 +535,35 @@ void AppController::onModelLoadFinished(bool ok) {
 
 void AppController::onQueryFinished(bool ok, QString answer, QVariantList sources, QString tool,
                                     QString searchQuery, QString searchTerms) {
-    m_activeQueryWorker = nullptr; // cleaned up by the QThread::finished->deleteLater() connection
+    m_activeQueryWorker = nullptr; // deletes itself via QThread::finished -> deleteLater()
     m_chatBusy = false;
     emit chatBusyChanged();
     m_queryStageText.clear();
     emit queryStageTextChanged();
 
     if (!ok) {
+        // A model failure explains itself; anything else gets the generic notice.
+        QString failure = m_queryFailureReason;
+        m_queryFailureReason.clear();
         if (m_retryingLiveAnswer) {
-            // A failed retry must not destroy the answer it was trying to
-            // improve: put the original back (the persisted row was never
-            // touched -- QueryWorker's replace runs only on success).
+            // A failed retry must not destroy the answer it tried to improve: put it back.
             m_chatModel->restoreLastAssistant(m_lastAnswer, m_lastAnswerSources, m_lastAnswerTool,
                                               m_lastAnswerSearchQuery, m_lastAnswerSearchTerms);
             m_retryingLiveAnswer = false;
-            // m_lastAnswerWasSearch is deliberately NOT touched on this
-            // path: the original answer is back, unchanged, so a second
-            // "try harder" on the same exchange must still be offered.
-            // (A failed query reports an empty tool, so assigning from it
-            // here would silently disable the button.)
+            // m_lastAnswerWasSearch untouched: the original is back, so a second retry must
+            // still be offered (a failed query's empty tool would disable the button).
             emit canRetryLastAnswerChanged();
-            emit notify(tr("Couldn't improve that answer -- the original is unchanged."));
+            emit notify(!failure.isEmpty()
+                            ? failure
+                            : tr("Couldn't improve that answer -- the original is unchanged."));
             return;
         } else {
-            // A failed query leaves no trace in the conversation (same as
-            // before streaming: nothing was persisted) -- the live row, if
-            // one ever appeared, goes away with it.
+            // A failed query leaves no trace: nothing was persisted, the live row goes too.
             m_chatModel->discardLive();
         }
-        emit notify(tr("Could not answer that question -- see the console for details."));
+        emit notify(!failure.isEmpty()
+                        ? failure
+                        : tr("Could not answer that question -- see the console for details."));
         emit canRetryLastAnswerChanged();
         return;
     }
@@ -652,18 +574,14 @@ void AppController::onQueryFinished(bool ok, QString answer, QVariantList source
     m_lastAnswerTool = tool;
     m_lastAnswerSearchQuery = searchQuery;
     m_lastAnswerSearchTerms = searchTerms;
-    // QueryWorker always sends a real, displayable answer on ok == true
-    // now -- "nothing to search for" and "no matching passages" are
-    // themselves the answer text (and already persisted to
-    // chat_messages by QueryWorker), not a sentinel this slot has to
-    // special-case into a synthesized message of its own; doing that
-    // here would desync what's shown live from what's actually stored.
-    // The live row (created on the first streamed token) is finalized
-    // with the authoritative text; when no token ever arrived (empty
-    // reply, or a stage that answers before generation) finishLive()
-    // falls back to an ordinary append internally.
+    // `answer` is always displayable on ok == true (already persisted by QueryWorker).
+    // finishLive() finalizes the live row, or appends when no token ever arrived.
     m_chatModel->finishLive(answer, sources, tool, searchQuery, searchTerms);
     emit canRetryLastAnswerChanged();
+}
+
+void AppController::onQueryFailed(QString reason) {
+    m_queryFailureReason = reason;
 }
 
 void AppController::onQueryStage(int stage, int payload) {
@@ -685,14 +603,19 @@ void AppController::onQueryStage(int stage, int payload) {
         break;
     case StageRetrying:
         m_queryStageText = tr("Trying again with a deeper search...");
-        // The first attempt's refusal text was already streamed into the
-        // live row; the retry regenerates from scratch, so clear it --
-        // leaving the refusal on screen under the new answer would read
-        // as two answers stacked in one message.
+        // The streamed refusal text must be cleared: the retry regenerates from scratch.
         m_chatModel->resetLiveText();
         break;
     case StageSummarizing:
         m_queryStageText = tr("Summarizing the group...");
+        // A fallback summary follows a streamed refusal or a partial read: clear it.
+        // Harmless on the fresh path (no live row exists yet).
+        m_chatModel->resetLiveText();
+        break;
+    case StageReadingDocuments:
+        m_queryStageText = tr("Reading the documents...");
+        // The fallback replaces a streamed refusal; harmless when nothing streamed.
+        m_chatModel->resetLiveText();
         break;
     default:
         return;
@@ -722,8 +645,7 @@ void AppController::setThinkingEnabled(bool enabled) {
     }
     m_thinkingEnabled = enabled;
     emit settingsChanged();
-    // No live call needed: every QueryWorker takes m_thinkingEnabled as
-    // its explicit per-query override (see sendChatMessage()).
+    // No live call needed: each QueryWorker takes this as a per-query override.
 }
 
 void AppController::setRerankerEnabled(bool enabled) {
@@ -735,8 +657,7 @@ void AppController::setRerankerEnabled(bool enabled) {
         emit notify(tr("Could not save the setting: %1").arg(manager.lastError()));
         return;
     }
-    // The write already succeeded; apply the live gate. Off means the
-    // model is never even loaded (see retrieval.c's reranker_user_enabled).
+    // Apply the live gate (off means the model is never even loaded).
     retrieval_set_reranker_enabled(enabled ? 1 : 0);
     m_rerankerEnabled = enabled;
     emit settingsChanged();
@@ -748,10 +669,8 @@ QString AppController::configDirectoryUrl() const {
     return QUrl::fromLocalFile(dir).toString();
 }
 
-// A query is already running, nothing was ever asked, the newest answer
-// didn't come from SEARCH (a CHAT reply has no retrieval to deepen; a
-// SUMMARY answer is about the overview, not the passages), or the group
-// itself isn't in a state to answer.
+// False when a query is running, nothing was asked, the newest answer isn't SEARCH,
+// or the group isn't answerable.
 bool AppController::canRetryLastAnswer() const {
     return m_activeQueryWorker == nullptr && !m_lastQuestion.isEmpty() && m_lastAnswerWasSearch &&
            m_activeCorpusId >= 0 && m_modelReady && m_activeChatSessionId >= 0 &&
@@ -763,11 +682,8 @@ void AppController::retryLastAnswer() {
         return;
     }
 
-    // Convert the newest answer's row into the live row up front: the
-    // retry replaces that answer in the UI (QueryWorker replaces it in
-    // history too -- same single row before and after, whether tokens
-    // streamed or not). m_lastAnswerWasSearch stays true, so a second
-    // "try harder" click on the same exchange keeps working.
+    // Convert the newest answer's row into the live row up front, so the retry replaces
+    // it in place (QueryWorker replaces the history row too).
     m_chatModel->makeLastAssistantLive();
     if (!m_chatModel->hasLiveAnswer()) {
         // Nothing to replace (shouldn't happen given the guards above).
@@ -787,6 +703,7 @@ void AppController::retryLastAnswer() {
     connect(m_activeQueryWorker, &QueryWorker::queryFinished, this, &AppController::onQueryFinished);
     connect(m_activeQueryWorker, &QueryWorker::queryStage, this, &AppController::onQueryStage);
     connect(m_activeQueryWorker, &QueryWorker::queryToken, this, &AppController::onQueryToken);
+    connect(m_activeQueryWorker, &QueryWorker::queryFailed, this, &AppController::onQueryFailed);
     connect(m_activeQueryWorker, &QThread::finished, m_activeQueryWorker, &QObject::deleteLater);
     m_activeQueryWorker->start();
 }
@@ -836,9 +753,7 @@ QVariantMap AppController::openDocument(const QString &documentName) {
 
 void AppController::removeDocument(const QString &documentName) {
     if (m_activeCorpusId < 0 || m_activeWorker != nullptr || m_activeCorpusId == m_ingestingCorpusId) {
-        // No group open, or an ingest/rebuild is in flight for it -- the
-        // removal writes to the live schema and would race the rebuild's
-        // swap (same reasoning as deleteGroup()'s ingest guard).
+        // No group open, or a rebuild in flight (the removal would race its swap).
         return;
     }
     if (!m_engine->removeDocument(documentName)) {

@@ -1,23 +1,18 @@
-/*
- * Implementation of the testing/production mode config reader.
- * See include/config.h for the module's role.
- */
+/* Testing/production mode config reader; see config.h. */
 
-/* See tokenizer.c for why this must come before any #include (strtok_r is
- * a POSIX extension hidden by glibc under strict -std=c11 otherwise). */
+/* Before any #include: exposes strtok_r under strict -std=c11 (see tokenizer.c). */
 #define _POSIX_C_SOURCE 200809L
 
 #include "config.h"
+
+#include "bm25.h"
 
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Deliberately not ingest_read_file(): a missing config file is a normal,
- * expected fallback path here (default to testing mode), not a real error
- * worth an stderr warning on every single run -- unlike ingest_read_file's
- * callers, where a missing file always means something actually failed. */
+/* Missing config is a normal fallback, not an error; hence no stderr warning. */
 static char *read_file_quietly(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (fp == NULL) {
@@ -70,11 +65,7 @@ static char *trim(char *s) {
     return s;
 }
 
-/* Walks `text` (destructively -- strtok_r/trim mutate it in place) and
- * returns the value of the last "key = value" line matching `key`, or
- * NULL if no such line exists. The returned pointer aliases `text`, so
- * it is only valid until `text` is freed. Last occurrence wins, matching
- * how the original mode parser behaved when a key was repeated. */
+/* Last "key = value" match for key (last wins); mutates text, result aliases it. */
 static const char *find_last_value(char *text, const char *key) {
     const char *found = NULL;
     char *saveptr;
@@ -167,4 +158,87 @@ char *config_load_model_path(const char *path) {
         result = strdup(LEXIS_DEFAULT_MODEL_PATH);
     }
     return result;
+}
+
+/* Parsed long for key, or fallback when missing/unparseable (partial parses rejected). */
+static long load_long_or(const char *path, const char *key, long fallback) {
+    char *text = read_file_quietly(path);
+    if (text == NULL) {
+        return fallback;
+    }
+    long result = fallback;
+    const char *value = find_last_value(text, key);
+    if (value != NULL && value[0] != '\0') {
+        char *end = NULL;
+        long parsed = strtol(value, &end, 10);
+        if (end != value && *end == '\0') {
+            result = parsed;
+        }
+    }
+    free(text);
+    return result;
+}
+
+/* Parsed double for key, or fallback when missing/unparseable (partial parses rejected). */
+static double load_double_or(const char *path, const char *key, double fallback) {
+    char *text = read_file_quietly(path);
+    if (text == NULL) {
+        return fallback;
+    }
+    double result = fallback;
+    const char *value = find_last_value(text, key);
+    if (value != NULL && value[0] != '\0') {
+        char *end = NULL;
+        double parsed = strtod(value, &end);
+        if (end != value && *end == '\0') {
+            result = parsed;
+        }
+    }
+    free(text);
+    return result;
+}
+
+size_t config_load_chunk_size(const char *path) {
+    long parsed = load_long_or(path, "chunk_size", LEXIS_DEFAULT_CHUNK_SIZE);
+    return parsed > 0 ? (size_t)parsed : LEXIS_DEFAULT_CHUNK_SIZE;
+}
+
+size_t config_load_chunk_overlap(const char *path) {
+    long parsed = load_long_or(path, "chunk_overlap", LEXIS_DEFAULT_CHUNK_OVERLAP);
+    return parsed >= 0 ? (size_t)parsed : LEXIS_DEFAULT_CHUNK_OVERLAP;
+}
+
+int config_load_ingest_threads(const char *path) {
+    long parsed = load_long_or(path, "ingest_threads", LEXIS_DEFAULT_INGEST_THREADS);
+    return parsed > 0 ? (int)parsed : LEXIS_DEFAULT_INGEST_THREADS;
+}
+
+size_t config_load_candidate_ceiling(const char *path) {
+    long parsed = load_long_or(path, "candidate_ceiling", LEXIS_SEARCH_CANDIDATE_CEILING);
+    return parsed > 0 ? (size_t)parsed : LEXIS_SEARCH_CANDIDATE_CEILING;
+}
+
+size_t config_load_max_passages(const char *path) {
+    long parsed = load_long_or(path, "max_passages", LEXIS_SEARCH_MAX_PASSAGES);
+    return parsed > 0 ? (size_t)parsed : LEXIS_SEARCH_MAX_PASSAGES;
+}
+
+int config_load_token_budget(const char *path) {
+    long parsed = load_long_or(path, "token_budget", LEXIS_SEARCH_TOKEN_BUDGET);
+    return parsed > 0 ? (int)parsed : LEXIS_SEARCH_TOKEN_BUDGET;
+}
+
+double config_load_score_floor_ratio(const char *path) {
+    double parsed = load_double_or(path, "score_floor_ratio", LEXIS_SEARCH_SCORE_FLOOR_RATIO);
+    return parsed >= 0.0 ? parsed : LEXIS_SEARCH_SCORE_FLOOR_RATIO;
+}
+
+double config_load_bm25_k1(const char *path) {
+    double parsed = load_double_or(path, "bm25_k1", BM25_DEFAULT_K1);
+    return parsed > 0.0 ? parsed : BM25_DEFAULT_K1;
+}
+
+double config_load_bm25_b(const char *path) {
+    double parsed = load_double_or(path, "bm25_b", BM25_DEFAULT_B);
+    return parsed >= 0.0 ? parsed : BM25_DEFAULT_B;
 }

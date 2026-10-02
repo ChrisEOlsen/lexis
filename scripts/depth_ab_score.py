@@ -1,25 +1,6 @@
 #!/usr/bin/env python3
-"""Score the 5-vs-12 A/B run.
-
-Two things are measured per answer:
-
-  gold_sent   whether a passage containing the reference answer's supporting
-              text actually reached the model. This separates "the model
-              failed" from "the passage was never there", which is the whole
-              reason the harness records which passage ids it sent.
-
-  coverage    what share of the reference answer's content words appear in the
-              generated answer. Crude on purpose: DelucionQA's references are
-              prose, and the only local model available is the same 2B one that
-              has already shown instability, so using it as a judge would be
-              unsound. A lexical measure is at least deterministic and applied
-              identically to both arms, which is what a comparison needs. It
-              will undercount correct answers that paraphrase, so read the
-              DIFFERENCE between arms, not the absolute level.
-
-Results are broken out by the stratum each question was sampled from, since
-the arms are expected to differ only where gold sits between the two cutoffs.
-"""
+"""Score the 5-vs-12 A/B: gold_sent (passage reached model?) + lexical coverage.
+Coverage is crude/deterministic; read the DIFFERENCE between arms, not absolutes."""
 
 import collections
 import json
@@ -27,23 +8,8 @@ import os
 import re
 import sys
 
-SHINGLE = 8
-
-
-def normalize(text):
-    return " ".join(text.lower().split())
-
-
-def shingles(text):
-    words = normalize(text).split()
-    if len(words) < SHINGLE:
-        return {" ".join(words)} if words else set()
-    return {" ".join(words[i : i + SHINGLE]) for i in range(len(words) - SHINGLE + 1)}
-
-
-def content_words(text, stopwords):
-    words = re.findall(r"[a-z0-9]+", text.lower())
-    return {w for w in words if w not in stopwords and len(w) > 2}
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from eval_common import content_words, shingles
 
 
 def main():

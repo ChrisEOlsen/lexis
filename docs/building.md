@@ -9,11 +9,14 @@ brew install postgresql@18 llama.cpp ggml cmake pkgconf \
              qtbase qtdeclarative poppler pugixml tesseract leptonica libzip
 ```
 
-Note: the Makefile and `app/CMakeLists.txt` pin the exact Homebrew
-Cellar paths for llama.cpp and ggml (Homebrew doesn't give them stable
-version-free paths). If your installed versions differ, update
-`LLAMA_CPP_DIR` and `GGML_DIR` in both files and the include paths in
-`compile_flags.txt`.
+Note: the builds pin exact Homebrew Cellar paths for llama.cpp and
+ggml (Homebrew doesn't give them stable version-free paths). If your
+installed versions differ, override them rather than editing the
+build files: copy `config/local.mk.example` to `config/local.mk`
+(gitignored) or export the variables for `make`, and pass
+`-DLLAMA_CPP_DIR=... -DGGML_DIR=...` (same for `PG_CONFIG`,
+`LEXIS_QTBASE_PREFIX`, `LEXIS_QTDECLARATIVE_PREFIX`) to `cmake`.
+Also update the matching include paths in `compile_flags.txt`.
 
 ## Database
 

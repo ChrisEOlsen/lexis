@@ -1,50 +1,16 @@
 #!/usr/bin/env python3
-"""Phase 0: how far down the results does the correct passage actually sit?
-
-Answers one question, with no language model involved: for each DelucionQA
-question, where does BM25 rank a passage that genuinely contains the answer?
-
-That single distribution decides whether reranking is worth building:
-
-  - correct passage usually already in the top 5   -> ordering is not the
-                                                      problem; build nothing
-  - usually within top 40 but below top 5          -> reordering would fix a
-                                                      lot; build the selection
-                                                      step
-  - often absent from the top 40 entirely          -> no reordering can help;
-                                                      retrieval itself is the
-                                                      problem
-
-Gold matching. DelucionQA gives the passages that were retrieved for each
-question; LEXIS re-chunks those into ~118-token windows that do not align with
-the originals, so exact string equality would find nothing. A retrieved chunk
-counts as correct when it shares at least one 8-word shingle with a gold
-passage: long enough that an accidental match is implausible, short enough to
-survive the chunk boundaries falling in different places.
-
-Reads:  data/eval/delucionqa/raw/*.json   (questions + gold passages)
-        a passages TSV dumped from the ingested corpus
-        the TSV emitted by phase0_retrieval
-"""
+"""Phase 0: where BM25 ranks the first correct passage (8-word shingle match).
+Decides whether reranking is worth building; reads raw/*.json + passages/retrieval TSVs."""
 
 import collections
 import json
 import os
 import sys
 
-SHINGLE = 8
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from eval_common import shingles
+
 CUTOFFS = (1, 3, 5, 12, 40)
-
-
-def normalize(text):
-    return " ".join(text.lower().split())
-
-
-def shingles(text):
-    words = normalize(text).split()
-    if len(words) < SHINGLE:
-        return {" ".join(words)} if words else set()
-    return {" ".join(words[i : i + SHINGLE]) for i in range(len(words) - SHINGLE + 1)}
 
 
 def main():
@@ -52,7 +18,7 @@ def main():
         sys.exit("usage: phase0_score.py <raw_dir> <passages.tsv> <retrieval.tsv>")
     raw_dir, passages_tsv, retrieval_tsv = sys.argv[1:4]
 
-    # -- questions and their gold passages, deduplicated by question text --
+    # Questions and gold passages, deduplicated by question text.
     gold_by_question = collections.OrderedDict()
     for name in sorted(os.listdir(raw_dir)):
         if not name.endswith(".json"):
@@ -69,7 +35,7 @@ def main():
 
     questions = list(gold_by_question.keys())
 
-    # -- passage id -> its shingles --
+    # Passage id -> shingles.
     passage_shingles = {}
     with open(passages_tsv) as handle:
         for line in handle:
@@ -78,7 +44,7 @@ def main():
                 continue
             passage_shingles[int(parts[0])] = shingles(parts[3])
 
-    # -- retrieval results --
+    # Retrieval results.
     ranked = collections.defaultdict(list)
     with open(retrieval_tsv) as handle:
         for line in handle:
@@ -119,8 +85,7 @@ def main():
     mrr = sum(1.0 / r for r in found) / total if total else 0.0
     print(f"\nMRR (first correct passage): {mrr:.3f}")
 
-    # The headroom: questions where reordering could help, because the answer
-    # is present in the candidate set but below where we currently cut.
+    # Headroom: answer present below the cutoff, so reordering could help.
     for send in (5, 12):
         recoverable = sum(1 for r in found if r > send)
         print(

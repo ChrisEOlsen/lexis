@@ -1,11 +1,6 @@
-/*
- * Implementation of the retrieval-quality evaluation harness.
- * See include/eval.h for the module's role and why it skips generation.
- */
+/* Retrieval-quality eval harness; see eval.h. */
 
-/* See tokenizer.c for why this must come before any #include (strdup and
- * getline are POSIX extensions hidden by glibc under strict -std=c11
- * otherwise). */
+/* Before any #include: exposes strdup/getline under strict -std=c11 (see tokenizer.c). */
 #define _POSIX_C_SOURCE 200809L
 
 #include "eval.h"
@@ -46,10 +41,7 @@ static void free_qrels(EvalQrel *qrels, size_t count) {
     free(qrels);
 }
 
-/* Reads "<query_id><TAB><query_text>" rows (no header) into a freshly
- * allocated, growable array. Returns the row count (>= 0) on success, or
- * -1 if the file can't be opened or on allocation failure. A row with no
- * tab is logged and skipped, not fatal. */
+/* Load "<id>TAB<text>" rows, no header. Count, or -1 on open/alloc fail; tabless rows skipped. */
 static long load_queries_tsv(const char *path, EvalQuery **out_queries) {
     FILE *fp = fopen(path, "rb");
     if (fp == NULL) {
@@ -110,11 +102,7 @@ static long load_queries_tsv(const char *path, EvalQuery **out_queries) {
     return (long)count;
 }
 
-/* Reads "query-id<TAB>corpus-id<TAB>score" rows (header required and
- * discarded) into a freshly allocated, growable array. Returns the row
- * count (>= 0) on success, or -1 if the file can't be opened/is empty, or
- * on allocation failure. A row missing either tab is logged and skipped,
- * not fatal. */
+/* Load "qid<TAB>docid<TAB>score" rows (header discarded). Count, or -1 on open/empty/alloc fail. */
 static long load_qrels_tsv(const char *path, EvalQrel **out_qrels) {
     FILE *fp = fopen(path, "rb");
     if (fp == NULL) {
@@ -186,13 +174,8 @@ static long load_qrels_tsv(const char *path, EvalQrel **out_qrels) {
     return (long)count;
 }
 
-/* Collects the corpus_ids of every qrels row for `query_id` with a
- * positive score -- a borrowed-pointer array into `qrels`'s own owned
- * strings, freed by the caller as just the array, not its contents.
- * Returns NULL (with *out_count == 0) on allocation failure. */
-/* Also returns each relevant doc's graded qrels score through
- * `scores_out` (parallel to the returned array, caller frees) -- the
- * gain nDCG@10 needs; MRR/recall ignore it. */
+/* Relevant corpus_ids for query_id (borrowed pointers; caller frees array only).
+ * Graded scores via scores_out for nDCG. NULL on alloc fail. */
 static const char **collect_relevant_ids(const EvalQrel *qrels, size_t qrels_count,
                                           const char *query_id, int **scores_out,
                                           size_t *out_count) {
@@ -219,9 +202,7 @@ static const char **collect_relevant_ids(const EvalQrel *qrels, size_t qrels_cou
     return relevant;
 }
 
-/* Ideal DCG@10: the relevant docs' gains, best-first, discounted into
- * the top ten ranks. Insertion-sorts a copy -- qrels per query are a
- * handful of rows, not worth qsort ceremony. */
+/* Ideal DCG@10: best-first gains discounted into top ten (insertion sort; few rows per query). */
 static double ideal_dcg_10(const int *scores, size_t count) {
     int top[10] = {0};
     for (size_t i = 0; i < count; i++) {
@@ -251,9 +232,7 @@ static void eval_cleanup(const char **relevant_ids, EvalQrel *qrels, long qrels_
 EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNetTable *wordnet,
                       const Lemmatizer *lemmatizer, const char *queries_tsv_path,
                       const char *qrels_tsv_path, int use_llm_expansion) {
-    /* Designated, not positional: adding a metric field must never
-     * silently shift the -1 sentinel out of queries_evaluated (it did
-     * once, when ndcg_at_10 landed). */
+    /* Designated init: keeps the -1 sentinel on queries_evaluated when fields are added. */
     EvalMetrics failure = {.queries_evaluated = -1};
 
     EvalQuery *queries = NULL;
@@ -272,13 +251,7 @@ EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNet
     printf("eval_run: loaded %ld queries, %ld qrels rows\n", query_count, qrels_count);
     fflush(stdout);
 
-    /* Computed once and reused for every query in this run, not
-     * recomputed per search -- bm25_corpus_stats() is a full-corpus
-     * aggregate (COUNT(*)/AVG(token_count) over every passage), and the
-     * corpus doesn't change during an eval run. At MS MARCO's real scale
-     * this was measured at several seconds per call -- multiplied across
-     * thousands of queries, recomputing it per search would have cost
-     * hours by itself. See LIMITATIONS.md. */
+    /* Stats computed once per run; per-query recompute cost hours at MS MARCO scale (see dev/LIMITATIONS.md). */
     BM25CorpusStats stats = bm25_corpus_stats(store);
     if (stats.total_passages < 0) {
         fprintf(stderr, "eval_run: failed to compute corpus stats\n");
@@ -297,10 +270,7 @@ EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNet
     struct timespec run_start;
     clock_gettime(CLOCK_MONOTONIC, &run_start);
 
-    /* The shared pipeline, eval-shaped by POLICY, not by a separate
-     * driver: rank 100 deep for Recall@100, no trim (metrics need the
-     * full ranked list), expansion per the caller's flag, and corpus
-     * stats computed once for the whole run rather than per query. */
+    /* Shared pipeline, eval-shaped by policy: rank 100 deep, no trim, caller-flagged expansion. */
     RetrievalPolicy policy = retrieval_default_policy();
     policy.candidate_ceiling = 100;
     policy.max_passages = 0;
@@ -320,8 +290,7 @@ EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNet
             return failure;
         }
         if (relevant_count == 0) {
-            /* No qrels judgments for this query -- nothing to score
-             * against, not a failure. */
+            /* No judgments for this query: skip, not a failure. */
             free(relevant_ids);
             free(relevant_scores);
             skipped++;
@@ -367,13 +336,7 @@ EvalMetrics eval_run(PgStore *store, const StopwordSet *stopwords, const WordNet
                     return failure;
                 }
 
-                /* A relevant pid can appear more than once in the ranked
-                 * results if that document split into multiple chunks
-                 * (rare -- MS MARCO passages average ~56 words, well
-                 * under LEXIS_CHUNK_SIZE=200, so almost every document
-                 * is exactly one chunk, but a few aren't). Track which
-                 * relevant_ids[] entries have already been counted so a
-                 * multi-chunk document can't inflate recall past 1.0. */
+                /* A doc may rank as multiple chunks; track counted ids so recall can't exceed 1.0. */
                 int *relevant_counted_10 = calloc(relevant_count, sizeof(int));
                 int *relevant_counted_100 = calloc(relevant_count, sizeof(int));
                 if (relevant_counted_10 == NULL || relevant_counted_100 == NULL) {

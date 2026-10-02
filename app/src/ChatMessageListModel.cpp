@@ -59,15 +59,14 @@ void ChatMessageListModel::addMessage(const QString &text, bool isUser, const QV
 void ChatMessageListModel::setMessages(const QVector<ChatMessage> &messages) {
     beginResetModel();
     m_messages = messages;
-    // A reset can never leave a live row: the only caller loads a whole
-    // session's history, all finished messages.
+    // A reset never leaves a live row: the caller loads finished history only.
     m_liveIndex = -1;
     endResetModel();
 }
 
 void ChatMessageListModel::beginLiveAnswer() {
     if (m_liveIndex >= 0) {
-        return; // one live row at a time, by the one-query-at-a-time rule
+        return; // one live row at a time
     }
     int row = m_messages.size();
     beginInsertRows(QModelIndex(), row, row);
@@ -134,8 +133,7 @@ void ChatMessageListModel::resetLiveText() {
 void ChatMessageListModel::finishLive(const QString &text, const QVariantList &sources, const QString &tool,
                                       const QString &searchQuery, const QString &searchTerms) {
     if (m_liveIndex < 0) {
-        // No live row was ever created (no tokens arrived -- e.g. an
-        // empty reply): the finished answer is just an ordinary append.
+        // No live row (no tokens arrived): the answer is just an ordinary append.
         addMessage(text, false, sources, tool, searchQuery, searchTerms);
         return;
     }

@@ -1,12 +1,5 @@
-// Settings: the two knobs users actually reach for, live-applied --
-// thinking (slower, more careful answers) and the meaning-based
-// reranker -- plus read-only model info. Everything else stays in
-// config/lexis.conf (see docs/configuration.md), reachable via the
-// "Open config folder" button; the dialog never edits or displays
-// db_conninfo.
-//
-// A gear ToolButton in ChatPanel's header opens this. Stock Dialog
-// throughout, same conventions as the other dialogs.
+// Settings: thinking + reranker switches (live-applied) and read-only model info.
+// Everything else stays in config/lexis.conf via "Open config folder".
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -26,14 +19,7 @@ Dialog {
     contentItem: ColumnLayout {
         spacing: Theme.spacingL
 
-        // Both live switches call into the C core: setThinkingEnabled()
-        // only changes the value the NEXT QueryWorker is handed, but
-        // setRerankerEnabled() calls retrieval_set_reranker_enabled(),
-        // which writes retrieval.c's gate flags from this thread and can
-        // start a model load. retrieval.h documents that as "never during
-        // a retrieval_run()", and only chatBusy tells us that here -- the
-        // gear button itself stays enabled so the panel is still readable
-        // mid-query.
+        // Switches are disabled mid-query: the reranker gate must not change during a run.
         Label {
             visible: AppController.chatBusy
             text: qsTr("These can't change while a question is being answered.")
@@ -71,12 +57,7 @@ Dialog {
                 checked: AppController.thinkingEnabled
                 onToggled: {
                     AppController.setThinkingEnabled(checked)
-                    // Toggling assigned `checked` directly, which destroyed
-                    // the binding above. Restore it: a write that failed
-                    // (read-only config, disk full) leaves the controller's
-                    // value unchanged, and the switch has to snap back to
-                    // it rather than sit there claiming a setting the
-                    // engine never got.
+                    // Restore the destroyed binding so a failed write snaps back.
                     checked = Qt.binding(function() { return AppController.thinkingEnabled })
                 }
             }
@@ -155,9 +136,7 @@ Dialog {
             flat: true
             text: qsTr("Open config folder")
             onClicked: {
-                // Reveal-only: the finder opens with the config selected;
-                // editing stays a deliberate, human act on a file the app
-                // promises to share (docs/configuration.md).
+                // Reveal-only: editing the shared config stays a deliberate human act.
                 Qt.openUrlExternally(AppController.configDirectoryUrl())
             }
         }

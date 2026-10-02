@@ -1,15 +1,4 @@
-/*
- * CLI entrypoint for the LEXIS C core. Dispatches to bulk-ingest (build/
- * rebuild the index from a TSV corpus via bulk_ingest.c's three-phase
- * pipeline -- see SPEED.md), query (run the retrieval + generation
- * pipeline for a single question), or eval (score retrieval quality
- * against labeled queries, see eval.c), per spec section 5.1's
- * high-level data flow.
- *
- * Must be run from the project root -- data/stopwords, data/wordnet,
- * and the index file are all located via relative paths, same
- * convention the test suite already uses.
- */
+/* CLI entrypoint: bulk-ingest/query/eval (spec 5.1). Must run from project root (relative data paths). */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -26,6 +15,7 @@
 #include "query_log.h"
 #include "retrieval.h"
 #include "stopwords.h"
+#include "time_util.h"
 #include "wordnet.h"
 
 #include <stdio.h>
@@ -33,52 +23,16 @@
 #include <string.h>
 #include <time.h>
 
-/* Postgres connection string -- points at the native Homebrew
- * postgresql@18 install (port 5434), the same instance the test suite's
- * TEST_CONNINFO now uses too (database lexis_test, vs. this database
- * lexis). Originally chosen over a Docker dev instance because Docker
- * Desktop on macOS runs everything inside a lightweight Linux VM, so
- * even "localhost" traffic to the containerized Postgres crosses that
- * VM boundary before reaching it -- real per-round-trip latency a
- * native install doesn't pay; the Docker instance was later removed
- * entirely once the test suite was verified passing against native
- * Postgres too (see CURRENT_STATE.md/SPEED.md). `make pg-start`/`make
- * pg-stop` manage this instance (see Makefile) -- it does not
- * auto-start on login. Separate from, and deliberately never touches,
- * this machine's pre-existing postgresql@14 instance on the default
- * port 5432 (unrelated projects' real data). */
-/* The connection string comes from config/lexis.conf's db_conninfo
- * (loaded once in main() into g_db_conninfo below) -- it embeds the
- * database password, which is why that file is untracked and why there
- * is no hardcoded fallback here. */
+/* Native Homebrew postgresql@18 on :5434 (see Makefile pg-start/pg-stop); distinct from :5432 postgres@14. */
+/* Conninfo from config db_conninfo (embeds password, untracked); no hardcoded fallback. */
 static const char *g_db_conninfo = NULL;
-/* Display-only label -- never print the conninfo itself, it embeds
- * the password. */
+/* Display label only; never print conninfo (embeds password). */
 #define LEXIS_DB_LABEL "127.0.0.1:5434/lexis (native)"
 #define LEXIS_STOPWORDS_PATH "data/stopwords/english.txt"
 #define LEXIS_WORDNET_DIR "data/wordnet"
-/* The local GGUF model path now comes from config/lexis.conf's
- * `model_path` (config_load_model_path(), falling back to
- * LEXIS_DEFAULT_MODEL_PATH) -- see config.h for the full history of how
- * the model itself was chosen. Loaded once per process (see
- * local_llm_client.c) and reused for query formulation and generation;
- * tool routing is app-only (app/src/QueryWorker.cpp) but shares the
- * same model/path since only one model is loaded process-wide. */
-#define LEXIS_CHUNK_SIZE 200
-#define LEXIS_CHUNK_OVERLAP 40
-/* Thread count for bulk_ingest.c's Phase 2 worker pool. 6 measured at
- * 3490.9 passages/sec on a real 200K-row slice against native Postgres
- * (see SPEED.md's three-phase-redesign section) -- not an exhaustive
- * sweep of this specific pipeline, just the count carried over from
- * earlier thread-count experiments on this 8 physical/logical-core
- * machine. Not auto-detected from core count yet; see LIMITATIONS.md. */
-#define LEXIS_INGEST_THREADS 6
-
-static long elapsed_ms(struct timespec start, struct timespec end) {
-    long seconds = end.tv_sec - start.tv_sec;
-    long nanoseconds = end.tv_nsec - start.tv_nsec;
-    return seconds * 1000 + nanoseconds / 1000000;
-}
+/* GGUF path from config model_path (see config.h); loaded once per process, shared by all LLM uses. */
+/* Chunking/worker tunables from config chunk_size/chunk_overlap/ingest_threads (see config.h).
+ * 6 threads measured ~3490 passages/sec (see dev/SPEED.md); not auto-detected yet (dev/LIMITATIONS.md). */
 
 static void print_usage(const char *program_name) {
     fprintf(stderr,
@@ -108,11 +62,7 @@ static int run_bulk_ingest(const char *tsv_path) {
         return 1;
     }
 
-    /* A quick connect-and-close up front: fails fast with one clear error
-     * message (and creates the schema as a side effect of pg_store_open)
-     * before spawning bulk_ingest_tsv()'s worker threads, rather than
-     * having every worker independently discover the database is
-     * unreachable. */
+    /* Probe connect first: fail fast before spawning workers, not once per worker. */
     PgStore *probe_store = pg_store_open(g_db_conninfo);
     if (probe_store == NULL) {
         fprintf(stderr, "lexis: failed to open index at %s\n", LEXIS_DB_LABEL);
@@ -124,12 +74,10 @@ static int run_bulk_ingest(const char *tsv_path) {
     pg_store_close(probe_store);
 
     struct timespec start, end;
-    /* Experiment overrides for retrieval tuning sweeps (see TESTING.md).
-     * Unset = the shipped defaults; a huge LEXIS_CHUNK_SIZE ingests each
-     * document as one passage (how published BEIR baselines index
-     * short-document corpora). */
-    size_t chunk_size = LEXIS_CHUNK_SIZE;
-    size_t chunk_overlap = LEXIS_CHUNK_OVERLAP;
+    /* Config first, tuning-sweep env wins (see docs/configuration.md). Huge chunk size = one passage per doc. */
+    size_t chunk_size = config_load_chunk_size(lexis_paths_config_file());
+    size_t chunk_overlap = config_load_chunk_overlap(lexis_paths_config_file());
+    int ingest_threads = config_load_ingest_threads(lexis_paths_config_file());
     const char *chunk_env = getenv("LEXIS_CHUNK_SIZE");
     const char *overlap_env = getenv("LEXIS_CHUNK_OVERLAP");
     if (chunk_env != NULL && atol(chunk_env) > 0) {
@@ -141,7 +89,7 @@ static int run_bulk_ingest(const char *tsv_path) {
 
     clock_gettime(CLOCK_MONOTONIC, &start);
     long passages = bulk_ingest_tsv(g_db_conninfo, NULL, stopwords, wordnet, lemmatizer, tsv_path,
-                                     chunk_size, chunk_overlap, LEXIS_INGEST_THREADS);
+                                     chunk_size, chunk_overlap, ingest_threads);
     clock_gettime(CLOCK_MONOTONIC, &end);
 
     int exit_code = 0;
@@ -149,9 +97,9 @@ static int run_bulk_ingest(const char *tsv_path) {
         fprintf(stderr, "lexis: failed to bulk-ingest %s\n", tsv_path);
         exit_code = 1;
     } else {
-        long ms = elapsed_ms(start, end);
+        long ms = lexis_elapsed_ms(start, end);
         printf("Ingested %ld passages from %s into %s in %ldms (%d threads, %.1f passages/sec)\n",
-               passages, tsv_path, LEXIS_DB_LABEL, ms, LEXIS_INGEST_THREADS,
+               passages, tsv_path, LEXIS_DB_LABEL, ms, ingest_threads,
                ms > 0 ? (double)passages / ((double)ms / 1000.0) : 0.0);
     }
 
@@ -184,12 +132,7 @@ static int run_query(const char *question) {
         return 1;
     }
 
-    /* Pipeline logging is only active in testing mode (config/lexis.conf)
-     * -- in production mode query_id stays -1 and every query_log_* call
-     * below is skipped, the same way it already would be if logging had
-     * failed to initialize. Measured overhead is small (~2.5ms p50 on top
-     * of a ~5ms bare BM25 search, see LIMITATIONS.md) but production
-     * traffic shouldn't have to pay it just so testing can observe it. */
+    /* Logging only in testing mode (query_id -1 skips it); spares production the ~2.5ms overhead. */
     LexisMode mode = config_load_mode(lexis_paths_config_file());
     if (mode == LEXIS_MODE_TESTING && query_log_init_schema(store) != 0) {
         fprintf(stderr, "lexis: warning: pipeline logging unavailable, continuing without it\n");
@@ -215,12 +158,7 @@ static int run_query(const char *question) {
     struct timespec pipeline_start, pipeline_end;
     clock_gettime(CLOCK_MONOTONIC, &pipeline_start);
 
-    /* The whole retrieval pipeline -- terms, sense-filtered expansion,
-     * weighted+coordinated BM25, trim -- is ONE shared call
-     * (src/core/retrieval.c), the same one the app's QueryWorker and
-     * eval.c run. This function only owns what is CLI-specific:
-     * printing, query_log observability (read from the run's artifacts,
-     * not re-derived), and single-turn generation. */
+    /* One shared retrieval_run() call (same as app/eval); here owns only printing, logging, generation. */
     RetrievalPolicy policy = retrieval_default_policy();
     RetrievalRun *run =
         retrieval_run(store, question, NULL, stopwords, wordnet, lemmatizer, &policy);
@@ -256,7 +194,7 @@ static int run_query(const char *question) {
 
         if (query_id != -1) {
             int64_t search_run_id = query_log_insert_search_run(
-                store, query_id, LEXIS_SEARCH_MAX_PASSAGES, (int)results->count, run->search_ms);
+                store, query_id, (int)policy.max_passages, (int)results->count, run->search_ms);
             if (search_run_id != -1) {
                 for (size_t i = 0; i < results->count; i++) {
                     query_log_insert_search_result(store, search_run_id, (int)i + 1,
@@ -295,9 +233,7 @@ static int run_query(const char *question) {
         if (mode == LEXIS_MODE_TESTING && gen_prompt != NULL) {
             printf("--- Generation prompt ---\n%s\n--- End generation prompt ---\n\n", gen_prompt);
         }
-        /* Zero history turns: the history-aware generator degrades to
-         * exactly the single-turn behavior (see generation.h) -- one
-         * generation entry point for the CLI and the app alike. */
+        /* Zero turns = single-turn behavior; one generation entry point for CLI and app. */
         char *answer = generation_generate_answer_with_history(question, store, results, NULL, 0, -1);
         clock_gettime(CLOCK_MONOTONIC, &gen_end);
         retrieval_run_free(run);
@@ -305,7 +241,7 @@ static int run_query(const char *question) {
         if (query_id != -1) {
             query_log_insert_generation_run(store, query_id, model_path, passages_included,
                                              passages_skipped, gen_prompt, answer, answer != NULL,
-                                             elapsed_ms(gen_start, gen_end));
+                                             lexis_elapsed_ms(gen_start, gen_end));
         }
         free(gen_prompt);
 
@@ -323,7 +259,7 @@ static int run_query(const char *question) {
 cleanup:
     clock_gettime(CLOCK_MONOTONIC, &pipeline_end);
     if (query_id != -1) {
-        query_log_finish_query(store, query_id, elapsed_ms(pipeline_start, pipeline_end),
+        query_log_finish_query(store, query_id, lexis_elapsed_ms(pipeline_start, pipeline_end),
                                 pipeline_succeeded);
     }
     local_llm_client_cleanup();
@@ -358,15 +294,7 @@ static int run_eval(const char *queries_path, const char *qrels_path, int use_ll
         return 1;
     }
 
-    /* eval_run() only exercises query formulation (WordNet expansion +
-     * local-model term selection), never generation_generate_answer() --
-     * MRR@10/Recall@K don't depend on what the large model says about
-     * the results. With use_llm_expansion, still needs the local model
-     * loaded exactly once here, up front, for the same reason main.c's
-     * other modes do: a fresh process-per-query would pay the ~9-19s
-     * model-load cost thousands of times over (see LIMITATIONS.md).
-     * Without it, query_formulation_terms_only() never calls the model
-     * at all -- skip paying that load cost for nothing. */
+    /* Eval scores formulation only, never generation; loads model once up front iff expansion is on. */
     if (use_llm_expansion) {
         char *model_path = config_load_model_path(lexis_paths_config_file());
         if (model_path == NULL || local_llm_client_init(model_path) != 0) {
@@ -393,7 +321,7 @@ static int run_eval(const char *queries_path, const char *qrels_path, int use_ll
         fprintf(stderr, "lexis: eval failed\n");
         exit_code = 1;
     } else {
-        long ms = elapsed_ms(start, end);
+        long ms = lexis_elapsed_ms(start, end);
         printf("\n=== Eval complete ===\n");
         printf("Queries evaluated: %ld (skipped %ld with no qrels judgments)\n",
                metrics.queries_evaluated, metrics.queries_skipped);

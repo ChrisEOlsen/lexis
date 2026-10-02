@@ -1,9 +1,4 @@
-/*
- * Tests for src/core/wordnet.c — parsing WordNet's data.<pos> line
- * format. Fixtures below are real lines copied verbatim from the
- * official WordNet 3.0 database files (data.noun), not fabricated, so
- * expected values are hand-verified against the actual file content.
- */
+/* Tests for wordnet.c; fixtures are real WordNet 3.0 data.noun lines. */
 
 #include "wordnet.h"
 #include "test_utils.h"
@@ -47,14 +42,8 @@ static void test_parse_entity_root_synset(void) {
     wordnet_synset_free(synset);
 }
 
-/* "object, physical_object" -- w_cnt=02 (hex) -> 2 words. p_cnt=039
- * (decimal 39): 1 hypernym ('@'), 1 derivationally-related-form ('+',
- * ignored -- not synonym/hypernym/hyponym), and 37 hyponyms ('~'). This
- * is also the case that proves w_cnt is genuinely read as hex, not
- * decimal -- if it were misread as decimal "02" the result is the same
- * value here (2), so this alone wouldn't catch a hex/decimal mixup; the
- * real proof is that decimal p_cnt=039 correctly yields 39 total
- * pointers (1+1+37), not a different count a base-mismatch would produce. */
+/* "object": 2 words, 1 hypernym, 1 ignored '+' pointer, 37 hyponyms.
+ * Decimal p_cnt=039 proves the base handling. */
 static void test_parse_object_synset_realistic_pointer_mix(void) {
     const char *line =
         "00002684 03 n 02 object 0 physical_object 0 039 "
@@ -108,12 +97,7 @@ static void test_synset_free_null_is_safe(void) {
     wordnet_synset_free(NULL);
 }
 
-/* Synthetic but format-valid (not copied from the real file, unlike the
- * fixtures above) -- exercises p_cnt=0, the one path the two real
- * fixtures above never hit: hypernym_offsets/hyponym_offsets are never
- * malloc'd at all when there are zero pointers (see the `pointer_count >
- * 0` guard in wordnet_parse_data_line), so both should come back NULL,
- * not just empty. */
+/* Synthetic p_cnt=0 case: offsets must be NULL, not just empty. */
 static void test_parse_zero_pointers_synset(void) {
     const char *line = "00000500 03 n 01 testword 0 000 | a test entry with no pointers";
 
@@ -129,11 +113,7 @@ static void test_parse_zero_pointers_synset(void) {
     wordnet_synset_free(synset);
 }
 
-/* Writes the two real fixture lines (entity=1740, object=2684) plus the
- * synthetic zero-pointer one (testword=500), deliberately out of offset
- * order, with a fake copyright-style header line (leading space) and a
- * blank line mixed in -- to prove wordnet_load_data_file both sorts
- * correctly and skips exactly the lines it should. */
+/* Out-of-order fixtures with header/blank lines; loader must sort and skip. */
 static void write_test_data_file(void) {
     FILE *fp = fopen(TEST_DATA_FILE_PATH, "wb");
     const char *content =
@@ -188,9 +168,7 @@ static void test_synset_index_free_null_is_safe(void) {
     wordnet_synset_index_free(NULL);
 }
 
-/* "entity" -- real line from index.noun. synset_cnt=1, p_cnt=1 ('~'),
- * sense_cnt=1, tagsense_cnt=1, one trailing offset: 1740. Matches the
- * single synset "entity" belongs to in data.noun above. */
+/* Real index.noun "entity" line: 1 sense, 1 offset (1740). */
 static void test_parse_index_entity(void) {
     const char *line = "entity n 1 1 ~ 1 1 00001740";
 
@@ -204,12 +182,7 @@ static void test_parse_index_entity(void) {
     wordnet_index_entry_free(entry);
 }
 
-/* "dog" -- real line from index.noun. synset_cnt=7, p_cnt=5 (five
- * distinct pointer symbols used across dog's senses: @ ~ #m #p %p),
- * sense_cnt=7, tagsense_cnt=1, seven trailing offsets. This is the case
- * that actually proves p_cnt pointer symbols get consumed and skipped
- * correctly -- with only one pointer symbol (like "entity" above) a
- * miscounted skip could still coincidentally land on the right field. */
+/* Real "dog" line: 7 senses; proves multi-symbol p_cnt skip. */
 static void test_parse_index_dog_multiple_senses(void) {
     const char *line = "dog n 7 5 @ ~ #m #p %p 7 1 02084071 10114209 10023039 09886220 07676602 03901548 02710044";
 
@@ -242,9 +215,7 @@ static void test_index_entry_free_null_is_safe(void) {
     wordnet_index_entry_free(NULL);
 }
 
-/* Same two real fixtures as above, deliberately out of alphabetical
- * order, plus a fake header line and a blank line -- proves sorting and
- * line-skipping both work for the index file loader too. */
+/* Out-of-order fixtures with header/blank lines; same sort/skip check. */
 static void write_test_index_file(void) {
     FILE *fp = fopen(TEST_INDEX_FILE_PATH, "wb");
     const char *content =
@@ -264,7 +235,6 @@ static void test_load_index_file_parses_sorts_and_skips(void) {
     TEST_ASSERT(index->count == 2, "expected 2 entries (header/blank lines skipped), got %zu",
                 index->count);
 
-    /* Alphabetical: "dog" sorts before "entity". */
     TEST_ASSERT_STR_EQ(index->entries[0]->lemma, "dog");
     TEST_ASSERT_STR_EQ(index->entries[1]->lemma, "entity");
 
@@ -302,9 +272,7 @@ static void write_file_at(const char *path, const char *content) {
     fclose(fp);
 }
 
-/* A minimal, synthetic (not real-data) index/data file pair for one part
- * of speech: "testword" belongs to one synset containing one other word,
- * `synonym`. */
+/* Minimal synthetic index/data pair: "testword" with one synonym. */
 static void write_minimal_pos_fixture(const char *dir, const char *suffix, const char *synonym) {
     char path[512];
 
@@ -318,9 +286,7 @@ static void write_minimal_pos_fixture(const char *dir, const char *suffix, const
     write_file_at(path, data_content);
 }
 
-/* An empty-but-valid pair (header-only, no real entries) -- needed
- * because wordnet_table_load() always loads all four parts of speech;
- * this fixture is used for the two POS that shouldn't contribute data. */
+/* Empty-but-valid pair for POS with no data (loader always loads all four). */
 static void write_empty_pos_fixture(const char *dir, const char *suffix) {
     char path[512];
     snprintf(path, sizeof(path), "%s/index.%s", dir, suffix);
@@ -329,12 +295,7 @@ static void write_empty_pos_fixture(const char *dir, const char *suffix) {
     write_file_at(path, "  header only, no real entries\n");
 }
 
-/* Proves cross-POS merging: "testword" appears as both a noun (synonym
- * "nounsynonym") and a verb (synonym "verbsynonym") in this synthetic
- * fixture -- a real lookup should return BOTH, merged into one entry,
- * not two separate results or just the last one loaded. This is the
- * design decision confirmed earlier: flat, merged, deduplicated across
- * every sense AND every part of speech. */
+/* Cross-POS fixture: noun + verb senses must merge into one entry. */
 static void test_table_load_merges_across_parts_of_speech(void) {
     mkdir(TEST_TABLE_DIR, 0755);
     write_minimal_pos_fixture(TEST_TABLE_DIR, "noun", "nounsynonym");
@@ -386,13 +347,7 @@ static void test_table_free_null_is_safe(void) {
     wordnet_table_free(NULL);
 }
 
-/* End-to-end against the real, full WordNet data committed in
- * data/wordnet/ -- not a synthetic fixture. "hypertension" is the
- * spec's own justifying example (5.2.3): "'Hypertension' and 'high
- * blood pressure' are semantically identical but lexically different."
- * If this doesn't come back, the whole point of building this module
- * hasn't actually been achieved regardless of what the unit tests above
- * say. */
+/* End-to-end on real data/wordnet: hypertension must yield high_blood_pressure (spec 5.2.3). */
 static void test_table_load_real_data_hypertension_example(void) {
     WordNetTable *table = wordnet_table_load("data/wordnet");
     TEST_ASSERT(table != NULL, "expected wordnet_table_load to succeed against real data");
@@ -409,8 +364,7 @@ static void test_table_load_real_data_hypertension_example(void) {
     TEST_ASSERT(found_high_blood_pressure,
                 "expected \"high_blood_pressure\" among hypertension's synonyms -- the spec's own example");
 
-    /* "entity" is the root of the noun hierarchy -- it must have zero
-     * hypernyms (nothing is broader than it) but real hyponyms. */
+    /* "entity" is the noun root: 0 hypernyms, real hyponyms. */
     const WordNetLookupResult *entity = wordnet_lookup(table, "entity");
     TEST_ASSERT(entity != NULL, "expected to find \"entity\"");
     TEST_ASSERT(entity->hypernyms->count == 0, "expected \"entity\" to have 0 hypernyms (it's the root), got %zu",

@@ -1,7 +1,4 @@
-/*
- * Implementation of the optional embedding reranker.
- * See include/reranker.h for the module's role.
- */
+/* Optional embedding reranker; see reranker.h. */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -13,9 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* bge-v1.5 models want this prefix on the QUERY side only (passages are
- * embedded bare) -- it is part of how the model was trained, not
- * decoration. */
+/* bge-v1.5 requires this prefix on queries only (passages bare); part of training. */
 #define RERANKER_QUERY_PREFIX "Represent this sentence for searching relevant passages: "
 
 #define RERANKER_N_CTX 512
@@ -35,9 +30,7 @@ int reranker_init(const char *model_path) {
         return 0;
     }
 
-    /* Idempotent; needed because this module can be the FIRST llama.cpp
-     * user in a process (eval --no-llm-expansion never loads the chat
-     * model, and that path is exactly how the reranker gets measured). */
+    /* Idempotent; this module can be the first llama.cpp user (eval --no-llm-expansion). */
     llama_backend_init();
 
     struct llama_model_params mparams = llama_model_default_params();
@@ -64,13 +57,7 @@ int reranker_init(const char *model_path) {
     }
     g_vocab = llama_model_get_vocab(g_model);
     g_n_embd = llama_model_n_embd(g_model);
-    /* Metal contexts left alive at process exit crash in dyld teardown
-     * (observed: a binary that loads this model, prints results, then
-     * exits dies AFTER its last line of output -- which made the test
-     * suite's runner read a passing binary as failed). The chat model
-     * avoids this because its callers run local_llm_client_cleanup();
-     * this module is loaded lazily by whoever retrieves first, so it
-     * cleans itself up. */
+    /* atexit cleanup: Metal contexts alive at exit crash dyld teardown (read as test failure). */
     atexit(reranker_cleanup);
     return 0;
 }
@@ -88,16 +75,13 @@ void reranker_cleanup(void) {
     g_n_embd = 0;
 }
 
-/* Embeds one text into `out` (g_n_embd floats, L2-normalized so cosine
- * is a plain dot product). 0 on success. */
+/* Embed text into out (L2-normalized, so cosine is dot). 0 ok. */
 static int embed_text(const char *text, float *out) {
     llama_token tokens[RERANKER_N_CTX];
     int n_tokens = llama_tokenize(g_vocab, text, (int32_t)strlen(text), tokens, RERANKER_N_CTX,
                                   /*add_special=*/true, /*parse_special=*/false);
     if (n_tokens < 0) {
-        /* Text longer than the window: llama_tokenize reports the needed
-         * count as negative. Re-tokenize truncated -- embedding the
-         * passage's head is fine for similarity purposes. */
+        /* Over-long text: negative count means truncate; head suffices for similarity. */
         n_tokens = llama_tokenize(g_vocab, text, (int32_t)strlen(text), tokens, RERANKER_N_CTX,
                                   true, false);
         if (n_tokens < 0) {
@@ -180,8 +164,7 @@ int reranker_rescore(PgStore *store, const char *query_text, BM25ResultSet *set)
     for (size_t i = 0; i < set->count; i++) {
         PgStorePassage *passage = pg_store_get_passage(store, set->items[i].passage_id);
         if (passage == NULL) {
-            /* Unfetchable passage: worst cosine, keeps its BM25 standing
-             * only through the fusion's BM25 half. */
+            /* Unfetchable: worst cosine, keeps only its BM25 fusion half. */
             entries[i].index = i;
             entries[i].cosine = -1.0;
             continue;
@@ -199,9 +182,7 @@ int reranker_rescore(PgStore *store, const char *query_text, BM25ResultSet *set)
         entries[i].cosine = cosine;
     }
 
-    /* Reciprocal-rank fusion: rank-based, so BM25's unbounded scores and
-     * cosine's [-1,1] never need to share a scale. items[] is already in
-     * BM25 rank order, so bm25_rank(i) == i. */
+    /* Reciprocal-rank fusion avoids mixing BM25 and cosine scales; items[] already BM25-ordered. */
     qsort(entries, set->count, sizeof(RerankEntry), compare_cosine_desc);
     double *fused = malloc(set->count * sizeof(double));
     if (fused == NULL) {

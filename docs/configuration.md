@@ -36,6 +36,29 @@ is in git.
 step (prompts, responses, timings) to the database for debugging;
 production skips that logging.
 
+**`chunk_size`**, **`chunk_overlap`** -- ingestion chunking in words
+(defaults 200/40). Overlap 0 means no overlap; a huge chunk size
+yields one passage per document. Changing these only affects the next
+`bulk-ingest` (already-indexed passages keep their old chunking).
+
+**`ingest_threads`** -- bulk-ingest worker threads (default 6).
+
+**`candidate_ceiling`** -- how deep BM25 ranks before the trim
+(default 40).
+
+**`max_passages`** -- trimmed passages handed to the answer step
+(default 12).
+
+**`token_budget`** -- trim cap on passage tokens sent to the model
+(default 1500).
+
+**`score_floor_ratio`** -- drop passages scoring below this fraction
+of the top score (default 0.6; 0.0 disables the floor).
+
+**`bm25_k1`**, **`bm25_b`** -- BM25's ranking constants, TF
+saturation and length norm (defaults 1.2/0.75, which beat the common
+alternatives in our sweeps).
+
 `thinking` and the reranker are settable from the app's Settings panel
 and apply immediately -- except while a question is being answered, when
 both switches are disabled: the reranker's live gate is read by the
@@ -45,14 +68,14 @@ changing those by hand.
 
 ## Environment overrides (tuning experiments only)
 
-These exist so retrieval experiments don't need rebuilds. Leave them
-unset in normal use.
+Precedence everywhere: env var wins over this file, this file wins
+over the compiled default. These exist so experiments don't need
+rebuilds (or config edits). Leave them unset in normal use.
 
 - `LEXIS_CHUNK_SIZE`, `LEXIS_CHUNK_OVERLAP` -- ingestion chunking
-  (defaults 200/40).
+  (over `chunk_size` / `chunk_overlap`).
 - `LEXIS_BM25_K1`, `LEXIS_BM25_B` -- BM25's two ranking constants
-  (defaults 1.2/0.75, which beat the common alternatives in our
-  sweeps).
+  (over `bm25_k1` / `bm25_b`).
 
 ## Models and data on disk
 

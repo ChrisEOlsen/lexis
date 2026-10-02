@@ -1,7 +1,4 @@
-/*
- * Implementation of the growable string buffer.
- * See include/string_builder.h for the module's role.
- */
+/* Growable string buffer; see string_builder.h. */
 
 #include "string_builder.h"
 

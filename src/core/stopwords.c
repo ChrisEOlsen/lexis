@@ -1,10 +1,6 @@
-/*
- * Implementation of stopword filtering.
- * See include/stopwords.h for the module's role (spec 5.2.1, Stage 1).
- */
+/* Stopword filtering (spec 5.2.1, Stage 1); see stopwords.h. */
 
-/* See tokenizer.c for why this must come before any #include (strdup is
- * a POSIX extension hidden by glibc under strict -std=c11 otherwise). */
+/* Before any #include: exposes strdup under strict -std=c11 (see tokenizer.c). */
 #define _POSIX_C_SOURCE 200809L
 
 #include "stopwords.h"
@@ -15,14 +11,10 @@
 
 #define STOPWORD_SET_INITIAL_CAPACITY 8
 
-/* Longest line stopword_set_load() will read per word. Generous relative
- * to the longest real entry ("yourselves", 11 chars) plus newline/NUL. */
+/* Per-word read cap; generous vs longest real entry ("yourselves", 11 chars). */
 #define STOPWORD_LINE_BUFFER_SIZE 64
 
-/* qsort()/bsearch() require this exact (const void *, const void *)
- * signature — strcmp's (const char *, const char *) doesn't match, so
- * this wrapper casts each element (a char **, since we're sorting an
- * array of char *) back to the real type before comparing. */
+/* qsort/bsearch comparator: strcmp needs this signature; elements are char**. */
 static int compare_words(const void *a, const void *b) {
     const char *word_a = *(const char *const *)a;
     const char *word_b = *(const char *const *)b;
@@ -54,17 +46,10 @@ StopwordSet *stopword_set_load(const char *path) {
     while (fgets(line, sizeof(line), file) != NULL) {
         size_t len = strlen(line);
 
-        /* fgets() stops at sizeof(line)-1 bytes if it hasn't hit a '\n'
-         * yet — true for the file's long prose comment lines, which are
-         * well over STOPWORD_LINE_BUFFER_SIZE. Without this check, the
-         * next fgets() call would resume mid-line and read the back half
-         * of that comment as if it were a fresh line (no longer starting
-         * with '#'), silently adding it as a bogus "word". Detect that
-         * case and consume the rest of the physical line here instead. */
+        /* Truncated long comment line: consume the rest so its back half isn't read as a word. */
         if (len == sizeof(line) - 1 && line[len - 1] != '\n') {
             int c;
             while ((c = fgetc(file)) != '\n' && c != EOF) {
-                /* discard remainder of the truncated line */
             }
         }
 
@@ -114,9 +99,7 @@ void stopword_set_free(StopwordSet *set) {
 }
 
 int stopword_set_contains(const StopwordSet *set, const char *word) {
-    /* bsearch's key must be the same type as an array element (char *),
-     * so we pass the address of `word` itself — a char** — not `word`.
-     * compare_words then casts both sides back and strcmp()s them. */
+    /* Key must be char** like elements, so pass &word. */
     return bsearch(&word, set->words, set->count, sizeof(char *),
                    compare_words) != NULL;
 }

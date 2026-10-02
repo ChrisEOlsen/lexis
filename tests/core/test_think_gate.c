@@ -1,27 +1,9 @@
-/*
- * Tests for local_llm_client.c's streaming think gate: the bytes handed
- * to a streaming callback must equal what strip_leading_think_block()
- * leaves in the returned answer -- exactly, byte for byte. That is the
- * promise local_llm_client.h makes to QueryWorker, and the reason the
- * app can show streamed text and then swap in the final answer without
- * anything visibly changing.
- *
- * The gate is static, so this file #includes the translation unit under
- * test and drives think_gate_feed() piece by piece with no model loaded
- * (test_stream_identity.c covers the real model, and cannot run in
- * `make check`). The Makefile's rule for this binary therefore links
- * every CORE_SRCS file EXCEPT local_llm_client.c -- it is compiled here,
- * as part of this file.
- *
- * Each case lists the pieces a decode loop would emit; the expectation
- * is always the same and is never written out by hand: whatever
- * strip_leading_think_block() makes of the concatenated pieces.
- */
+/* Tests for the streaming think gate: streamed bytes must equal strip_leading_think_block().
+ * Drives think_gate_feed() with no model via local_llm_client_test.h hooks. */
 
 #include "test_utils.h"
 
-/* Relative to this file, not an -I path: the .c, not the header. */
-#include "../../src/core/local_llm_client.c"
+#include "local_llm_client_test.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -57,8 +39,7 @@ static void gate_init(ThinkGate *gate) {
     gate->held.capacity = 0;
 }
 
-/* Feeds `pieces` through the gate and asserts the streamed bytes equal
- * the stripped whole reply. */
+/* Feed pieces through the gate; streamed bytes must equal the stripped reply. */
 static void check_matches_strip(const char *name, const char *const *pieces, size_t count) {
     ThinkGate gate;
     gate_init(&gate);
@@ -80,8 +61,7 @@ static void check_matches_strip(const char *name, const char *const *pieces, siz
 }
 
 static void test_close_marker_ends_a_piece(void) {
-    /* The whitespace run after </think> arrives in the NEXT piece. The
-     * non-streaming strip eats it, so the gate has to as well. */
+    /* Trailing whitespace in the next piece must be eaten too. */
     static const char *const pieces[] = {"<think>", "reasoning here", "</think>", "\n\n", "The answer."};
     check_matches_strip("close marker ends a piece", pieces, 5);
 }
@@ -97,8 +77,7 @@ static void test_close_and_whitespace_in_one_piece(void) {
 }
 
 static void test_whole_reply_in_one_piece(void) {
-    /* Open and close in the same piece: the gate must scan for the close
-     * marker in the piece that opened the block, not wait for another. */
+    /* Open and close in one piece must still scan for the close marker. */
     static const char *const pieces[] = {"<think>reasoning</think>\n\nThe answer."};
     check_matches_strip("whole reply in one piece", pieces, 1);
 }
@@ -114,15 +93,13 @@ static void test_ordinary_answer_streams_unchanged(void) {
 }
 
 static void test_answer_opening_with_a_lookalike(void) {
-    /* Shares a prefix with "<think>" but diverges: everything held has
-     * to be released once the marker is ruled out. */
+    /* Lookalike prefix ruled out: held bytes must be released. */
     static const char *const pieces[] = {"<thi", "ngs like this>", " are not think blocks."};
     check_matches_strip("answer that looks like a marker at first", pieces, 3);
 }
 
 static void test_opened_but_never_closed(void) {
-    /* Truncated mid-thought: both paths leave it visible rather than
-     * turning a truncation into a plausible-looking empty answer. */
+    /* Truncated mid-thought stays visible, not silently emptied. */
     static const char *const pieces[] = {"<think>", "truncated mid-thought"};
     check_matches_strip("opened but never closed", pieces, 2);
 }
@@ -133,8 +110,7 @@ static void test_gemma_markers(void) {
 }
 
 static void test_leading_whitespace_in_an_ordinary_answer_is_kept(void) {
-    /* No think block means no skipping: the gate must not eat leading
-     * whitespace the returned answer still has. */
+    /* No think block means leading whitespace is kept. */
     static const char *const pieces[] = {"\n", "  Answer with leading whitespace."};
     check_matches_strip("ordinary answer keeps its leading whitespace", pieces, 2);
 }

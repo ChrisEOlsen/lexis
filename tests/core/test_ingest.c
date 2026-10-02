@@ -1,10 +1,4 @@
-/*
- * Tests for src/core/ingest.c — reading, splitting, chunking, and
- * lemmatizing a document's text, the primitives bulk_ingest.c's Phase 2
- * worker builds on. No database or WordNet-backed lemmatizer tests here
- * (ingest_lemmatize_terms/ingest_count_distinct_terms are exercised
- * indirectly via test_bulk_ingest.c's real end-to-end tests instead).
- */
+/* Tests for ingest.c: read/split/chunk primitives for bulk_ingest Phase 2. */
 
 #include "ingest.h"
 #include "test_utils.h"
@@ -59,8 +53,7 @@ static void test_split_words_basic(void) {
 }
 
 static void test_split_words_keeps_punctuation_attached(void) {
-    /* Unlike tokenize(), this must NOT strip punctuation or lowercase --
-     * that's the whole point of a separate raw word-splitter for chunking. */
+    /* Unlike tokenize(), keeps punctuation and case. */
     TokenList *words = ingest_split_words("Hypertension, treatment.");
     TEST_ASSERT(words != NULL, "expected ingest_split_words to succeed");
     TEST_ASSERT(words->count == 2, "expected 2 words, got %zu", words->count);
@@ -151,9 +144,7 @@ static void test_chunk_words_overlapping_windows(void) {
     TokenList *words = ingest_split_words("one two three four five six seven eight nine ten");
     TEST_ASSERT(words != NULL, "expected ingest_split_words to succeed");
 
-    /* chunk_size=5, overlap=2 -> step=3. 10 words should produce exactly 3
-     * chunks, the last one naturally shorter -- no degenerate 4th chunk
-     * covering only already-seen tail words. */
+    /* chunk_size=5, overlap=2: 10 words must yield exactly 3 chunks. */
     TokenList *chunks = ingest_chunk_words(words, 5, 2);
     TEST_ASSERT(chunks != NULL, "expected ingest_chunk_words to succeed");
     TEST_ASSERT(chunks->count == 3, "expected 3 chunks, got %zu", chunks->count);
@@ -169,8 +160,7 @@ static void test_chunk_words_short_document_single_chunk(void) {
     TokenList *words = ingest_split_words("just a few words");
     TEST_ASSERT(words != NULL, "expected ingest_split_words to succeed");
 
-    /* Only 4 words, chunk_size=5 -- should produce exactly 1 chunk
-     * containing everything, not an empty or truncated result. */
+    /* 4 words, chunk_size=5: exactly 1 chunk with everything. */
     TokenList *chunks = ingest_chunk_words(words, 5, 2);
     TEST_ASSERT(chunks != NULL, "expected ingest_chunk_words to succeed");
     TEST_ASSERT(chunks->count == 1, "expected 1 chunk, got %zu", chunks->count);

@@ -1,10 +1,4 @@
-/*
- * Tests for src/core/pg_store.c — PgStore lifecycle and the passage/term/
- * posting write path against a real Postgres instance (the native
- * install, port 5434 -- `make pg-start` must be running for these to
- * pass). TRUNCATE resets state between tests, since there's no file to
- * delete the way the SQLite version's tests worked.
- */
+/* Tests for pg_store.c against native Postgres (port 5434; `make pg-start` first). */
 
 #include "pg_store.h"
 #include "test_utils.h"
@@ -20,23 +14,13 @@ static PgStore *open_fresh_store(void) {
     if (store == NULL) {
         return NULL;
     }
-    /* Dependency order: postings references both other tables. documents
-     * has no FK relationship to any of them (see pg_store.c's schema
-     * comment -- it's an independent original-text record, not part of
-     * the passages/terms/postings graph), but still needs truncating so
-     * fixed document_names reused across test runs don't collide with
-     * documents.document_name's PRIMARY KEY. */
+    /* documents has no FK but shares reused names, so truncate it too (see pg_store.c). */
     PGresult *res = PQexec(store->conn, "TRUNCATE postings, terms, passages, documents RESTART IDENTITY CASCADE;");
     PQclear(res);
     return store;
 }
 
-/* Drops every schema a prior test run registered (in case a prior run
- * crashed mid-test and left one behind -- CREATE SCHEMA would otherwise
- * collide with it) and empties the registry itself, so every corpus test
- * starts from a genuinely clean slate regardless of what earlier runs
- * left behind. Tolerates public.corpora not existing yet (first-ever
- * run) -- both queries just no-op in that case. */
+/* Drop leftover corpus schemas and empty the registry; tolerates missing public.corpora. */
 static void reset_corpora_registry(PgStore *store) {
     PGresult *res = PQexec(store->conn, "SELECT schema_name FROM public.corpora;");
     if (PQresultStatus(res) == PGRES_TUPLES_OK) {
@@ -152,9 +136,7 @@ static void test_use_corpus_scopes_queries_to_chosen_corpus(void) {
     int64_t corpus_b = pg_store_create_corpus(store, "Group B", &schema_b);
     TEST_ASSERT(corpus_a > 0 && corpus_b > 0, "expected both corpora to be created");
 
-    /* Real, unmodified pg_store_insert_passage()/pg_store_get_passage()
-     * calls -- the whole point of search_path scoping is that these need
-     * zero corpus-awareness of their own to land in the right schema. */
+    /* Plain insert/get calls must land in the right schema via search_path alone. */
     TEST_ASSERT(pg_store_use_corpus(store, corpus_a) == 0, "expected use_corpus(A) to succeed");
     int64_t id_in_a = pg_store_insert_passage(store, "doc-a", 0, "text in A", 3);
     TEST_ASSERT(id_in_a == 1, "expected the first passage in a fresh corpus to get id 1, got %lld",
@@ -166,10 +148,7 @@ static void test_use_corpus_scopes_queries_to_chosen_corpus(void) {
                 "expected corpus B to have its own independent id sequence (also starting at 1), got %lld",
                 (long long)id_in_b);
 
-    /* id 1 exists in both schemas now, with different content -- proves
-     * they're genuinely separate tables, not a shared one filtered by
-     * search_path (search_path picks which table "passages" even means,
-     * it isn't a WHERE-clause-style filter). */
+    /* Same id, different content per schema proves separate tables, not a shared one. */
     PgStorePassage *passage_in_b = pg_store_get_passage(store, 1);
     TEST_ASSERT(passage_in_b != NULL, "expected id 1 to exist while scoped to corpus B");
     TEST_ASSERT_STR_EQ(passage_in_b->text, "text in B");
@@ -315,9 +294,7 @@ static void test_swap_corpus_schema_replaces_data_and_preserves_registry_identit
     TEST_ASSERT(pg_store_swap_corpus_schema(store, corpus_id, "corpus_swap_new") == 0,
                 "expected pg_store_swap_corpus_schema to succeed");
 
-    /* The registry's schema_name for this corpus_id must be completely
-     * unchanged -- the swap replaces what's PHYSICALLY behind that name,
-     * not the name itself. */
+    /* Swap replaces data behind the name, not the registry name itself. */
     size_t count = 0;
     PgStoreCorpus *corpora = pg_store_list_corpora(store, &count);
     TEST_ASSERT(count == 1, "expected exactly one corpus in the registry, got %zu", count);
@@ -332,8 +309,6 @@ static void test_swap_corpus_schema_replaces_data_and_preserves_registry_identit
     TEST_ASSERT_STR_EQ(docs[0].text, "new content");
     pg_store_documents_free(docs, doc_count);
 
-    /* corpus_swap_new was renamed away as part of the swap -- it
-     * shouldn't exist under that name anymore. */
     TEST_ASSERT(!schema_has_lexis_tables(store, "corpus_swap_new"),
                 "expected corpus_swap_new to no longer exist under that name");
 
@@ -428,8 +403,7 @@ static void test_insert_document_on_conflict_does_nothing(void) {
 
     TEST_ASSERT(pg_store_insert_document(store, "doc1.txt", "first version") == 0,
                 "expected the first insert to succeed");
-    /* Matches a Phase 2 batch retry re-processing the same document (see
-     * bulk_ingest.c) -- must not error, and must not overwrite. */
+    /* Phase 2 retry case (see bulk_ingest.c): must not error or overwrite. */
     TEST_ASSERT(pg_store_insert_document(store, "doc1.txt", "second version") == 0,
                 "expected a repeat insert of the same document_name to succeed (ON CONFLICT DO NOTHING)");
 
@@ -622,19 +596,12 @@ static void test_disable_synchronous_commit_succeeds(void) {
 }
 
 static void test_get_or_create_term_survives_concurrent_style_conflict(void) {
-    /* Simulates what two concurrent writer connections racing on the same
-     * new term would produce: an ON CONFLICT upsert from one connection
-     * while the term already exists must still return the *original* id,
-     * not create a duplicate row or error out -- the exact race the
-     * SQLite version's SELECT-then-INSERT couldn't close safely. */
+    /* Simulate concurrent writers racing on one new term; must return the original id. */
     PgStore *store = open_fresh_store();
     TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
     int64_t first = pg_store_get_or_create_term(store, "hypertension");
 
-    /* Directly exercise the same INSERT ... ON CONFLICT statement
-     * get_or_create_term uses internally, as if a second connection raced
-     * in after the term already existed. */
     const char *params[1] = {"hypertension"};
     PGresult *res = PQexecParams(store->conn,
                                   "INSERT INTO terms (term) VALUES ($1) "
@@ -685,8 +652,6 @@ static void test_get_or_create_terms_batch_handles_duplicates_in_input(void) {
     PgStore *store = open_fresh_store();
     TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
-    /* "treatment" appears twice in the same batch -- must resolve to the
-     * same id both times, and must not create two rows. */
     const char *terms[3] = {"treatment", "hypertension", "treatment"};
     int64_t *ids = pg_store_get_or_create_terms(store, terms, 3);
     TEST_ASSERT(ids != NULL, "expected batch resolve to succeed");
@@ -705,10 +670,7 @@ static void test_get_or_create_terms_batch_handles_special_characters(void) {
     PgStore *store = open_fresh_store();
     TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
-    /* Exercises the array-literal escaping path directly -- a comma is
-     * the array-element separator, so this term ("1,000", which the
-     * tokenizer's internal-connector-punctuation rule can legitimately
-     * produce) must round-trip intact, not get split into two elements. */
+    /* "1,000" (valid tokenizer output) must survive array-literal escaping intact. */
     const char *terms[2] = {"1,000", "normal"};
     int64_t *ids = pg_store_get_or_create_terms(store, terms, 2);
     TEST_ASSERT(ids != NULL, "expected batch resolve to succeed");
@@ -737,15 +699,11 @@ static void test_insert_postings_batch_zips_not_cross_products(void) {
     int result = pg_store_insert_postings(store, term_ids, passage_id, frequencies, 3, 3);
     TEST_ASSERT(result == 0, "expected batch posting insert to succeed");
 
-    /* If unnest() were a cross product instead of zipping element-wise,
-     * this would be 9 rows (3x3), not 3. */
     PGresult *res = PQexec(store->conn, "SELECT COUNT(*) FROM postings;");
     TEST_ASSERT(atoi(PQgetvalue(res, 0, 0)) == 3, "expected exactly 3 posting rows, got %s",
                 PQgetvalue(res, 0, 0));
     PQclear(res);
 
-    /* And each term_id must be paired with its OWN frequency, not a
-     * mismatched one. */
     for (int i = 0; i < 3; i++) {
         char term_id_str[32];
         snprintf(term_id_str, sizeof(term_id_str), "%lld", (long long)term_ids[i]);
@@ -770,9 +728,7 @@ static void test_get_document_names_batch_maps_in_order(void) {
     int64_t id_b = pg_store_insert_passage(store, "pid-200", 0, "beta text", 2);
     int64_t id_c = pg_store_insert_passage(store, "pid-300", 0, "gamma text", 2);
 
-    /* Deliberately out of insertion order, and repeats id_a -- the
-     * result must still line up index-for-index with the input, not
-     * insertion or database order. */
+    /* Out-of-order input with a repeat; output must match input order. */
     int64_t passage_ids[4] = {id_c, id_a, id_b, id_a};
     char **names = pg_store_get_document_names(store, passage_ids, 4);
     TEST_ASSERT(names != NULL, "expected batch lookup to succeed");
@@ -838,12 +794,7 @@ static void test_copy_documents_raw_loads_every_row(void) {
     TEST_ASSERT(pg_store_create_staging_tables(store) == 0, "expected staging table creation to succeed");
     TEST_ASSERT(pg_store_truncate_staging_tables(store) == 0, "expected truncate to succeed");
 
-    /* Real MS MARCO passages contain literal, unescaped backslashes
-     * (e.g. LaTeX-style "\displaystyle", "\%") and embedded double
-     * quotes/commas -- exactly what motivated CSV format over plain TSV
-     * in the first place (see SPEED.md). This fixture mirrors those
-     * cases directly: row 2 has a raw backslash, row 3 is CSV-quoted
-     * (embedded comma + doubled internal quote per RFC4180). */
+    /* Mirrors real MS MARCO cases: raw backslash, CSV-quoted comma/quotes (see dev/SPEED.md). */
     write_staging_csv("100\tplain text with no special characters\n"
                        "101\ttext with a literal \\backslash and \\% escape-looking sequence\n"
                        "102\t\"quoted, with a comma and a \"\"doubled\"\" quote\"\n");
@@ -877,9 +828,7 @@ static void test_get_raw_documents_range_returns_requested_rows(void) {
     int64_t rows_loaded = pg_store_copy_documents_raw(store, TEST_STAGING_CSV_PATH);
     TEST_ASSERT(rows_loaded == 5, "expected all 5 rows to load");
 
-    /* [2, 4) -- rows 2 and 3, exclusive of 4 -- exercises the exact
-     * half-open range convention Phase 2's worker partitioning relies
-     * on. */
+    /* Half-open [2,4): the range convention Phase 2 workers rely on. */
     size_t count = 0;
     PgStoreRawDocument *docs = pg_store_get_raw_documents_range(store, 2, 4, &count);
     TEST_ASSERT(docs != NULL, "expected range fetch to succeed");
@@ -892,9 +841,7 @@ static void test_get_raw_documents_range_returns_requested_rows(void) {
     TEST_ASSERT_STR_EQ(docs[1].text, "third");
     pg_store_raw_documents_free(docs, count);
 
-    /* A range that runs past the end of the table should just come back
-     * short, not error -- this is exactly what happens to whichever
-     * worker claims the last batch. */
+    /* Past-the-end ranges return short, not error (last worker batch case). */
     docs = pg_store_get_raw_documents_range(store, 4, 100, &count);
     TEST_ASSERT(docs != NULL, "expected a past-the-end range fetch to still succeed");
     TEST_ASSERT(count == 2, "expected only 2 rows (row_num 4 and 5) in a range that runs past the table's end");
@@ -939,18 +886,14 @@ static void test_finalize_terms_and_postings_resolves_and_dedups(void) {
     TEST_ASSERT(pg_store_create_staging_tables(store) == 0, "expected staging table creation to succeed");
     TEST_ASSERT(pg_store_truncate_staging_tables(store) == 0, "expected truncate to succeed");
 
-    /* A term ("existing") already resolved through the normal path
-     * before Phase 3 ever runs -- finalize must fold staged postings
-     * into its *existing* id via ON CONFLICT DO NOTHING, not create a
-     * second "existing" row. */
+    /* Finalize must fold into the pre-existing id, not create a second row. */
     int64_t existing_term_id = pg_store_get_or_create_term(store, "existing");
     TEST_ASSERT(existing_term_id != -1, "expected pre-existing term to be created");
 
     int64_t passage_a = pg_store_insert_passage(store, "pid-a", 0, "text a", 4);
     int64_t passage_b = pg_store_insert_passage(store, "pid-b", 0, "text b", 3);
 
-    /* "shared" appears in both passages -- must resolve to the SAME
-     * terms.id for both postings rows, not one each. */
+    /* "shared" in both passages must resolve to one terms.id. */
     const char *terms_a[2] = {"existing", "shared"};
     int freqs_a[2] = {1, 2};
     TEST_ASSERT(pg_store_insert_staged_postings(store, passage_a, terms_a, freqs_a, 4, 2) == 0,
@@ -991,13 +934,7 @@ static void test_finalize_terms_and_postings_resolves_and_dedups(void) {
     pg_store_close(store);
 }
 
-/* Scoped to the public schema specifically -- this file's tests now
- * create tables of the same name (postings, terms, ...) in many
- * different corpus schemas, so an unqualified "relname = $1" match
- * against pg_class can hit more than one row and silently break the
- * PQntuples(res) == 1 check below. Every caller of this helper operates
- * via open_fresh_store() (public, unconditionally), so this is the
- * correct scope, not just a narrower one. */
+/* Scoped to public: unqualified pg_class matches hit multiple corpus schemas. */
 static int table_persistence_is_unlogged(PgStore *store, const char *table_name) {
     const char *params[1] = {table_name};
     PGresult *res = PQexecParams(store->conn,
@@ -1011,11 +948,7 @@ static int table_persistence_is_unlogged(PgStore *store, const char *table_name)
 }
 
 static int postings_has_pk_and_fks(PgStore *store) {
-    /* Explicitly public.postings, not a bare 'postings'::regclass search-
-     * path lookup -- same reasoning as table_persistence_is_unlogged()
-     * above; this happened to still resolve correctly via search_path,
-     * but only by coincidence (no schema named after the connecting role
-     * exists), not by construction. */
+    /* Explicit public.postings, not a search_path lookup (see helper above). */
     PGresult *res = PQexec(store->conn,
                             "SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.postings'::regclass "
                             "AND contype IN ('p', 'f');");
@@ -1038,8 +971,7 @@ static void test_prepare_bulk_load_defers_constraints_and_durability(void) {
     TEST_ASSERT(table_persistence_is_unlogged(store, "postings"), "expected postings to be UNLOGGED");
     TEST_ASSERT(table_persistence_is_unlogged(store, "terms"), "expected terms to be UNLOGGED");
 
-    /* Idempotent: a prior crashed run may have already left things in
-     * exactly this state -- calling prepare again must not error. */
+    /* Idempotent: a crashed run may have left this state behind. */
     TEST_ASSERT(pg_store_prepare_bulk_load(store) == 0, "expected a second prepare_bulk_load to be a no-op");
 
     pg_store_close(store);
@@ -1049,9 +981,7 @@ static void test_finish_bulk_load_restores_constraints_and_durability_and_data_s
     PgStore *store = open_fresh_store();
     TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
 
-    /* Real data inserted BEFORE deferring constraints, exactly like a
-     * real bulk-ingest run -- proves the constraint drop/restore cycle
-     * doesn't lose or corrupt anything already written. */
+    /* Insert before deferring, like a real bulk run; data must survive the cycle. */
     int64_t term_id = pg_store_get_or_create_term(store, "hypertension");
     int64_t passage_id = pg_store_insert_passage(store, "pid-1", 0, "some text", 3);
     TEST_ASSERT(pg_store_insert_posting(store, term_id, passage_id, 2, 3) == 0,
@@ -1131,8 +1061,7 @@ static void test_get_document_passages_orders_and_round_trips(void) {
     PgStoreDocumentPassage *passages = pg_store_get_document_passages(store, "doc", &count);
     TEST_ASSERT(passages != NULL, "expected get_document_passages to succeed");
     TEST_ASSERT(count == 2, "expected 2 chunks for doc, got %zu", count);
-    /* Insertion order was chunk 1 then 0 -- the read must come back in
-     * chunk order regardless. */
+    /* Inserted 1 then 0; read must return chunk order. */
     TEST_ASSERT(passages[0].chunk_id == 0, "expected first row chunk_id 0, got %d", passages[0].chunk_id);
     TEST_ASSERT_STR_EQ(passages[0].text, "first chunk");
     TEST_ASSERT(passages[0].token_count == 3, "expected token_count 3, got %d", passages[0].token_count);
@@ -1151,9 +1080,7 @@ static void test_remove_document_full_transaction(void) {
     PgStore *store = open_fresh_store();
     TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
-    /* Two documents sharing a term, plus one term only the removed doc
-     * uses -- the shared term must survive, the exclusive one must be
-     * swept, and doc-b's rows must be untouched. */
+    /* Shared term must survive, exclusive term swept, doc-b untouched. */
     TEST_ASSERT(pg_store_insert_document(store, "doc-a", "text a") == 0, "expected doc-a insert");
     TEST_ASSERT(pg_store_insert_document(store, "doc-b", "text b") == 0, "expected doc-b insert");
     int64_t id_a0 = pg_store_insert_passage(store, "doc-a", 0, "shared rare exclusive", 3);

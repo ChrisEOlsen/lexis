@@ -1,17 +1,5 @@
 /*
- * One-shot headless group ingestion: create a group and ingest a
- * directory of .txt files into it through the exact pipeline the app's
- * IngestWorker runs (bulk_ingest_rebuild_corpus, chunk 200/overlap 40/
- * 6 threads -- keep in sync with IngestWorker.cpp's constants). Exists
- * so eval corpora (DelucionQA) can be (re)built on a fresh machine or
- * after a lemmatizer change without driving the GUI by hand.
- *
- * Usage: ingest_group "<display name>" <dir-of-txt-files>
- * Prints the new corpus id on success -- lexis_eval and
- * scripts/phase0_run.sh take it as their first argument.
- *
- * Build: same ad hoc clang invocation as scripts/phase0_run.sh uses for
- * phase0_retrieval.c (core sources + jinja_chat_template.o).
+ * Headless group ingest via the app's pipeline (keep chunk 200/40/6 in sync with IngestWorker.cpp).
  */
 
 #define _POSIX_C_SOURCE 200809L

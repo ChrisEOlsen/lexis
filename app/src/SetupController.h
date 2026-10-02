@@ -1,19 +1,5 @@
-// First-run model download. The bundle ships everything except the two
-// GGUF models (~5.1GB together -- far too big for a DMG); this object
-// backs the QML setup overlay that fetches them into
-// ~/Library/Application Support/LEXIS/models/ with progress and
-// resume.
-//
-// A QML singleton like AppController. In a dev build (or once both
-// model files exist) `required` is false and the overlay never shows.
-// main.cpp calls configure() before the QML engine loads so the
-// constructor knows whether it is in a bundle and where models go.
-//
-// Download sources: the chat model URL is derived from the config's
-// model_path filename with the same unsloth-repo rule
-// scripts/download_model.sh uses; the reranker comes from a fixed
-// CompendiumLabs URL. Downloads write to <file>.part and rename on
-// completion, resuming a partial .part with an HTTP Range request.
+// First-run model download for the bundle (dev builds never need it; see configure()).
+// Fetches the two GGUFs into Application Support with progress and resume.
 
 #ifndef LEXIS_APP_SETUPCONTROLLER_H
 #define LEXIS_APP_SETUPCONTROLLER_H
@@ -31,8 +17,7 @@ class SetupController : public QObject {
     QML_ELEMENT
     QML_SINGLETON
 
-    // Whether the setup overlay must be shown at all (bundle mode with
-    // at least one model file missing at startup).
+    // Whether the setup overlay must show (bundle mode + model file missing).
     Q_PROPERTY(bool required READ isRequired NOTIFY stateChanged)
     Q_PROPERTY(bool downloading READ isDownloading NOTIFY stateChanged)
     Q_PROPERTY(bool finished READ isFinished NOTIFY stateChanged)
@@ -43,8 +28,7 @@ class SetupController : public QObject {
 public:
     explicit SetupController(QObject *parent = nullptr);
 
-    // Called from main() before the QML engine instantiates this
-    // singleton. Dev builds never call it, leaving `required` false.
+    // Called from main() before QML loads; dev builds never call it.
     static void configure(bool bundleMode);
 
     bool isRequired() const { return m_required; }
@@ -59,8 +43,7 @@ public:
 signals:
     void stateChanged();
     void progressChanged();
-    // Emitted once every model file is in place -- Main.qml reacts by
-    // asking AppController to load the model it skipped at startup.
+    // All models in place; Main.qml asks AppController to load the model now.
     void setupComplete();
 
 private:

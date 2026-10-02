@@ -1,9 +1,4 @@
-/*
- * Tests for src/core/bulk_ingest.c -- the three-phase, deferred-term-
- * resolution TSV ingestion pipeline. Uses the real native Postgres
- * instance (lexis_test database, port 5434) -- `make pg-start` must be
- * running for these to pass.
- */
+/* Tests for bulk_ingest.c against native Postgres (port 5434). */
 
 #include "bulk_ingest.h"
 #include "pg_store.h"
@@ -42,11 +37,7 @@ static void test_bulk_ingest_ingests_every_row_exactly_once(void) {
     TEST_ASSERT(reset_store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
     pg_store_close(reset_store);
 
-    /* Six rows sharing common vocabulary ("hypertension"), TSV-formatted
-     * as "<pid><TAB><text>" -- mirrors real MS MARCO passage rows. More
-     * worker threads than rows exercises both the shared-cursor
-     * work-stealing and the concurrent term-dedup path (multiple threads
-     * racing to be the first to insert "hypertension"). */
+    /* 6 MS MARCO-style rows; 4 threads exercise work-stealing and term-dedup races. */
     write_tsv("100\thypertension treatment options\n"
               "101\thypertension diagnosis criteria\n"
               "102\thypertension risk factors\n"
@@ -71,17 +62,14 @@ static void test_bulk_ingest_ingests_every_row_exactly_once(void) {
                 PQgetvalue(res, 0, 0));
     PQclear(res);
 
-    /* document_name must be the row's own pid (not a filename) so
-     * results can be mapped back to the original corpus ID later. */
+    /* document_name must be the row pid for corpus mapping. */
     res = PQexec(store->conn, "SELECT COUNT(*) FROM passages WHERE document_name = '103';");
     TEST_ASSERT(PQresultStatus(res) == PGRES_TUPLES_OK, "expected verification query to succeed");
     TEST_ASSERT(atoi(PQgetvalue(res, 0, 0)) == 1, "expected pid 103's row to be stored as document_name, got %s",
                 PQgetvalue(res, 0, 0));
     PQclear(res);
 
-    /* "hypertension" appears in 4 different rows, almost certainly
-     * ingested by different worker threads racing on the same new term
-     * -- must still collapse to exactly one terms row. */
+    /* "hypertension" in 4 rows must dedup to one terms row despite thread races. */
     res = PQexec(store->conn, "SELECT COUNT(*) FROM terms WHERE term = 'hypertension';");
     TEST_ASSERT(PQresultStatus(res) == PGRES_TUPLES_OK, "expected verification query to succeed");
     TEST_ASSERT(atoi(PQgetvalue(res, 0, 0)) == 1,
@@ -103,10 +91,7 @@ static void test_bulk_ingest_captures_one_original_document_per_multi_chunk_row(
     PQclear(truncate_documents);
     pg_store_close(reset_store);
 
-    /* chunk_size 3 (words), no overlap, against an 9-word single-row
-     * document -- guaranteed to split into multiple passages/chunks, the
-     * exact case where "one documents row per source document, not per
-     * chunk" actually matters. */
+    /* 9 words, chunk_size 3: multiple chunks, one documents row. */
     write_tsv("400\tone two three four five six seven eight nine\n");
 
     StopwordSet *stopwords = stopword_set_load(STOPWORD_FILE);
@@ -153,15 +138,7 @@ static void test_bulk_ingest_fails_atomically_on_a_malformed_row(void) {
     TEST_ASSERT(reset_store != NULL, "expected pg_store_open to succeed");
     pg_store_close(reset_store);
 
-    /* Phase 1 loads the whole file via a single COPY (see
-     * bulk_ingest.h) -- unlike the old row-by-row streaming pipeline,
-     * a single malformed row (here: a missing tab, so the wrong column
-     * count) fails the WHOLE load atomically rather than being skipped.
-     * That's an intentional trade-off, not a regression: real MS MARCO
-     * corpus.tsv is machine-generated and verified clean at full scale
-     * (see SPEED.md), and silently dropping rows on a bulk load is the
-     * wrong default for a pipeline whose whole point is trusting the
-     * source file's format. */
+    /* One malformed row fails the whole COPY load atomically (see bulk_ingest.h, dev/SPEED.md). */
     write_tsv("200\tvalid row one\n"
               "this line has no tab in it\n"
               "201\tvalid row two\n");
@@ -183,10 +160,7 @@ static void test_bulk_ingest_targets_specified_corpus(void) {
     PgStore *reset_store = open_fresh_store();
     TEST_ASSERT(reset_store != NULL, "expected pg_store_open to succeed");
 
-    /* A prior run in this same database could have left rows in the
-     * legacy public schema (other tests in this file all target it) --
-     * truncate so "public stayed untouched" below is a real signal, not
-     * a leftover coincidence. */
+    /* Truncate public first so "untouched" below is a real signal. */
     PGresult *truncate_res = PQexec(reset_store->conn, "TRUNCATE postings, terms, passages RESTART IDENTITY CASCADE;");
     PQclear(truncate_res);
 
@@ -216,9 +190,7 @@ static void test_bulk_ingest_targets_specified_corpus(void) {
     TEST_ASSERT_STR_EQ(PQgetvalue(corpus_res, 0, 0), "2");
     PQclear(corpus_res);
 
-    /* The whole point of this test: the legacy public schema, which
-     * every OTHER bulk_ingest test in this file writes to, must stay
-     * completely untouched by a run that targeted a specific corpus. */
+    /* Public schema must stay untouched by a corpus-targeted run. */
     PGresult *public_res = PQexec(verify_store->conn, "SELECT COUNT(*) FROM public.passages;");
     TEST_ASSERT(PQresultStatus(public_res) == PGRES_TUPLES_OK, "expected public schema count query to succeed");
     TEST_ASSERT_STR_EQ(PQgetvalue(public_res, 0, 0), "0");
@@ -260,13 +232,7 @@ static void test_bulk_ingest_rebuild_corpus_adds_new_documents_and_preserves_exi
     PgStore *verify_store = pg_store_open(TEST_CONNINFO);
     TEST_ASSERT(verify_store != NULL, "expected pg_store_open to succeed");
 
-    /* This corpus_id must still resolve in the registry after the
-     * rebuild, to the exact same id -- the swap replaces what's
-     * physically behind the schema name, never the registry identity
-     * itself (see pg_store_swap_corpus_schema()). Other tests in this
-     * file create their own corpora and never reset the registry between
-     * tests (unlike test_pg_store.c), so this checks for the specific
-     * corpus this test created, not the registry's total count. */
+    /* Registry identity must survive the swap; check this corpus id specifically. */
     size_t corpus_count = 0;
     PgStoreCorpus *corpora = pg_store_list_corpora(verify_store, &corpus_count);
     int found = 0;

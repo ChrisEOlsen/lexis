@@ -1,7 +1,4 @@
-/*
- * Tests for src/core/generation.c — assembling retrieved passages into a
- * grounded generation prompt (spec 5.2.7).
- */
+/* Tests for generation.c: grounded prompt assembly (spec 5.2.7). */
 
 #include "generation.h"
 #include "test_utils.h"
@@ -17,7 +14,7 @@ static PgStore *open_fresh_store(void) {
     if (store == NULL) {
         return NULL;
     }
-    PGresult *res = PQexec(store->conn, "TRUNCATE postings, terms, passages RESTART IDENTITY CASCADE;");
+    PGresult *res = PQexec(store->conn, "TRUNCATE postings, terms, passages, documents RESTART IDENTITY CASCADE;");
     PQclear(res);
     return store;
 }
@@ -76,8 +73,7 @@ static void test_build_prompt_skips_unloadable_passages(void) {
 
     BM25ResultSet *results = bm25_result_set_create();
     TEST_ASSERT(results != NULL, "expected bm25_result_set_create to succeed");
-    /* A passage_id that was never actually inserted -- simulates a stale
-     * or inconsistent reference; must be skipped, not fatal. */
+    /* Stale passage_id must be skipped, not fatal. */
     bm25_result_set_add(results, 999999, 10.0);
     bm25_result_set_add(results, real_passage, 5.0);
 
@@ -115,11 +111,7 @@ static void test_generate_answer_returns_null_without_loaded_model(void) {
     BM25ResultSet *results = bm25_result_set_create();
     bm25_result_set_add(results, p1, 5.0);
 
-    /* Unlike query formulation, generation has no fallback -- a
-     * generation failure just propagates as NULL, since there's no
-     * "lesser" answer to fall back to. local_llm_chat_completion()
-     * returns NULL here since local_llm_client_init() is never called in
-     * this test binary. */
+    /* No fallback in generation; NULL model result propagates as NULL. */
     char *answer = generation_generate_answer("a question", store, results);
     TEST_ASSERT(answer == NULL, "expected NULL when generation fails, no fallback answer");
 
@@ -140,6 +132,99 @@ static void test_generate_answer_empty_results_returns_null(void) {
     pg_store_close(store);
 }
 
+static void test_build_documents_prompt_includes_docs_and_question(void) {
+    PgStoreDocument docs[2] = {
+        {"memo.txt", "Christopher Olsen approved the budget."},
+        {"notes.txt", "The meeting is on Tuesday."},
+    };
+
+    char *prompt = generation_build_documents_prompt("Who is this document referring to?", docs, 2);
+    TEST_ASSERT(prompt != NULL, "expected build_documents_prompt to succeed");
+    TEST_ASSERT(strstr(prompt, "Christopher Olsen approved the budget.") != NULL,
+                "expected the first document's full text in the prompt");
+    TEST_ASSERT(strstr(prompt, "The meeting is on Tuesday.") != NULL,
+                "expected the second document's full text in the prompt");
+    TEST_ASSERT(strstr(prompt, "memo.txt") != NULL, "expected attribution for memo.txt");
+    TEST_ASSERT(strstr(prompt, "notes.txt") != NULL, "expected attribution for notes.txt");
+    TEST_ASSERT(strstr(prompt, "Who is this document referring to?") != NULL,
+                "expected the original question in the prompt");
+
+    free(prompt);
+}
+
+static void test_build_documents_prompt_zero_docs_returns_null(void) {
+    char *prompt = generation_build_documents_prompt("anything", NULL, 0);
+    TEST_ASSERT(prompt == NULL, "expected NULL when there are no documents to read");
+}
+
+static void test_build_documents_prompt_skips_null_text(void) {
+    PgStoreDocument docs[2] = {
+        {"empty.txt", NULL},
+        {"memo.txt", "Christopher Olsen approved the budget."},
+    };
+
+    char *prompt = generation_build_documents_prompt("a question", docs, 2);
+    TEST_ASSERT(prompt != NULL, "expected build_documents_prompt to succeed on the readable document");
+    TEST_ASSERT(strstr(prompt, "Christopher Olsen approved the budget.") != NULL,
+                "expected the readable document's text to still be included");
+
+    free(prompt);
+
+    PgStoreDocument all_null[1] = {{"empty.txt", NULL}};
+    char *nothing = generation_build_documents_prompt("a question", all_null, 1);
+    TEST_ASSERT(nothing == NULL, "expected NULL when no document has readable text");
+}
+
+static void test_generate_from_documents_empty_group_returns_null_not_too_big(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+    int too_big = -1;
+    char *answer = generation_generate_answer_from_documents("a question", store, NULL, 0, -1, &too_big);
+    TEST_ASSERT(answer == NULL, "expected NULL when the group holds no documents");
+    TEST_ASSERT(too_big == 0, "expected too_big == 0: nothing to fit, not a fit failure");
+
+    pg_store_close(store);
+}
+
+static void test_generate_from_documents_small_without_model_is_not_too_big(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+    TEST_ASSERT(pg_store_insert_document(store, "memo.txt", "Christopher Olsen approved the budget.") == 0,
+                "expected insert_document to succeed");
+
+    /* No model loaded: the call must fail as a quiet model, not as "too big". */
+    int too_big = -1;
+    char *answer = generation_generate_answer_from_documents("Who is this referring to?", store, NULL, 0, -1,
+                                                             &too_big);
+    TEST_ASSERT(answer == NULL, "expected NULL when generation fails, no fallback answer");
+    TEST_ASSERT(too_big == 0, "expected too_big == 0: a small group fits, the model went quiet");
+
+    pg_store_close(store);
+}
+
+static void test_generate_from_documents_too_big_sets_flag_without_model_call(void) {
+    PgStore *store = open_fresh_store();
+    TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
+
+    /* ~60KB >> the ~42KB whole-corpus budget: must decline before any model call. */
+    size_t big_len = 60000;
+    char *big_text = malloc(big_len + 1);
+    TEST_ASSERT(big_text != NULL, "expected malloc to succeed");
+    memset(big_text, 'x', big_len);
+    big_text[big_len] = '\0';
+    TEST_ASSERT(pg_store_insert_document(store, "big.txt", big_text) == 0,
+                "expected insert_document to succeed");
+    free(big_text);
+
+    int too_big = -1;
+    char *answer = generation_generate_answer_from_documents("a question", store, NULL, 0, -1, &too_big);
+    TEST_ASSERT(answer == NULL, "expected NULL when the corpus exceeds the read budget");
+    TEST_ASSERT(too_big == 1, "expected too_big == 1 so the caller falls through to the summary");
+
+    pg_store_close(store);
+}
+
 int main(void) {
     test_build_prompt_includes_passages_and_question();
     test_build_prompt_empty_results_returns_null();
@@ -147,5 +232,11 @@ int main(void) {
     test_build_prompt_all_passages_unloadable_returns_null();
     test_generate_answer_returns_null_without_loaded_model();
     test_generate_answer_empty_results_returns_null();
+    test_build_documents_prompt_includes_docs_and_question();
+    test_build_documents_prompt_zero_docs_returns_null();
+    test_build_documents_prompt_skips_null_text();
+    test_generate_from_documents_empty_group_returns_null_not_too_big();
+    test_generate_from_documents_small_without_model_is_not_too_big();
+    test_generate_from_documents_too_big_sets_flag_without_model_call();
     return test_summary();
 }

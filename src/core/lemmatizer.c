@@ -1,11 +1,6 @@
-/*
- * Implementation of the WordNet-style morphological lemmatizer.
- * See include/lemmatizer.h for the module's role.
- */
+/* WordNet-style morphological lemmatizer; see lemmatizer.h. */
 
-/* See tokenizer.c for why this must come before any #include (strdup and
- * strtok_r are POSIX extensions hidden by glibc under strict -std=c11
- * otherwise). */
+/* Before any #include: exposes strdup/strtok_r under strict -std=c11 (see tokenizer.c). */
 #define _POSIX_C_SOURCE 200809L
 
 #include "lemmatizer.h"
@@ -44,9 +39,7 @@ void lemmatizer_free(Lemmatizer *lemmatizer) {
     free(lemmatizer);
 }
 
-/* Format (WordNet's noun.exc/verb.exc/adj.exc/adv.exc): "inflected base1
- * [base2 ...]" -- one or more base forms per line, space-separated. No
- * header lines in these files, unlike index.<pos>/data.<pos>. */
+/* WordNet *.exc format: "inflected base1 [base2 ...]", no headers. */
 static LemmatizerException *parse_exception_line(const char *line) {
     char *mutable_line = strdup(line);
     if (mutable_line == NULL) {
@@ -179,9 +172,7 @@ static int compare_word_to_exception(const void *key, const void *element) {
     return strcmp(*word_ptr, (*exception_ptr)->inflected);
 }
 
-/* One suffix-stripping rule: replace `suffix` at the end of a word with
- * `replacement` (often empty). Tables below are WordNet's own morphy
- * rules verbatim, not approximated. */
+/* Suffix -> replacement rule; tables below are WordNet morphy rules verbatim. */
 typedef struct {
     const char *suffix;
     const char *replacement;
@@ -227,14 +218,7 @@ static char *strip_and_replace(const char *word, const char *suffix, const char 
     return candidate;
 }
 
-/* Tries every rule in `rules`, in order, returning the first candidate
- * that validates against `wordnet` (i.e. wordnet_lookup() finds it).
- * Returns NULL if no rule produces a valid candidate -- including on a
- * rare allocation failure partway through, which is treated the same as
- * "no match" here rather than a hard error: the caller's fallback
- * (return the original word unchanged) is always safe and correct, so
- * there's nothing gained by propagating a malloc failure from a single
- * rule attempt as distinct from "this rule just didn't apply". */
+/* First rule candidate validating via wordnet_lookup(), else NULL. Alloc failure counts as no match (caller fallback is safe). */
 static char *try_rule_table(const WordNetTable *wordnet, const char *word,
                              const SuffixRule *rules, size_t rule_count) {
     for (size_t i = 0; i < rule_count; i++) {
@@ -254,8 +238,7 @@ static char *try_rule_table(const WordNetTable *wordnet, const char *word,
 }
 
 char *lemmatize(const Lemmatizer *lemmatizer, const WordNetTable *wordnet, const char *word) {
-    /* 1. Exception list first -- already-curated WordNet data, trusted
-     * as-is, no re-validation against wordnet_lookup() needed. */
+    /* 1. Exceptions first: curated data, no re-validation needed. */
     LemmatizerException **found =
         bsearch(&word, lemmatizer->exceptions, lemmatizer->count,
                 sizeof(LemmatizerException *), compare_word_to_exception);
@@ -264,18 +247,10 @@ char *lemmatize(const Lemmatizer *lemmatizer, const WordNetTable *wordnet, const
         if (result != NULL) {
             return result;
         }
-        /* strdup failed -- fall through to the unchanged-word path below
-         * rather than returning NULL for what should be a safe lookup. */
+        /* strdup failed: fall through to unchanged-word return below. */
     }
 
-    /* 2. The word as given is already a WordNet base form -- return it
-     * unchanged before any suffix rule can touch it, as real morphy
-     * does. Without this guard, base forms that merely look inflected
-     * get mangled whenever the stripped stem happens to validate
-     * cross-POS: "king" -> {"ing",""} -> "k" (a real WordNet noun --
-     * potassium), "ring" -> {"ing","e"} -> "re", "sing" -> "se".
-     * Must stay AFTER the exception list: "saw" is in WordNet as a noun
-     * but verb.exc still maps it to "see", and exceptions win. */
+    /* 2. Already a base form: return unchanged (guards "king"->"k" etc.); stays after exceptions ("saw"->"see"). */
     if (wordnet_lookup(wordnet, word) != NULL) {
         return strdup(word);
     }
@@ -295,7 +270,6 @@ char *lemmatize(const Lemmatizer *lemmatizer, const WordNetTable *wordnet, const
         return candidate;
     }
 
-    /* 4. Nothing matched -- not a WordNet word at all (a proper noun, a
-     * made-up word, etc.); base forms already returned at step 2. */
+    /* 4. Not a WordNet word; return unchanged. */
     return strdup(word);
 }

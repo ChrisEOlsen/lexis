@@ -1,15 +1,12 @@
-/*
- * Implementation of the llama.cpp-backed local model client.
- * See include/local_llm_client.h for the module's role.
- */
+/* llama.cpp-backed local model client (see local_llm_client.h). */
 
-/* See tokenizer.c for why this must come before any #include (strdup is a
- * POSIX extension hidden by glibc under strict -std=c11 otherwise). */
+/* Must precede #includes: strdup is POSIX, hidden under strict -std=c11. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "local_llm_client.h"
 
 #include "jinja_chat_template.h"
+#include "local_llm_client_test.h"
 #include "string_builder.h"
 
 #include <llama.h>
@@ -17,24 +14,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* LOCAL_LLM_N_CTX is declared in local_llm_client.h, not here -- the
- * windowing helpers in query_formulation.c/generation.c need the real
- * ceiling to compute how much chat history budget they have, not a
- * number they'd have to keep in sync with this file by hand. */
+/* N_CTX stays in the header: windowing helpers in query_formulation.c/generation.c
+ * need the real ceiling without hand-syncing. */
 #define LOCAL_LLM_N_BATCH LOCAL_LLM_N_CTX
-/* LOCAL_LLM_MAX_NEW_TOKENS now lives in local_llm_client.h -- callers have
- * to size their own context reservations against it. */
+/* MAX_NEW_TOKENS also lives in the header: callers size reservations against it. */
 
 static struct llama_model *g_model = NULL;
 static struct llama_context *g_ctx = NULL;
 static const struct llama_vocab *g_vocab = NULL;
 static int g_initialized = 0;
 
-/* llama.cpp/ggml log INFO/DEBUG-level Metal shader compilation and
- * backend detection noise (hundreds of lines) on every single model
- * load by default. Real problems (WARN/ERROR) still reach stderr;
- * everything else is suppressed so a query's actual output isn't buried
- * under it. */
+/* Suppresses llama.cpp/ggml INFO/DEBUG noise (Metal/backend chatter); WARN/ERROR
+ * still reach stderr so real problems aren't hidden. */
 static void local_llm_log_callback(enum ggml_log_level level, const char *text, void *user_data) {
     (void)user_data;
     if (level >= GGML_LOG_LEVEL_WARN) {
@@ -42,9 +33,7 @@ static void local_llm_log_callback(enum ggml_log_level level, const char *text, 
     }
 }
 
-/* Forward declaration -- defined later in this file, needed here so
- * local_llm_client_init() can warm its cache (see the call site below
- * for why). */
+/* Defined below; declared here so init() can warm its cache. */
 static char *apply_chat_template_multi(const LocalLlmTurn *turns, size_t count, const char *prefill,
                                         int force_thinking, int32_t *out_len);
 
@@ -79,23 +68,8 @@ int local_llm_client_init(const char *model_path) {
 
     g_initialized = 1;
 
-    /* Prime the chat-template path now, during startup, rather than
-     * paying for it on the user's first real chat message. Models whose
-     * template needs the Jinja fallback (see apply_chat_template_multi()
-     * below and jinja_chat_template.cpp's own comment) pay real parse
-     * cost the first time it runs -- measured at ~11-12 seconds for
-     * Gemma 4's real Jinja2 template -- which the fallback's own cache
-     * then eliminates for every call after. Without this warm-up, that
-     * one-time cost would land as a jarring delay on the very first
-     * question a user asks instead of overlapping with the ~9-19s model
-     * load this function already costs (same reasoning ModelLoader.h
-     * documents for why the app loads the model proactively at startup
-     * rather than deferring to first use). For models on the plain
-     * built-in template path (Llama, Qwen), this warm-up is
-     * essentially free. Result is discarded either way -- this call
-     * exists purely for its cache side effect; if it fails for some
-     * transient reason, the real call later just tries again on its own
-     * merits. */
+    /* Warm the chat-template path now: first Jinja-fallback render costs ~11-12s (Gemma 4)
+     * but caches; without this it would land on the user's first question. Discarded. */
     LocalLlmTurn warmup_turn = {.role = "user", .content = "hi"};
     int32_t warmup_len = 0;
     char *warmup_result = apply_chat_template_multi(&warmup_turn, 1, NULL, /*force_thinking=*/0, &warmup_len);
@@ -119,32 +93,8 @@ void local_llm_client_cleanup(void) {
     }
 }
 
-/* Formats `turns[0..count)` with the model's own chat template into a
- * heap buffer (caller must free()), with `prefill` (if non-NULL) already
- * folded in -- one complete, ready-to-tokenize prompt either way.
- * Returns NULL on failure.
- *
- * Tries llama_chat_apply_template() first (handles the "buffer too
- * small" case it signals by reporting a formatted_len larger than the
- * buffer it was given -- grows once and re-applies, per the API's
- * documented contract). That function is NOT a real Jinja parser --
- * llama.h documents it as only supporting a pre-defined list of known
- * template formats -- so on a genuine failure (a model whose template is
- * too sophisticated for that list, e.g. Gemma 4's native-tool-calling-
- * capable template, confirmed directly by reading its raw Jinja source)
- * this falls back to real Jinja rendering via jinja_render_chat_template()
- * (minja, vendored under src/core/vendor/).
- *
- * The two paths handle `prefill` differently: the plain path appends it
- * as a literal string after the template's own assistant-turn opening
- * (see local_llm_chat_completion_multi()'s header doc comment on why
- * that skips a thinking model's reasoning pass). The Jinja path instead
- * passes `enable_thinking` as a real template context variable -- modern
- * templates like Gemma 4's branch on it directly, so the literal prefill
- * string isn't needed (and Gemma 4's template defaults enable_thinking
- * to false on its own, confirmed by reading its source -- so prefill ==
- * NULL going through this path still means "let the template's own
- * default apply", not "force thinking on"). */
+/* Formats turns (+prefill) via the model's chat template (caller frees, NULL on fail).
+ * Built-in apply first (grows once if short); minja fallback for real-Jinja templates. */
 static char *apply_chat_template_multi(const LocalLlmTurn *turns, size_t count, const char *prefill,
                                         int force_thinking, int32_t *out_len) {
     struct llama_chat_message *msgs = malloc(count * sizeof(struct llama_chat_message));
@@ -220,28 +170,8 @@ static char *apply_chat_template_multi(const LocalLlmTurn *turns, size_t count, 
     return with_prefill;
 }
 
-/* Strips a leading reasoning block (plus any whitespace right after it),
- * in place, so a thinking model's internal monologue never reaches a
- * caller's displayed or persisted output.
- *
- * Two formats are recognised, because the delimiters are per-model and
- * getting them wrong is silent -- the reasoning simply arrives as the
- * answer:
- *
- *   <think> ... </think>                    the widespread convention
- *   <|channel>thought ... <channel|>     Gemma 4's, taken from its own
- *                                        chat template (note the pipe
- *                                        moves to the other side on the
- *                                        closing tag -- it is NOT a typo,
- *                                        and the template's own
- *                                        strip_thinking macro splits on
- *                                        exactly that string)
- *
- * Only strips a block that starts at the very beginning of `reply` and
- * actually closes. An unterminated block -- generation having hit
- * LOCAL_LLM_MAX_NEW_TOKENS mid-thought -- is left untouched rather than
- * guessed at, so the truncation is visible instead of being silently
- * turned into a plausible-looking answer. */
+/* Strips one leading reasoning block in place (<think> or Gemma 4's <|channel>thought,
+ * whose asymmetric closing <channel|> is NOT a typo). Unterminated blocks stay visible. */
 static const struct {
     const char *open;
     const char *close;
@@ -250,7 +180,8 @@ static const struct {
     {"<|channel>thought", "<channel|>"},
 };
 
-static void strip_leading_think_block(char *reply) {
+/* Non-static: exposed to tests via local_llm_client_test.h. */
+void strip_leading_think_block(char *reply) {
     for (size_t i = 0; i < sizeof(kThinkFormats) / sizeof(kThinkFormats[0]); i++) {
         size_t open_len = strlen(kThinkFormats[i].open);
         if (strncmp(reply, kThinkFormats[i].open, open_len) != 0) {
@@ -269,77 +200,25 @@ static void strip_leading_think_block(char *reply) {
     }
 }
 
-/* -- Streaming think suppression ---------------------------------------
- *
- * The non-streaming path strips a leading reasoning block from the
- * completed reply above. A streaming caller must not receive those
- * bytes live -- the model's internal monologue would flash past the
- * user before the answer replaced it -- but "does this reply open with
- * a think block?" cannot be answered until either the block closes or
- * the reply provably does not start with any open marker. So the
- * decode loop holds pieces in a gate until that question resolves:
- *
- *   - DECIDING: bytes are compared against both open markers. Once
- *     they diverge from both (an ordinary answer -- the overwhelmingly
- *     common case, and always the case on the prefill path, where the
- *     template has already closed the think block in the prompt),
- *     everything held is released and every later piece flows through
- *     unchanged. Once one open marker fully matches, the gate goes
- *     INSIDE with that format.
- *   - INSIDE: pieces are held and scanned for the format's close
- *     marker. When it is found, everything up to and including it plus
- *     the whitespace run after it (the same run
- *     strip_leading_think_block() skips) is dropped, and the tail is
- *     released; the reply streams as plain answer text from there on.
- *   - Generation ends while still DECIDING or INSIDE -- a think block
- *     that opened but never closed, the truncated-mid-thought case --
- *     everything held is released as-is: the same "leave the truncation
- *     visible" rule the non-streaming strip applies, so a stream that
- *     dies mid-thought never looks like a clean empty answer.
- *
- * The final reply the loop returns is still stripped by
- * strip_leading_think_block(), so the returned string (what callers
- * persist and display) can never diverge from the non-streaming path;
- * the gate only governs which bytes reach the callback along the way. */
-typedef struct {
-    int phase_deciding; /* 1 until the reply's opening is understood */
-    int phase_inside;   /* 1 once an open marker matched */
-    size_t format;      /* index into kThinkFormats once known */
-    /* DECIDING only: matched-prefix length against each open marker,
-     * or SIZE_MAX for a format the held text has already diverged from. */
-    size_t open_match[2];
-    /* INSIDE only: bytes of the held text already scanned for the close
-     * marker -- the next scan starts close_len-1 bytes earlier so a
-     * marker split across a piece boundary is still found. */
-    size_t close_scanned;
-    /* Set when the gate leaves INSIDE with the whitespace run after the
-     * close marker still unfinished -- the run continues into the next
-     * piece, and strip_leading_think_block() skips it there too. Stays
-     * set through pass-through pieces until real answer text arrives. */
-    int skip_leading_ws;
-    /* The held buffer: reply bytes whose disposition is not yet
-     * decided. In DECIDING this is everything; in INSIDE it is the
-     * think block body; once released, it is empty. */
-    StringBuilder held;
-} ThinkGate;
+/* ThinkGate lives in local_llm_client_test.h (test hooks); the gate holds bytes until
+ * the opening resolves (DECIDING -> INSIDE -> release), flushes truncated blocks
+ * visible, and the returned reply is still stripped. */
+_Static_assert(THINK_GATE_FORMAT_COUNT == sizeof(kThinkFormats) / sizeof(kThinkFormats[0]),
+               "test header out of sync with kThinkFormats");
 
 /* The whitespace strip_leading_think_block() skips after a close marker. */
 static int think_gap_ws(char c) {
     return c == '\n' || c == '\r' || c == ' ' || c == '\t';
 }
 
-#define THINK_GATE_FORMAT_COUNT (sizeof(kThinkFormats) / sizeof(kThinkFormats[0]))
 #define THINK_GATE_RULED_OUT ((size_t)-1)
 
 /* Feeds one decoded piece through the gate, invoking `on_piece` with
  * whatever the gate decides is now displayable answer text. */
-static void think_gate_feed(ThinkGate *gate, const char *piece, LocalLlmStreamFn on_piece, void *user_data) {
-    /* Released state first, and WITHOUT touching `held`: once the gate
-     * has released, holding is over, and appending pieces to the buffer
-     * anyway would make think_gate_flush() re-emit the whole answer as
-     * one final duplicate piece (found by the stream-identity check).
-     * Pass-through is pure: the piece goes to the callback and nothing
-     * else. */
+/* Non-static: exposed to tests via local_llm_client_test.h. */
+void think_gate_feed(ThinkGate *gate, const char *piece, LocalLlmStreamFn on_piece, void *user_data) {
+    /* Released state: pure pass-through WITHOUT touching held (appending would make
+     * the flush re-emit the whole answer as a duplicate final piece). */
     if (!gate->phase_deciding && !gate->phase_inside) {
         size_t len = strlen(piece);
         size_t start = 0;
@@ -396,14 +275,8 @@ static void think_gate_feed(ThinkGate *gate, const char *piece, LocalLlmStreamFn
             gate->phase_inside = 1;
             gate->format = (size_t)matched;
             gate->close_scanned = 0;
-            /* The open marker stays in `held` and is dropped along with
-             * the whole think block when the close marker is found.
-             * Deliberately NOT returning: this same piece may already
-             * carry the close marker (a short block whose open and close
-             * land in one piece), and the INSIDE scan below is what
-             * finds it. Returning here would leave that block held until
-             * some later piece arrived -- and if none did, the flush
-             * would emit the entire reasoning block. */
+            /* Open marker stays in held (dropped with the block). Fall through to the
+             * INSIDE scan: this piece may already carry the close marker too. */
         } else {
             if (!any_alive) {
                 /* An ordinary answer: release everything held and stream
@@ -438,12 +311,8 @@ static void think_gate_feed(ThinkGate *gate, const char *piece, LocalLlmStreamFn
                         on_piece(gate->held.data + after, held_len - after, user_data);
                     }
                 } else {
-                    /* The held text ends exactly where the skip does --
-                     * either the close marker landed on a piece boundary
-                     * or the run consumed the rest. The run may continue
-                     * in the next piece; the non-streaming strip would
-                     * eat that too, so keep skipping rather than passing
-                     * whitespace the returned answer does not have. */
+                    /* Held text ends where the skip does; the run may continue next piece,
+                     * which the non-streaming strip would also eat -- keep skipping. */
                     gate->skip_leading_ws = 1;
                 }
                 free(gate->held.data);
@@ -457,11 +326,10 @@ static void think_gate_feed(ThinkGate *gate, const char *piece, LocalLlmStreamFn
     }
 }
 
-/* Releases whatever the gate is still holding. Called exactly once when
- * generation ends, before the reply is returned -- the
- * opened-but-never-closed case must stay visible, matching
- * strip_leading_think_block()'s rule. */
-static void think_gate_flush(ThinkGate *gate, LocalLlmStreamFn on_piece, void *user_data) {
+/* Releases whatever is still held; called once at generation end. Opened-but-never-
+ * closed stays visible (same rule as strip_leading_think_block()). */
+/* Non-static: exposed to tests via local_llm_client_test.h. */
+void think_gate_flush(ThinkGate *gate, LocalLlmStreamFn on_piece, void *user_data) {
     if (gate->held.data != NULL && gate->held.length > 0 && on_piece != NULL) {
         on_piece(gate->held.data, gate->held.length, user_data);
     }
@@ -471,19 +339,8 @@ static void think_gate_flush(ThinkGate *gate, LocalLlmStreamFn on_piece, void *u
     gate->held.capacity = 0;
 }
 
-/* Shared greedy-decode loop, run against an already-tokenized prompt
- * (`tokens[0..n_tokens)`, already sized against LOCAL_LLM_N_CTX by the
- * caller). Returns the generated reply text (caller must free(), never
- * NULL on success -- an empty string is a valid reply, see below), or
- * NULL on failure. Does not free `tokens` -- the caller owns it.
- *
- * `on_piece` (when non-NULL) receives the reply's displayable answer
- * text live, piece by piece, post think-suppression (see ThinkGate);
- * the loop's returned buffer still carries the unstripped reply, which
- * the public entry points strip exactly as the non-streaming path
- * does. The two paths share this one loop -- the same sampler, the
- * same decode calls, the same caps -- so their outputs are bit-identical
- * by construction. */
+/* Greedy-decode loop over a tokenized, ctx-sized prompt (tokens stay caller-owned).
+ * Returns malloc'd reply ("" is valid, NULL is failure); on_piece gets live pieces. */
 static char *run_decode_loop(llama_token *tokens, int32_t n_tokens, LocalLlmStreamFn on_piece, void *user_data) {
     struct llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
     struct llama_sampler *sampler = llama_sampler_chain_init(sparams);
@@ -539,9 +396,7 @@ static char *run_decode_loop(llama_token *tokens, int32_t n_tokens, LocalLlmStre
 
         n_ctx_used++;
         if (n_ctx_used >= LOCAL_LLM_N_CTX) {
-            /* Ran out of context window mid-generation -- stop cleanly
-             * with whatever's been produced so far rather than
-             * overflowing the KV cache. */
+            /* Out of context mid-generation: stop cleanly rather than overflowing KV cache. */
             break;
         }
 
@@ -560,18 +415,15 @@ static char *run_decode_loop(llama_token *tokens, int32_t n_tokens, LocalLlmStre
     }
 
     if (reply.data == NULL) {
-        /* The first sampled token was already EOG -- a valid empty reply,
-         * not a failure. Match the "non-NULL means success" contract with
-         * an empty string rather than NULL. */
+        /* First token was already EOG: valid empty reply, not failure (non-NULL = success). */
         return strdup("");
     }
 
     return reply.data;
 }
 
-/* One implementation behind both the plain and the streaming entry
- * points (see local_llm_client.h's streaming doc comment for why
- * sharing it is what makes their outputs provably identical). */
+/* One loop behind plain + streaming entry points (shared loop => provably identical
+ * outputs; see local_llm_client.h). */
 static char *chat_completion_multi_ex_common(const LocalLlmTurn *turns, size_t count, const char *prefill,
                                              int force_thinking, LocalLlmStreamFn on_piece, void *user_data) {
     if (!g_initialized) {
@@ -582,12 +434,8 @@ static char *chat_completion_multi_ex_common(const LocalLlmTurn *turns, size_t c
         return NULL;
     }
 
-    /* Each call is a fresh conversation, not a continuation of whatever
-     * the previous call left in the KV cache -- the full turn history is
-     * always passed in explicitly (see the windowing helpers in
-     * query_formulation.c/generation.c), so token positions must start
-     * at 0 here or the model would see an unrelated earlier prompt
-     * layered underneath this one. */
+    /* Fresh conversation per call, not a KV-cache continuation: full history is always
+     * passed explicitly, so positions restart at 0. */
     llama_memory_clear(llama_get_memory(g_ctx), true);
 
     int32_t formatted_len = 0;
@@ -655,10 +503,8 @@ int local_llm_count_tokens(const char *text) {
         return -1;
     }
 
-    /* add_special = false -- this counts one turn's own content toward a
-     * windowing budget, not a full templated prompt (which gets exactly
-     * one BOS token regardless of how many turns it's made of, added by
-     * apply_chat_template_multi()/llama_tokenize() above, not here). */
+    /* add_special=false: counts one turn's content toward a budget, not a full prompt
+     * (the single BOS is added by the template/tokenize path, not here). */
     int32_t n_tokens = llama_tokenize(g_vocab, text, text_len, tokens, n_tokens_max, false, true);
     free(tokens);
     if (n_tokens < 0) {

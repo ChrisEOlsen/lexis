@@ -1,9 +1,4 @@
-/*
- * Implementation of the learned synonym table.
- * See include/synonym_table.h for the module's role. Chained-bucket hash
- * keyed by word, same shape as wordnet.c's table -- sized once at load
- * from the row count, no rehashing.
- */
+/* Learned synonym table; see synonym_table.h. Chained-bucket hash, sized once at load. */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -24,7 +19,7 @@ struct SynonymTable {
     size_t bucket_count;
 };
 
-/* djb2 -- same function family the other tables in this project use. */
+/* djb2, same family as the other tables. */
 static size_t hash_word(const char *word, size_t bucket_count) {
     size_t hash = 5381;
     for (const unsigned char *p = (const unsigned char *)word; *p != '\0'; p++) {

@@ -1,6 +1,4 @@
-// Backs GroupSidebar.qml's ListView -- one row per group. Never created
-// directly from QML (QML_UNCREATABLE); AppController owns the one
-// instance and exposes it via its corpusModel property.
+// One row per group (QML_UNCREATABLE; owned by AppController).
 
 #ifndef LEXIS_APP_CORPUSLISTMODEL_H
 #define LEXIS_APP_CORPUSLISTMODEL_H
@@ -28,9 +26,7 @@ public:
     QVariant data(const QModelIndex &index, int role) const override;
     QHash<int, QByteArray> roleNames() const override;
 
-    // Replaces the whole list and notifies bound QML views. Called by
-    // AppController after any operation that could change the set of
-    // groups (create, delete, or the initial load).
+    // Replaces the whole list. Called after create, delete, or the initial load.
     void setCorpora(const QVector<Corpus> &corpora);
 
 private:

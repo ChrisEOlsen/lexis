@@ -1,25 +1,5 @@
-// Document viewer: one document's stored text and its chunks, opened
-// from the Source inspector's passage cards (focused on the cited
-// chunk) or from the document list (whole document). Near-fullscreen
-// like the source inspector, for the same reason -- the text is the
-// point, and a letterbox turns reading into a scroll-race.
-//
-// Two tabs:
-//   - "Extracted text": the document's full stored text, split into
-//     paragraph blocks in a virtualized ListView -- a 900-page manual
-//     is over a megabyte of text, and one giant Label would defeat
-//     virtualization and stall the scroll.
-//   - "Passages": the chunk cards search actually retrieves, in chunk
-//     order. Opening from a source card lands here, scrolled to and
-//     highlighting the cited chunk -- the "is the answer actually
-//     supported by this passage?" question gets answered in the
-//     passage's surrounding context, one click from the answer.
-//
-// Everything is read-only; the viewer deliberately has no editing, no
-// re-indexing, no "open the original file" (the original file's path is
-// not stored anywhere -- the indexed text IS the source of truth here,
-// which is also what makes this honest: it shows exactly what search
-// sees).
+// Document viewer: stored text + chunks, opened from the source inspector or the
+// document list. Near-fullscreen (the text is the point) and read-only throughout.
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -38,24 +18,20 @@ Dialog {
     standardButtons: Dialog.Close
     title: qsTr("Document")
 
-    // Populated by openFor() before open(): the viewer's whole payload
-    // in one AppController call, so a document that can't be read never
-    // opens half-populated.
+    // Populated by openFor() before open(), so failures never open half-populated.
     property string documentName: ""
     property string documentText: ""
     property var chunks: []          // [{chunkId, text, tokenCount}, ...]
     property int focusChunkId: -1    // cited chunk to scroll to + highlight
     property int selectedTab: 0      // 0 = extracted text, 1 = passages
 
-    // A short label the caller can pass ("12 passages · 8,412 tokens");
-    // built here when absent so both entry points share the code.
+    // Stats label, built here when the caller passes none.
     property string statsLabel: ""
 
     function openFor(name, chunkId) {
         var doc = AppController.openDocument(name)
         if (!doc || doc.text === undefined) {
-            // openDocument returns {} on failure -- surface it rather
-            // than opening an empty shell over a real click.
+            // openDocument returns {} on failure: surface it, don't open an empty shell.
             AppController.showMessage(qsTr("Could not open \"%1\" -- it may have been removed.").arg(name))
             return
         }
@@ -71,24 +47,18 @@ Dialog {
             viewer.selectedTab = 0
         }
         open()
-        // After open(), and after focusChunkId is set: the assignment to
-        // `chunks` above may already have fired onCountChanged with the
-        // PREVIOUS focus id (or not fired at all, on a same-length
-        // reopen), so this is the call that is always correct.
+        // After open() and focusChunkId: the count-driven scroll may have fired stale.
         chunkList.scrollToFocusChunk()
     }
 
-    // Paragraph blocks for the extracted-text tab, recomputed whenever
-    // the loaded text changes. A single big Label defeats ListView
-    // virtualization; ~paragraph-sized blocks keep the list cheap no
-    // matter how long the document is.
+    // Paragraph blocks (a single big Label would defeat ListView virtualization).
     readonly property var textBlocks: viewer.documentText.length === 0
                                       ? [] : viewer.documentText.split(/\n{2,}/)
 
     contentItem: ColumnLayout {
         spacing: Theme.spacingS
 
-        // Header: name + one stats line.
+        // Header.
         Label {
             text: viewer.documentName
             font.weight: Theme.fontWeightBold
@@ -105,11 +75,7 @@ Dialog {
             elide: Text.ElideRight
         }
 
-        // Tab bar. Two buttons, not a TabBar: this is a two-way toggle
-        // where the checked state IS the selection, and stock flat
-        // buttons with `checked` keep the style's own press/hover
-        // treatment without hand-drawing a tab chrome no other surface
-        // in the app uses.
+        // Two checked buttons, not a TabBar: a two-way toggle keeping the style's chrome.
         RowLayout {
             spacing: Theme.spacingXS
             Layout.fillWidth: true
@@ -131,8 +97,7 @@ Dialog {
                 flat: true
                 text: qsTr("Copy")
                 font.pixelSize: Theme.fontSizeCaption
-                // Copies whichever tab is showing -- the extracted text
-                // or the chunk texts joined in order.
+                // Copies whichever tab is showing.
                 onClicked: {
                     if (viewer.selectedTab === 0) {
                         AppController.copyToClipboard(viewer.documentText)
@@ -147,11 +112,7 @@ Dialog {
             }
         }
 
-        // -- Extracted text --
-        // PlainText, not Markdown: this is source material shown
-        // verbatim, and any punctuation in it must not reformat. A bare
-        // ListView (its own flickable -- a ScrollView wrapper would
-        // stack two), virtualized over paragraph blocks.
+        // -- Extracted text (PlainText: source shown verbatim; bare ListView, no ScrollView) --
         ListView {
             id: textList
             visible: viewer.selectedTab === 0
@@ -250,17 +211,8 @@ Dialog {
                 text: qsTr("No passages.")
             }
 
-            // Scroll to the cited chunk once the list is laid out --
-            // positionViewAtIndex before the delegates exist lands
-            // nowhere (the same deferred-positioning discipline as the
-            // message list's followTail).
-            //
-            // Called from openFor(), not only from onCountChanged:
-            // reopening the SAME document at a different cited chunk
-            // replaces `chunks` with an array of the same length, so
-            // count never changes and a count-driven scroll would leave
-            // the view sitting on the previous chunk while the highlight
-            // moved off-screen.
+            // Deferred scroll to the cited chunk (positioning before delegates exist lands
+            // nowhere). Also called from openFor(): same-length reopens never fire onCountChanged.
             function scrollToFocusChunk() {
                 if (viewer.focusChunkId < 0 || chunkList.count === 0) {
                     return

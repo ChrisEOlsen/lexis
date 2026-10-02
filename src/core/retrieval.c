@@ -1,8 +1,4 @@
-/*
- * Implementation of the shared retrieval orchestrator.
- * See include/retrieval.h for the module's role and its two rules
- * (policy values not caller flags; observers read artifacts).
- */
+/* Shared retrieval orchestrator; see retrieval.h (policy values, observers read artifacts). */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -14,13 +10,12 @@
 #include "paths.h"
 #include "reranker.h"
 #include "synonym_table.h"
+#include "time_util.h"
 
 #include <stdlib.h>
 #include <time.h>
 
-/* The learned synonym table, loaded once per process, lazily -- same
- * pattern as generation.c's thinking gate. Missing file = NULL = no
- * learned candidates, quietly (the table is optional shipped data). */
+/* Learned synonyms, lazy once-per-process. Missing file = NULL = no learned candidates. */
 static const SynonymTable *learned_synonyms(void) {
     static SynonymTable *table = NULL;
     static int attempted = 0;
@@ -35,17 +30,8 @@ static const SynonymTable *learned_synonyms(void) {
     return table;
 }
 
-/* The optional embedding reranker, initialized once per process from
- * config `reranker_model_path` -- same lazy pattern as the synonym
- * table above. No config line = never initialized = pure BM25 order.
- *
- * The user toggle (retrieval_set_reranker_enabled(), declared in
- * retrieval.h for the app's Settings panel) is a second gate consulted
- * BEFORE the lazy init: disabling it must not merely skip reranking,
- * it must skip ever loading the ~67MB model. Enabling it after a
- * disable resumes the normal lazy path -- the model (re)loads on the
- * next query that reranks, so the first post-enable query pays a small
- * one-time load exactly like the process's first query did. */
+/* Optional reranker from config reranker_model_path, lazy once-per-process.
+ * User toggle gates init so disable skips loading the ~67MB model. */
 static int reranker_user_enabled = 1; /* default: whatever the config says */
 
 /* Lazy-init state, file-scope so the toggle below can reset it. */
@@ -55,11 +41,7 @@ static int reranker_loaded = 0;
 void retrieval_set_reranker_enabled(int enabled) {
     const int want = enabled ? 1 : 0;
     if (want && !reranker_user_enabled) {
-        /* A disable -> enable transition: reset the attempt flag so the
-         * next query re-runs the lazy load once, rather than inheriting
-         * the outcome of whatever attempt the disabled period
-         * interrupted (or never made). Enabling with the load already
-         * done keeps it -- reranker_loaded survives, no reload cost. */
+        /* Re-enable resets attempt flag for one fresh lazy load; already-loaded model is kept. */
         reranker_attempted = 0;
     }
     reranker_user_enabled = want;
@@ -80,28 +62,20 @@ static int reranker_ready(void) {
     return reranker_loaded;
 }
 
-static long elapsed_ms(struct timespec start, struct timespec end) {
-    long seconds = end.tv_sec - start.tv_sec;
-    long nanoseconds = end.tv_nsec - start.tv_nsec;
-    return seconds * 1000 + nanoseconds / 1000000;
-}
-
 RetrievalPolicy retrieval_default_policy(void) {
     RetrievalPolicy policy;
-    policy.candidate_ceiling = LEXIS_SEARCH_CANDIDATE_CEILING;
-    policy.max_passages = LEXIS_SEARCH_MAX_PASSAGES;
-    policy.token_budget = LEXIS_SEARCH_TOKEN_BUDGET;
-    policy.score_floor_ratio = LEXIS_SEARCH_SCORE_FLOOR_RATIO;
+    /* Config first (compiled defaults when unset), tuning-sweep env wins; see dev/TESTING.md. */
+    const char *config = lexis_paths_config_file();
+    policy.candidate_ceiling = config_load_candidate_ceiling(config);
+    policy.max_passages = config_load_max_passages(config);
+    policy.token_budget = config_load_token_budget(config);
+    policy.score_floor_ratio = config_load_score_floor_ratio(config);
     policy.use_expansion = 1;
-    policy.bm25.k1 = BM25_DEFAULT_K1;
-    policy.bm25.b = BM25_DEFAULT_B;
+    policy.bm25.k1 = config_load_bm25_k1(config);
+    policy.bm25.b = config_load_bm25_b(config);
     policy.bm25.coord_bonus = BM25_DEFAULT_COORD_BONUS;
     policy.corpus_stats = NULL;
 
-    /* Experiment overrides for tuning sweeps (see TESTING.md) -- unset
-     * means the shipped defaults above. Kept in the default-policy
-     * constructor, not scattered through callers, so a sweep tunes every
-     * driver (CLI, app, eval) identically. */
     const char *k1_env = getenv("LEXIS_BM25_K1");
     const char *b_env = getenv("LEXIS_BM25_B");
     if (k1_env != NULL && atof(k1_env) > 0.0) {
@@ -135,12 +109,7 @@ RetrievalRun *retrieval_run(PgStore *store, const char *question, const char *re
     struct timespec formulation_start, formulation_end;
     clock_gettime(CLOCK_MONOTONIC, &formulation_start);
 
-    /* 1. The original terms. With a rewritten question, the UNION of
-     * both questions' terms, raw first -- reformulation resolves
-     * follow-ups into something searchable, but it paraphrases, and a
-     * paraphrase can drop the one term the index is keyed on (measured:
-     * "license classes" -> a rewrite that lost "class"); the union lets
-     * the rewrite only ever add. */
+    /* 1. Original terms; with a rewrite, the union of both (rewrites can drop key terms). */
     TokenList *base =
         (rewritten_question != NULL)
             ? query_formulation_terms_union(question, rewritten_question, stopwords, wordnet,
@@ -154,17 +123,13 @@ RetrievalRun *retrieval_run(PgStore *store, const char *question, const char *re
     run->original_count = base->count;
 
     if (base->count == 0) {
-        /* Entirely stopwords -- a valid outcome the caller words for the
-         * user; nothing to expand or search. */
+        /* All stopwords: valid outcome, nothing to expand or search. */
         clock_gettime(CLOCK_MONOTONIC, &formulation_end);
-        run->formulation_ms = elapsed_ms(formulation_start, formulation_end);
+        run->formulation_ms = lexis_elapsed_ms(formulation_start, formulation_end);
         return run;
     }
 
-    /* 2. Sense-filtered WordNet expansion, policy-gated. The prompt
-     * shows the rewritten question when there is one (standalone, so
-     * the model can sense-check candidates without chat history). Any
-     * failure degrades to the plain terms already in run->terms. */
+    /* 2. Policy-gated WordNet expansion (standalone rewrite as prompt question); failure keeps plain terms. */
     if (policy->use_expansion) {
         const char *prompt_question = (rewritten_question != NULL) ? rewritten_question : question;
         QueryFormulationCandidates *candidates =
@@ -189,11 +154,9 @@ RetrievalRun *retrieval_run(PgStore *store, const char *question, const char *re
         query_formulation_candidates_free(candidates);
     }
     clock_gettime(CLOCK_MONOTONIC, &formulation_end);
-    run->formulation_ms = elapsed_ms(formulation_start, formulation_end);
+    run->formulation_ms = lexis_elapsed_ms(formulation_start, formulation_end);
 
-    /* 3. Weighted search: originals at full weight, expansions
-     * discounted so they can assist a passage but never let one outrank
-     * a passage matching the question itself. */
+    /* 3. Weighted search: expansions discounted so they can't outrank original-term matches. */
     struct timespec search_start, search_end;
     clock_gettime(CLOCK_MONOTONIC, &search_start);
 
@@ -223,31 +186,21 @@ RetrievalRun *retrieval_run(PgStore *store, const char *question, const char *re
         return NULL;
     }
 
-    /* 4. Optional meaning-based reorder of the whole candidate list,
-     * BEFORE the trim -- the point is exactly to rescue passages BM25
-     * ranked below the cutoff. The question embedded is the standalone
-     * one when a rewrite exists. On any reranker failure the BM25 order
-     * stands untouched. */
+    /* 4. Optional rerank before trim (rescues sub-cutoff passages); failure keeps BM25 order. */
     int reranked = 0;
     if (reranker_ready()) {
         const char *embed_question = (rewritten_question != NULL) ? rewritten_question : question;
         reranked = (reranker_rescore(store, embed_question, run->results) == 0);
     }
 
-    /* 5. Rank deep, send shallow -- trim to what is worth putting in
-     * front of the model, per policy. Done here, once, so "what the
-     * model reads" and "what any observer shows" are the same list.
-     * The score floor is a BM25-scale heuristic; fused reciprocal-rank
-     * scores live on a different scale, so it is disabled when the
-     * reranker actually ran (the passage cap and token budget still
-     * bound the prompt). */
+    /* 5. Trim per policy (model and observers share this list); score floor disabled after rerank (different scale). */
     if (policy->max_passages > 0) {
         double floor_ratio = reranked ? 0.0 : policy->score_floor_ratio;
         bm25_result_set_trim(store, run->results, policy->max_passages, policy->token_budget,
                              floor_ratio);
     }
     clock_gettime(CLOCK_MONOTONIC, &search_end);
-    run->search_ms = elapsed_ms(search_start, search_end);
+    run->search_ms = lexis_elapsed_ms(search_start, search_end);
 
     return run;
 }

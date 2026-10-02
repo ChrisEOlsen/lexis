@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Generates the LEXIS app icon: a macOS rounded-square (squircle-radius
-approximation) in near-black with a pixel-art smiley in accent blue.
-Writes app/assets/LEXIS.icns via an intermediate .iconset. Re-run after
-editing the pixel grid below; the .icns is committed so builds don't
-need Python."""
+"""Generates app/assets/LEXIS.icns (rounded square + pixel smiley); .icns is committed."""
 import subprocess, tempfile, os
 from PIL import Image, ImageDraw
 
@@ -17,7 +13,7 @@ RADIUS = int(S * 0.2237)  # Apple's rounded-square corner ratio
 img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
 draw = ImageDraw.Draw(img)
 
-# Vertical gradient background inside a rounded rect
+# Gradient background inside a rounded rect
 grad = Image.new("RGBA", (S, S))
 gd = ImageDraw.Draw(grad)
 for y in range(S):

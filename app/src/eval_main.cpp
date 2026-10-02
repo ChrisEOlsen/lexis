@@ -1,28 +1,5 @@
-// Batch evaluation harness: runs a list of questions through the REAL chat
-// pipeline and records what came back.
-//
-// This links the app's own QueryWorker rather than reimplementing the
-// pipeline, which is the entire point -- every earlier measurement in this
-// project was made by a scratch program that mirrored QueryWorker by hand,
-// and a mirror can drift from what the UI actually does. Here the routing,
-// reformulation, term union, retrieval, trimming, generation and provenance
-// are literally the same code the app runs; only the Qt UI and the
-// AppController state machine are absent.
-//
-// Each question gets its own fresh chat session, mirroring what the app does
-// when you open a group and ask something: selectGroup() always lands on a
-// new chat, so there is no conversation history unless the user builds it.
-// That isolates each question -- history effects are real (measured earlier
-// in this project) but they are a separate experiment.
-//
-// usage: lexis_eval <corpus_id> <questions_file> [--persist]
-//
-//   --persist  write each exchange to public.chat_sessions/chat_messages so
-//              the run can be browsed in the app afterwards. Off by default:
-//              a few hundred sessions makes the history drawer unusable.
-//
-// Output: TSV to stdout -- index, tool, passage_count, seconds, ok, question,
-// answer (tabs and newlines flattened so one exchange stays one row).
+// Batch eval harness: questions through the REAL pipeline (links QueryWorker itself, so
+// runs can't drift). usage: lexis_eval <corpus_id> <questions_file> [--persist]; TSV to stdout.
 
 #include <QCoreApplication>
 #include <QElapsedTimer>
@@ -49,14 +26,12 @@ extern "C" {
 #include <cstdlib>
 
 namespace {
-// Mirrors AppController's own constants. The conninfo comes from
-// config/lexis.conf and is never printed (embeds the password).
+// Mirrors AppController's constants. Conninfo is never printed (embeds the password).
 const char *kStopwordsPath = "data/stopwords/english.txt";
 const char *kWordnetDir = "data/wordnet";
 const char *kConfigPath = "config/lexis.conf";
 
-// Same truncation AppController::sendChatMessage() applies when it titles a
-// new chat from its first question.
+// Same title truncation AppController::sendChatMessage() applies.
 QString titleFor(const QString &question) {
     QString title = question.trimmed();
     constexpr int kMaxTitleLength = 60;
@@ -134,13 +109,8 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < questions.size(); i++) {
         const QString question = questions.at(i);
 
-        // A fresh session per question, exactly as the app does on a new
-        // chat. Always a REAL session, even when not persisting: the
-        // pipeline reads history from it and writes both messages to it, so
-        // a fake id would make every one of those calls fail against the
-        // foreign key and stop this being a faithful run. When persistence
-        // is off the session is deleted after the answer instead, which
-        // cascades its messages away.
+        // Fresh REAL session per question (the pipeline reads/writes it; a fake id would
+        // fail the foreign key). Deleted after the answer unless --persist.
         const qint64 sessionId =
             pg_store_create_chat_session(store, corpusId, titleFor(question).toUtf8().constData());
         if (sessionId <= 0) {
@@ -155,9 +125,7 @@ int main(int argc, char *argv[]) {
 
         QueryWorker worker(connInfo, corpusId, sessionId, question, stopwords, wordnet,
                             lemmatizer);
-        // DirectConnection: the lambda runs on the worker thread. There is no
-        // event loop here to pump a queued connection, and wait() below makes
-        // the ordering safe.
+        // DirectConnection: no event loop here to pump a queued one; wait() orders it.
         QObject::connect(
             &worker, &QueryWorker::queryFinished, &app,
             [&](bool okIn, QString answerIn, QVariantList sourcesIn, QString toolIn,
@@ -175,11 +143,8 @@ int main(int argc, char *argv[]) {
         worker.wait();
         const double seconds = timer.elapsed() / 1000.0;
 
-        // Column 8: the passage texts the model actually read, as a
-        // flattened JSON array. Lets any judge/metric score old runs
-        // (grounding, gold-sent attribution) without re-running the
-        // pipeline. Empty array for CHAT and legacy consumers ignore
-        // columns past 7.
+        // Column 8: passage texts the model read, as flattened JSON (lets judges score old
+        // runs without re-running the pipeline). Empty for CHAT; legacy readers ignore it.
         QJsonArray passageTexts;
         for (const QVariant &sourceVar : sources) {
             passageTexts.append(sourceVar.toMap().value(QStringLiteral("text")).toString());

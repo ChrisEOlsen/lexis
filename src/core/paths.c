@@ -1,7 +1,4 @@
-/*
- * Implementation of runtime path resolution.
- * See include/paths.h for the module's role.
- */
+/* Runtime path resolution; see paths.h. */
 
 #define _POSIX_C_SOURCE 200809L
 

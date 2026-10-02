@@ -1,0 +1,6 @@
+# Copy to config/local.mk (gitignored) and edit for your machine.
+PG_CONFIG = /opt/homebrew/opt/postgresql@18/bin/pg_config
+LLAMA_CPP_DIR = /opt/homebrew/Cellar/llama.cpp/10360
+GGML_DIR = /opt/homebrew/Cellar/ggml/0.19.0
+PG_NATIVE_BIN = /opt/homebrew/opt/postgresql@18/bin
+PG_NATIVE_DATA = /opt/homebrew/var/postgresql@18

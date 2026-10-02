@@ -1,15 +1,5 @@
-// Left-hand panel: a single drill-down StackView. Level 1
-// (GroupsListView) is every group; clicking one selects it and pushes
-// level 2 (GroupDocumentsView), that group's documents; "back" pops.
-// Neither level knows about this StackView -- they only emit
-// groupOpened()/backRequested().
-//
-// The panel is a Fluent "layer": a rounded card filled one step lighter
-// than the window, with a hairline border. Fluent builds depth by
-// stacking lighter fills rather than by drawing shadows, so this is the
-// idiomatic way to separate the source list from the content pane -- and
-// it replaces the previous 1px divider that only worked while the window
-// color happened to contrast with both sides.
+// Left-hand drill-down: groups list, then the selected group's documents.
+// A Fluent "layer" card; levels signal up, they don't know about this StackView.
 pragma ComponentBehavior: Bound
 
 import QtQuick
@@ -27,18 +17,11 @@ Rectangle {
         id: stackView
         anchors.fill: parent
         anchors.margins: Theme.spacingS
-        // StackView does not clip by default -- during a push/pop the
-        // outgoing item is translated aside while the incoming one slides
-        // in, and without clipping both render outside this card's bounds
-        // mid-transition.
+        // Clip: pages slide sideways mid-transition and would render outside the card.
         clip: true
 
-        // Explicit transitions instead of StackView's defaults, which are
-        // a 400ms full-width x-slide. At 400ms both pages overlap for
-        // most of the animation, which in a narrow column reads as the
-        // outgoing page's button smearing across the incoming one. A
-        // short offset plus a crossfade keeps the "went deeper / came
-        // back" cue without the long two-pages-visible window.
+        // Short offset + crossfade instead of the default 400ms full slide (which smears
+        // the outgoing page's buttons across the incoming one in a narrow column).
         pushEnter: Transition {
             NumberAnimation { property: "x"; from: 24; to: 0; duration: Theme.durationNav; easing.type: Easing.OutCubic }
             NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Theme.durationNav }

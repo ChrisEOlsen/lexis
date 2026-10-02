@@ -1,18 +1,5 @@
-// The one object QML talks to for everything backend-related: groups,
-// documents, ingestion, and chat. Wraps LexisEngine (the actual
-// pg_store C-API adapter) plus the three list models QML binds its
-// ListViews to. Exposed as a QML singleton -- QML creates and owns the
-// single instance automatically the first time it's referenced after
-// `import Lexis`, no manual registration needed in main.cpp.
-//
-// Owns the language data (stopwords/wordnet/lemmatizer) every ingest
-// AND every chat query needs, loaded once for the app's whole lifetime
-// and shared read-only across every IngestWorker/QueryWorker -- see
-// IngestWorker.h's own comment on why that's safe. Also owns the local
-// model's lifetime: kicks off a background ModelLoader in the
-// constructor (see ModelLoader.h for why proactively, not deferred to
-// first chat use) and calls local_llm_client_cleanup() in the
-// destructor, after waiting for any in-flight loader/query.
+// The one object QML talks to for everything backend-related (QML singleton; owns
+// LexisEngine, the list models, the shared language data, and the local model lifetime).
 
 #ifndef LEXIS_APP_APPCONTROLLER_H
 #define LEXIS_APP_APPCONTROLLER_H
@@ -31,9 +18,7 @@ extern "C" {
 #include "wordnet.h"
 }
 
-// Full definitions, not forward declarations -- Q_PROPERTY's pointer
-// types need the complete class visible for Qt's meta-type
-// registration (MOC-generated code fails a static_assert otherwise).
+// Full definitions: Q_PROPERTY pointer types need complete classes for MOC.
 #include "ChatMessageListModel.h"
 #include "ChatSessionListModel.h"
 #include "CorpusListModel.h"
@@ -54,15 +39,11 @@ class AppController : public QObject {
     Q_PROPERTY(QString activeCorpusName READ activeCorpusName NOTIFY activeCorpusIdChanged)
     Q_PROPERTY(bool busy READ isBusy NOTIFY busyChanged)
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusTextChanged)
-    // The one group currently ingesting (-1 = none). Chat is blocked for
-    // this group only -- ChatPanel swaps in an "ingestion in progress"
-    // panel when it is the active group; every other group stays fully
-    // usable, including chat, while the ingest runs in the background.
+    // Group currently ingesting (-1 = none). Chat is blocked for this group only;
+    // every other group stays usable while the ingest runs in the background.
     Q_PROPERTY(qint64 ingestingCorpusId READ ingestingCorpusId NOTIFY ingestStateChanged)
-    // 0..1 target for the progress bar. Real during extraction; when the
-    // index rebuild starts (one C call, no progress hooks) it jumps to
-    // near-complete and ingestAnimMs carries the estimated rebuild time,
-    // so QML animates through the estimate instead of freezing.
+    // 0..1 progress-bar target. Real during extraction; jumps to near-complete when
+    // the hook-less index rebuild starts, with ingestAnimMs carrying its time estimate.
     Q_PROPERTY(double ingestProgress READ ingestProgress NOTIFY ingestStateChanged)
     Q_PROPERTY(int ingestAnimMs READ ingestAnimMs NOTIFY ingestStateChanged)
     Q_PROPERTY(QString ingestStatusText READ ingestStatusText NOTIFY ingestStateChanged)
@@ -74,35 +55,19 @@ class AppController : public QObject {
     Q_PROPERTY(QString activeChatSessionTitle READ activeChatSessionTitle NOTIFY activeChatSessionIdChanged)
     Q_PROPERTY(bool modelReady READ isModelReady NOTIFY modelReadyChanged)
     Q_PROPERTY(bool chatBusy READ isChatBusy NOTIFY chatBusyChanged)
-    // Live pipeline progress for the chat footer: what the running query
-    // is doing right now ("Searching the group...", "Reading 12
-    // passages...", "Writing...", "Trying again with a deeper search...").
-    // Empty when no query is running -- the footer's placeholder covers
-    // that case. A new query resets it to the routing stage's text.
+    // Live pipeline stage for the chat footer ("Searching the group...", ...).
+    // Empty when no query is running.
     Q_PROPERTY(QString queryStageText READ queryStageText NOTIFY queryStageTextChanged)
-    // Settings-panel state (F5). Both apply live (no restart): thinking
-    // via an explicit per-query override handed to QueryWorker (bypassing
-    // generation.c's once-per-process config cache), the reranker via
-    // retrieval_set_reranker_enabled(). Both persist through
-    // ConfigManager's line-preserving rewrite of config/lexis.conf.
-    // modelDisplayName is read-only display (its change requires a
-    // restart and stays a file edit, per the spec).
+    // Settings state: both apply live and persist via ConfigManager. modelDisplayName
+    // is read-only (changing the model is a config-file edit + restart).
     Q_PROPERTY(bool thinkingEnabled READ isThinkingEnabled NOTIFY settingsChanged)
     Q_PROPERTY(bool rerankerEnabled READ isRerankerEnabled NOTIFY settingsChanged)
     Q_PROPERTY(QString modelDisplayName READ modelDisplayName NOTIFY settingsChanged)
-    // The local model's context window in tokens (LOCAL_LLM_N_CTX). CONSTANT
-    // because it is a compile-time constant of the loaded model, not per
-    // message -- the source inspector reports it when the READ tool fed
-    // documents to the model directly, since that path's real limit is how
-    // much text fits in this window.
+    // Local model's context window in tokens. CONSTANT: a property of the loaded model,
+    // reported by the source inspector for retired READ-path answers.
     Q_PROPERTY(int contextTokenLimit READ contextTokenLimit CONSTANT)
-    // Whether "Try harder" would actually do something right now: the
-    // newest answer in THIS session came from SEARCH, its question is
-    // still known, and nothing blocks a query. The button binds to this
-    // instead of guessing from the message row, because the retry always
-    // acts on the conversation's newest answer -- a session loaded from
-    // history has answers but no live question to re-ask, and offering
-    // the button there produced a click that silently did nothing.
+    // Whether "Try harder" would do something now: newest answer in THIS session came
+    // from SEARCH, its question is still known, and nothing blocks a query.
     Q_PROPERTY(bool canRetryLastAnswer READ canRetryLastAnswer NOTIFY canRetryLastAnswerChanged)
 
 public:
@@ -134,105 +99,62 @@ public:
 
     Q_INVOKABLE bool createGroup(const QString &displayName);
     Q_INVOKABLE bool deleteGroup(qint64 corpusId);
-    // Switches the active group and loads its documents and its chat
-    // session list. Always lands on a fresh chat (see startNewChat()) --
-    // it never resumes the group's most recent conversation, because a
-    // question typed right after opening a group must not silently append
-    // to an old thread. Resuming is explicit, via the history drawer.
+    // Switches the active group. Always lands on a fresh chat, never the most recent
+    // conversation; resuming is explicit, via the history drawer.
     Q_INVOKABLE void selectGroup(qint64 corpusId);
 
-    // Resets to a "pending new chat" state -- activeChatSessionId
-    // becomes -1 and chatModel is cleared, but no database row is
-    // created yet (see sendChatMessage()'s own comment on lazy session
-    // creation). A no-op-looking call with real effect: it's what backs
-    // the chat panel's "New Chat" button.
+    // Resets to "pending new chat" (id -1, cleared model); the session row is created
+    // lazily by sendChatMessage(). Backs the "New Chat" button.
     Q_INVOKABLE void startNewChat();
 
-    // Loads sessionId's full message history into chatModel. A no-op if
-    // sessionId doesn't exist (LexisEngine::getChatMessages() just
-    // returns an empty list).
+    // Loads sessionId's full history into chatModel. No-op if sessionId doesn't exist.
     Q_INVOKABLE void selectChatSession(qint64 sessionId);
 
-    // Permanently deletes a chat session and every message in it. If it
-    // was the active session, falls back to startNewChat()'s pending
-    // state rather than leaving chatModel showing a now-deleted
-    // conversation.
+    // Deletes a chat session and its messages. Falls back to startNewChat() if active.
     Q_INVOKABLE void deleteChatSession(qint64 sessionId);
 
-    // fileUrls are raw file:// URL strings straight from QML's
-    // DropArea.drop.urls -- converted to local paths here (via
-    // QUrl::toLocalFile(), not string manipulation) rather than in QML,
-    // since that's the robust way to handle URL-encoded characters
-    // (spaces, non-ASCII filenames) correctly.
+    // fileUrls are raw file:// strings from DropArea.drop.urls, converted to local paths
+    // here via QUrl::toLocalFile() (handles URL-encoded characters correctly).
     Q_INVOKABLE void ingestFiles(const QStringList &fileUrls);
 
-    // Requires a group to be selected and the model to be ready
-    // (modelReady) -- a no-op otherwise (mirrors ingestFiles()'s own
-    // guard pattern). Appends the question to chatModel immediately (so
-    // it shows up right away, not after the round trip completes), then
-    // the answer once QueryWorker finishes.
+    // No-op unless a group is selected and the model is ready. Shows the question
+    // immediately, then the answer once QueryWorker finishes.
     Q_INVOKABLE void sendChatMessage(const QString &question);
 
-    // System clipboard for the answer actions (QML exposes no clipboard
-    // of its own; this is the one-liner a Copy button needs).
+    // System clipboard for the Copy buttons (QML exposes no clipboard of its own).
     Q_INVOKABLE void copyToClipboard(const QString &text);
 
-    // Lets QML raise the standard message dialog (the notify() signal's
-    // Main.qml handler) -- for errors a QML component detects itself,
-    // like a document that can't be opened.
+    // Lets QML raise the standard message dialog for errors it detects itself.
     Q_INVOKABLE void showMessage(const QString &message) { emit notify(message); }
 
     // -- Settings (F5): live + persisted via ConfigManager --
     Q_INVOKABLE void setThinkingEnabled(bool enabled);
     Q_INVOKABLE void setRerankerEnabled(bool enabled);
 
-    // A file:// URL for the directory holding config/lexis.conf, for the
-    // Settings dialog's "Open config folder" -- QML opens it with
-    // Qt.openUrlExternally (Finder on macOS). The file itself is never
-    // opened by the app: config edits are a deliberate human act.
+    // file:// URL of the config directory, for Settings' "Open config folder".
     Q_INVOKABLE QString configDirectoryUrl() const;
 
-    // Backs the canRetryLastAnswer property; retryLastAnswer() uses the
-    // same call as its own guard, so the button and the action can never
-    // disagree about whether a retry is possible.
+    // Backs canRetryLastAnswer; retryLastAnswer() uses it as its guard too.
     bool canRetryLastAnswer() const;
 
-    // -- Document viewer (F1) --
-    // Loads one document's stored text and chunk list for the viewer
-    // dialog (see LexisEngine::getDocument()). Returns a QVariantMap
-    // {"name", "text", "chunks"} (chunks: [{"chunkId", "text",
-    // "tokenCount"}...]), or an empty map when the document doesn't
-    // exist or the read fails -- the QML side treats empty as "cannot
-    // open" and says so.
+    // Document viewer payload: {"name", "text", "chunks"}, or an empty map when the
+    // document can't be read (QML reports that as "cannot open").
     Q_INVOKABLE QVariantMap openDocument(const QString &documentName);
 
-    // -- Document removal (F4) --
-    // Removes one document from the ACTIVE group (transactionally --
-    // see pg_store_remove_document()). A no-op when a different group
-    // is ingesting or this group's index is mid-rebuild (the removal
-    // writes to the live schema; a rebuild's swap would race it).
+    // Removes one document from the ACTIVE group. No-op while its index is mid-rebuild
+    // (the removal writes the live schema; a rebuild's swap would race it).
     Q_INVOKABLE void removeDocument(const QString &documentName);
 
-    // "Try harder" on the newest answer (see QueryWorker's forceRetry):
-    // re-runs that question's SEARCH pipeline with the deeper retrieval
-    // policy and the reasoning pass on, replacing the answer the UI
-    // shows and the row history persists. A no-op when no query is
-    // running, none ever ran in this session, or the newest exchange
-    // wasn't a SEARCH answer (retries don't make sense for CHAT or
-    // SUMMARY answers).
+    // "Try harder": re-runs the newest answer's SEARCH pipeline with deeper retrieval
+    // and the reasoning pass on, replacing the answer in the UI and in history.
     Q_INVOKABLE void retryLastAnswer();
 
-    // Starts the background model load if it never ran -- the
-    // constructor skips it when the model file doesn't exist yet (fresh
-    // install), and the setup overlay calls this once the download
-    // finishes. A no-op while a load is in flight or already done.
+    // Starts the background model load if it never ran (fresh installs skip it until the
+    // setup download lands). No-op while a load is in flight or already done.
     Q_INVOKABLE void retryModelLoad();
 
-    // Aborts the running ingest (the progress panel's Cancel button).
-    // Lossless: the rebuild happens in a temporary schema that only
-    // replaces the group at the very end, so cancelling leaves the
-    // group exactly as it was before the drop. A no-op when nothing is
-    // ingesting.
+    // Aborts the running ingest. Lossless (rebuild runs in a temp schema); no-op when
+    // nothing is ingesting.
     Q_INVOKABLE void cancelIngest();
 
 signals:
@@ -247,10 +169,7 @@ signals:
     void canRetryLastAnswerChanged();
     // Thinking/reranker/model-display changed (Settings panel).
     void settingsChanged();
-    // Reused for both real errors and informational results (e.g. "N
-    // passages added") -- QML shows both the same way, as a dismissible
-    // message dialog; splitting into two signals would just double the
-    // QML-side wiring for no behavioral difference.
+    // One signal for errors and informational results alike; QML shows both the same way.
     void notify(QString message);
 
 private slots:
@@ -262,16 +181,14 @@ private slots:
                           QString searchQuery, QString searchTerms);
     void onQueryStage(int stage, int payload);
     void onQueryToken(QString piece);
+    // Fired before onQueryFinished(false) on model failure; reason replaces the generic notice.
+    void onQueryFailed(QString reason);
 
 private:
     void refreshCorpusModel();
     void refreshDocumentModel();
 
-    // Re-fetches every chat session for m_activeCorpusId and repopulates
-    // m_chatSessionModel -- doesn't touch activeChatSessionId or
-    // chatModel, so it's safe to call after any operation that only
-    // changes the *set* of sessions (delete, lazy-create) without
-    // disturbing whichever session is currently open.
+    // Re-fetches this group's sessions. Leaves the open session and chatModel alone.
     void refreshChatSessionModel();
 
     std::unique_ptr<LexisEngine> m_engine;
@@ -296,29 +213,22 @@ private:
     bool m_modelReady;
     bool m_chatBusy;
     QString m_queryStageText;
-    // The question behind the running/last query, for retryLastAnswer():
-    // a retry re-asks it, not a reformulation (the pipeline re-derives
-    // everything else). Also remembers whether that query's answer was
-    // a SEARCH answer, for the same no-op guards.
+    // Question behind the running/last query; a retry re-asks it verbatim.
     QString m_lastQuestion;
     bool m_lastAnswerWasSearch = false;
-    // The last answer's own display fields, so a failed retry can put
-    // the original answer back (a "try harder" must never destroy the
-    // answer it was trying to improve).
+    // Last answer's display fields, so a failed retry can restore the original.
     QString m_lastAnswer;
     QVariantList m_lastAnswerSources;
     QString m_lastAnswerTool;
     QString m_lastAnswerSearchQuery;
     QString m_lastAnswerSearchTerms;
-    // True while the running query is a "try harder" retry whose live row
-    // is a converted (cleared) previous answer -- on failure that answer
-    // is restored rather than the row discarded. See retryLastAnswer().
+    // True while a retry is streaming into a converted previous answer; on failure that
+    // answer is restored rather than the row discarded.
     bool m_retryingLiveAnswer = false;
-    // Keep the m_last* block above describing the ACTIVE session's newest
-    // exchange. Switching sessions without this let a retry run one
-    // session's question against another session's id and overwrite an
-    // unrelated answer. adoptLastExchange() reads the state back out of a
-    // session loaded from history, so the button stays usable there.
+    // Set by onQueryFailed, consumed once by the matching onQueryFinished(false).
+    QString m_queryFailureReason;
+    // Keep m_last* describing the ACTIVE session's newest exchange; adoptLastExchange()
+    // re-derives it from history so the retry button stays usable there.
     void clearLastExchange();
     void adoptLastExchange(const QVector<ChatMessage> &messages);
     QString m_modelPath; // from config/lexis.conf, resolved once in the constructor
@@ -328,9 +238,7 @@ private:
     WordNetTable *m_wordnet;
     Lemmatizer *m_lemmatizer;
 
-    // Settings state (F5): read once at startup from the same file
-    // ConfigManager writes, applied live per-query (see the property
-    // comment above), and kept in sync by the setters.
+    // Settings state: read at startup, applied live per-query, kept in sync by setters.
     bool m_thinkingEnabled = true;
     bool m_rerankerEnabled = false;
     QString m_modelDisplayName;

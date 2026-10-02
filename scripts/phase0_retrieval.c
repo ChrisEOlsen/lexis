@@ -1,22 +1,5 @@
 /*
- * Phase 0 retrieval harness: batch-runs the app's own BM25 retrieval over a
- * list of questions and prints the ranked passage ids for each.
- *
- * Deliberately loads NO language model. DelucionQA questions are single-turn,
- * so query_formulation_contextualize_question() has no history to work with
- * and returns the question unchanged without ever calling the model -- which
- * means the whole measurement runs in seconds instead of the hours every
- * generation-based measurement in this project has cost.
- *
- * Uses query_formulation_terms_union() with a NULL rewrite, so it exercises
- * the exact function the app calls rather than a reimplementation of it.
- *
- * Input:  a file of questions, one per line (tabs/newlines already stripped).
- * Output: TSV to stdout -- question_index, rank (1-based), passage_id, score.
- *         Scoring against gold contexts happens in phase0_score.py, which owns
- *         the passage text and the matching rule.
- *
- * Build: see scripts/phase0_run.sh
+ * Phase 0 harness: batch BM25 retrieval over questions; TSV to stdout (scored by phase0_score.py).
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -68,10 +51,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B};
-    /* Computed once for the whole run, not per query -- it is a full-corpus
-     * aggregate and stays valid while the corpus doesn't change (see
-     * bm25_search()'s own doc comment). */
+    BM25Params params = {.k1 = BM25_DEFAULT_K1, .b = BM25_DEFAULT_B};
+    /* Once per run: a full-corpus aggregate, valid while the corpus is unchanged. */
     BM25CorpusStats stats = bm25_corpus_stats(store);
 
     char line[LINE_MAX_LEN];
@@ -85,9 +66,7 @@ int main(int argc, char **argv) {
 
         TokenList *terms = query_formulation_terms_union(line, NULL, sw, wn, lm);
         if (terms == NULL || terms->count == 0) {
-            /* No searchable terms: emitted as a question with zero results
-             * rather than skipped, so the scorer counts it as a miss instead
-             * of silently shrinking the denominator. */
+            /* Zero results, not skipped: the scorer must count this as a miss. */
             token_list_free(terms);
             index++;
             continue;

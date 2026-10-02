@@ -1,7 +1,4 @@
-/*
- * Tests for src/core/csv_parse.c — strict RFC4180 CSV parsing. Pure
- * in-memory logic, no database needed.
- */
+/* Tests for csv_parse.c: strict RFC4180 parsing, no database. */
 
 #include "csv_parse.h"
 #include "test_utils.h"
@@ -178,9 +175,7 @@ static void test_crlf_line_endings(void) {
 }
 
 static void test_quoted_field_starting_with_a_digit_matches_unquoted(void) {
-    /* Real-world case: a numeric-looking column sometimes gets quoted by
-     * spreadsheet exporters even without needing to be -- must parse
-     * identically to an unquoted equivalent. */
+    /* Spreadsheet exporters may quote numeric fields; must parse identically. */
     write_test_file("id,name\n"
                      "\"123\",alice\n");
 

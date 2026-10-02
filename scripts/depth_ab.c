@@ -1,22 +1,5 @@
 /*
- * A/B harness: does sending fewer passages produce better answers?
- *
- * Phase 0 showed BM25 puts a correct passage at rank 1 for 82% of DelucionQA
- * questions and inside the top 12 for 97%, so the twelve passages the app
- * currently sends are mostly distractors. Separate measurement showed answer
- * quality degrading as retrieval depth grew. This runs the real pipeline at
- * two passage counts over the same questions and the same candidate sets, so
- * the only variable is how many of them reach the model.
- *
- * Single-turn: no conversation history is passed, matching how DelucionQA
- * questions are posed and keeping history out of the comparison entirely.
- *
- * Output: TSV to stdout -- question_index, max_passages, n_sent,
- * passage_ids (comma separated), prompt_tokens, seconds, answer. Tabs and
- * newlines are stripped from the answer so the row stays parseable; scoring
- * against the reference answers happens in depth_ab_score.py.
- *
- * Build: see scripts/depth_ab_run.sh
+ * A/B harness: same questions/candidates at 12 vs 5 passages; TSV to stdout (see depth_ab_score.py).
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -42,8 +25,7 @@
 #define SCORE_FLOOR 0.6
 #define LINE_MAX_LEN 8192
 
-/* The two configurations under test: today's 12, versus the 5 that Phase 0's
- * recall@5 of 93.5% suggests may be enough. */
+/* Today's 12 vs 5 (Phase 0 recall@5 93.5%). */
 static const size_t CONFIGS[] = {12, 5};
 
 static double now_s(void) {
@@ -52,8 +34,7 @@ static double now_s(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
-/* In place: collapse every tab/newline to a space so one answer stays one
- * TSV field. */
+/* Flatten tabs/newlines so one answer stays one TSV field. */
 static void flatten(char *text) {
     for (char *p = text; *p != '\0'; p++) {
         if (*p == '\t' || *p == '\n' || *p == '\r') {
@@ -95,7 +76,7 @@ int main(int argc, char **argv) {
     WordNetTable *wn = wordnet_table_load("data/wordnet");
     Lemmatizer *lm = lemmatizer_load("data/wordnet");
 
-    BM25Params params = {BM25_DEFAULT_K1, BM25_DEFAULT_B};
+    BM25Params params = {.k1 = BM25_DEFAULT_K1, .b = BM25_DEFAULT_B};
     BM25CorpusStats stats = bm25_corpus_stats(store);
 
     char line[LINE_MAX_LEN];

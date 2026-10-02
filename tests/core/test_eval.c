@@ -1,13 +1,4 @@
-/*
- * Tests for src/core/eval.c -- the retrieval-quality evaluation harness.
- * Uses the real native Postgres instance (lexis_test database, port
- * 5434) -- `make pg-start` must be running for these to pass.
- *
- * local_llm_client_init() is never called in this test binary, so
- * query_formulation_formulate_query() always falls back to its plain
- * stopword-filtered terms (see test_query_formulation.c) -- deterministic
- * and network/model-free, exactly what a unit test wants here.
- */
+/* Tests for eval.c against native Postgres; LLM expansion always falls back here. */
 
 #include "eval.h"
 #include "bulk_ingest.h"
@@ -34,14 +25,8 @@ static void write_file(const char *path, const char *contents) {
     fclose(fp);
 }
 
-/* Seeds one document into the index via the real ingestion pipeline
- * (bulk_ingest_tsv(), single-threaded) instead of any lower-level
- * document-ingestion primitive -- bulk_ingest.c's three-phase pipeline
- * is the only ingestion path this codebase has, so eval's own test
- * fixtures go through the same path real corpora do. `pid`/`text` must
- * not themselves contain a literal tab, double-quote, or newline (none
- * of this file's fixtures do) -- see pg_store.c's pg_store_copy_
- * documents_raw() for why those specifically would need CSV quoting. */
+/* Seed via real bulk_ingest_tsv; pid/text must avoid tab/quote/newline
+ * (see pg_store_copy_documents_raw). */
 static long seed_document(const StopwordSet *stopwords, const WordNetTable *wordnet,
                            const Lemmatizer *lemmatizer, const char *pid, const char *text,
                            size_t chunk_size, size_t overlap) {
@@ -62,10 +47,7 @@ static PgStore *open_fresh_store(void) {
     return store;
 }
 
-/* A long enough passage (> LEXIS's usual small chunk_size used here) to
- * split into 3 chunks sharing one document_name -- reproduces the exact
- * multi-chunk-document scenario that once let Recall@K exceed 1.0 (a
- * relevant pid counted once per matching chunk instead of once overall). */
+/* Splits into 3 chunks; regression for Recall@K exceeding 1.0. */
 static const char *MULTI_CHUNK_TEXT =
     "hypertension treatment options one two three four five six seven eight nine ten "
     "hypertension treatment options eleven twelve thirteen fourteen fifteen sixteen "
@@ -78,9 +60,7 @@ int main(void) {
     TEST_ASSERT(stopwords != NULL && wordnet != NULL && lemmatizer != NULL, "expected setup to succeed");
 
     {
-        /* Regression test for the recall-can-exceed-1.0 bug: a document
-         * split into multiple chunks must still count as at most one hit
-         * against a qrels row that names it once. */
+        /* Multi-chunk doc must count once, not once per chunk. */
         PgStore *store = open_fresh_store();
         TEST_ASSERT(store != NULL, "expected pg_store_open to succeed -- is native Postgres running (make pg-start)?");
 
@@ -110,8 +90,7 @@ int main(void) {
     }
 
     {
-        /* A relevant pid that's never actually retrieved -- both metrics
-         * should be exactly 0 for that query, not just "not 1.0". */
+        /* Unretrieved relevant pid: both metrics exactly 0. */
         PgStore *store = open_fresh_store();
         TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
@@ -134,8 +113,7 @@ int main(void) {
     }
 
     {
-        /* A query with no matching qrels row at all is skipped, not
-         * counted as evaluated and not treated as a failure. */
+        /* Queries with no qrels row are skipped, not failed. */
         PgStore *store = open_fresh_store();
         TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
@@ -153,8 +131,7 @@ int main(void) {
     }
 
     {
-        /* A qrels row with score 0 doesn't count as relevant -- matches
-         * qrels' own convention for a judged-but-not-relevant pair. */
+        /* Score-0 qrels rows are not relevant. */
         PgStore *store = open_fresh_store();
         TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 
@@ -173,11 +150,7 @@ int main(void) {
     }
 
     {
-        /* use_llm_expansion=0 -- query_formulation_terms_only() instead
-         * of query_formulation_formulate_query(), no model call at all.
-         * local_llm_client_init() is never called anywhere in this test
-         * binary (see this file's header comment), so this exercises the
-         * real no-LLM code path standalone, not by coincidence. */
+        /* use_llm_expansion=0: plain terms path, no model call. */
         PgStore *store = open_fresh_store();
         TEST_ASSERT(store != NULL, "expected pg_store_open to succeed");
 

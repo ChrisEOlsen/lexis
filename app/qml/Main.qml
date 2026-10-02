@@ -1,6 +1,4 @@
-// Root window. Lays out the group sidebar against the chat panel and
-// shows AppController's notify() signal as a dismissible dialog -- the
-// one place both children funnel user-facing messages through.
+// Root window: sidebar + chat panel, with notify() shown as a dialog.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -15,21 +13,15 @@ ApplicationWindow {
     minimumHeight: 560
     title: "LEXIS"
 
-    // Sidebar collapse -- pure UI state, toggled from ChatPanel's header
-    // button. Fully collapsible: the panel animates to zero width and
-    // fades, leaving the whole window to the conversation. The animated
-    // value is this plain property, not the Layout attached property --
-    // Behavior on attached properties is not reliably supported.
+    // Sidebar collapse (pure UI state). Animates a plain property: Behavior on
+    // attached Layout properties is not reliably supported.
     property bool sidebarCollapsed: false
     property real sidebarWidth: sidebarCollapsed ? 0 : 260
     Behavior on sidebarWidth {
         NumberAnimation { duration: Theme.durationNav; easing.type: Easing.OutCubic }
     }
 
-    // No explicit `color`. ApplicationWindow is one of the controls
-    // FluentWinUI3 implements, so the window background is the style's --
-    // which is what makes it match the dialogs and popups drawn over it
-    // without a shared color token to keep in sync.
+    // No explicit color: the style's window background matches dialogs/popups for free.
 
     Connections {
         target: AppController
@@ -47,14 +39,8 @@ ApplicationWindow {
         standardButtons: Dialog.Ok
         property alias text: messageLabel.text
 
-        // Explicit width, and an explicit width on the wrapping Label
-        // below. Without both this is a real binding loop, reported at
-        // runtime as 'QML Dialog: Binding loop detected for property
-        // "implicitWidth"': Dialog.implicitWidth derives from its
-        // content's implicitWidth, a WordWrap Label's implicitWidth
-        // derives from the width it was given, and that width comes from
-        // the Dialog. A loop re-runs layout every frame, visible as the
-        // dialog jittering as it opens.
+        // Explicit widths on dialog AND label: without both, a binding loop jitters
+        // the dialog as it opens (Dialog <-> WordWrap label implicitWidth).
         width: Math.min(440, window.width - 2 * Theme.spacingXL)
 
         Label {
@@ -72,11 +58,9 @@ ApplicationWindow {
         GroupSidebar {
             Layout.preferredWidth: window.sidebarWidth
             Layout.fillHeight: true
-            // Fade with the width so mid-animation content reads as
-            // sliding away rather than being crushed.
+            // Fade with the width so content slides away rather than crushing.
             opacity: window.sidebarWidth / 260
-            // At width 0 the item (and its 1px border) must not paint,
-            // and it must not eat the RowLayout's spacing either.
+            // At width 0 the item must not paint or eat layout spacing.
             visible: window.sidebarWidth > 0.5
             clip: true
         }
@@ -88,11 +72,8 @@ ApplicationWindow {
         }
     }
 
-    // First-run setup: shown only in an installed bundle whose language
-    // models haven't been downloaded yet (SetupController.required is
-    // always false in a dev build). Covers the whole window until the
-    // ~5.1GB download lands, then asks AppController to start the model
-    // load it skipped at startup.
+    // First-run setup overlay (bundle mode, models missing). Covers the window until
+    // the download lands, then AppController starts the skipped model load.
     Connections {
         target: SetupController
         function onSetupComplete() {
@@ -103,9 +84,7 @@ ApplicationWindow {
     Rectangle {
         anchors.fill: parent
         visible: SetupController.required || SetupController.downloading
-        // Opaque black, not a translucent scrim -- the UI underneath is
-        // alive (animations, loading states) and movement bleeding
-        // through the setup screen looks broken.
+        // Opaque: the live UI bleeding through would look broken.
         color: "black"
 
         // Swallow clicks so the UI underneath is inert during setup.

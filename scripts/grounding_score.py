@@ -1,71 +1,19 @@
 #!/usr/bin/env python3
-"""Grounding attribution for a lexis_eval run that carries passages (col 8).
-
-Answers the two questions pipeline_eval_score.py cannot:
-
-  gold_sent   did text from this question's gold documents (DelucionQA's
-              per-question `documents` in raw/*.json -- real ground truth)
-              actually reach the model? Computed as shingle containment:
-              a gold document counts as sent when >= GOLD_SENT_MIN of its
-              8-word shingles appear in the sent passages. Splits every
-              weak answer into "retrieval never delivered" vs "model had
-              it and still answered weakly".
-
-  supported   is the answer entailed by the sent passages, per a DeBERTa-v3
-              NLI cross-encoder (MoritzLaurer/DeBERTa-v3-base-mnli-fever-
-              anli) -- the same model family RAGBench fine-tuned for its
-              unpublished judge, so this is a same-family stand-in, not
-              the identical yardstick; say so when comparing to their
-              published adherence numbers. (Vectara's HHEM was the first
-              choice but its custom model code doesn't run on Python
-              3.14-era transformers.) Scored per (passage, answer) pair
-              as P(entailment), max over passages: "supported by at least
-              one sent passage". Conservative by construction -- an
-              answer that synthesizes across several passages can score
-              low against each individually.
-
-Usage:
-  .venv/bin/python scripts/grounding_score.py <raw_dir> <run_tsv> <stopwords> <per_row_out.tsv>
-
-Needs the venv (transformers/torch/sentencepiece); downloads the judge
-(~0.7GB) on first run.
-"""
+"""Grounding attribution for a lexis_eval run with passages: gold_sent + NLI support.
+Usage: grounding_score.py <raw_dir> <run_tsv> <stopwords> <out.tsv> (needs venv; ~0.7GB judge)."""
 
 import json
 import os
 import re
 import sys
 
-SHINGLE = 8
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from eval_common import content_words, looks_like_refusal, shingles
+
 GOLD_SENT_MIN = 0.35  # fraction of a gold doc's shingles that must arrive
 SUPPORT_MIN = 0.5
 WEAK_COVERAGE = 0.25
 HHEM_BATCH = 64
-
-REFUSAL_MARKERS = (
-    "don't have enough",
-    "do not have enough",
-    "not enough information",
-    "does not contain",
-    "doesn't contain",
-    "no matching passages",
-    "could you rephrase",
-)
-
-
-def normalize(text):
-    return " ".join(text.lower().split())
-
-
-def shingles(text):
-    words = normalize(text).split()
-    if len(words) < SHINGLE:
-        return {" ".join(words)} if words else set()
-    return {" ".join(words[i : i + SHINGLE]) for i in range(len(words) - SHINGLE + 1)}
-
-
-def content_words(text, stopwords):
-    return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in stopwords and len(w) > 2}
 
 
 def main():
@@ -74,9 +22,7 @@ def main():
     with open(stopwords_path) as fh:
         stopwords = {l.strip().lower() for l in fh if l.strip()}
 
-    # Ground truth per question: reference answers + each gold document's
-    # own shingle set (per-doc, not unioned -- one retrieved gold doc is
-    # enough for gold_sent, and a union would blur the threshold).
+    # Per-doc (not unioned) gold shingle sets: one retrieved gold doc suffices.
     refs, gold_docs = {}, {}
     for name in sorted(os.listdir(raw_dir)):
         if not name.endswith(".json"):
@@ -93,7 +39,7 @@ def main():
 
     rows = []
     with open(run_tsv) as fh:
-        fh.readline()  # header
+        fh.readline()
         for line in fh:
             parts = line.rstrip("\n").split("\t")
             if len(parts) < 8:
@@ -122,7 +68,7 @@ def main():
         for p in row["passages"]:
             sent_shingles |= shingles(p)
 
-        row["refusal"] = any(m in row["answer"].lower() for m in REFUSAL_MARKERS)
+        row["refusal"] = looks_like_refusal(row["answer"])
 
         best_frac = 0.0
         for doc_sh in gold_docs.get(q, []):
@@ -148,9 +94,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(judge_name)
     model = AutoModelForSequenceClassification.from_pretrained(judge_name)
     model.eval()
-    # MPS is ~100x this workload's CPU speed on Apple Silicon (measured:
-    # 0.6s vs ~70s per 64-pair batch) -- the first run of this script
-    # went to CPU and crawled for 1.5h+ before being killed.
+    # MPS is ~100x CPU speed here (0.6s vs ~70s per batch on Apple Silicon).
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     model.to(device)
     entailment_idx = model.config.label2id["entailment"]
@@ -167,9 +111,7 @@ def main():
 
     for start in range(0, len(pairs), HHEM_BATCH):
         batch = pairs[start : start + HHEM_BATCH]
-        # padding="max_length", not "longest": MPS compiles a kernel per
-        # tensor shape, and variable-length batches force a recompile
-        # every batch -- fixed 512 keeps one shape for the whole run.
+        # Fixed 512: MPS recompiles a kernel per shape, so "longest" recompiles every batch.
         inputs = tokenizer(
             [p for p, _ in batch], [a for _, a in batch],
             return_tensors="pt", padding="max_length", truncation=True, max_length=512,

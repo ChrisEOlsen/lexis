@@ -1,9 +1,4 @@
-/*
- * WordNet flat-file loader (spec 5.2.3, 6, build order Stage 5).
- * Preprocesses the WordNet flat file (data/wordnet/) into an in-memory
- * hash table at startup, avoiding libwn's API complexity. Provides
- * synonym/hypernym/hyponym lookups used by synonym expansion.
- */
+/* WordNet flat-file loader: preprocess data/wordnet/ into an in-memory lookup table at startup. */
 
 #ifndef LEXIS_WORDNET_H
 #define LEXIS_WORDNET_H
@@ -12,8 +7,7 @@
 
 #include "tokenizer.h"
 
-/* WordNet's four parts of speech, each stored in its own pair of flat
- * files (index.<pos>, data.<pos>) sharing an identical format. */
+/* WordNet's four parts of speech, each in its own index.<pos>/data.<pos> file pair. */
 typedef enum {
     WORDNET_NOUN,
     WORDNET_VERB,
@@ -21,17 +15,8 @@ typedef enum {
     WORDNET_ADVERB
 } WordNetPOS;
 
-/* One synset (synonym set) parsed from a data.<pos> file: the words that
- * are interchangeable in this specific sense (the actual synonyms),
- * plus the byte offsets of its directly broader (hypernym) and narrower
- * (hyponym) synsets -- still unresolved to words at this stage;
- * resolution to actual word lists happens once every synset is loaded
- * (see wordnet_table_load). `offset` is this synset's own byte position
- * in its data file -- unique only within one part of speech, not
- * globally, since each POS has its own separate file. Assumes hypernym/
- * hyponym pointer targets share the source synset's part of speech,
- * which holds in practice for these two relations even though the file
- * format technically allows cross-POS pointers. */
+/* One synset: sense words + hypernym/hyponym offsets (unresolved until load completes).
+ * offset unique within its POS file only; targets assumed same-POS. */
 typedef struct {
     WordNetPOS pos;
     long offset;
@@ -43,99 +28,59 @@ typedef struct {
     size_t hyponym_count;
 } WordNetSynset;
 
-/* Parses one line of a data.<pos> file into a synset. `pos` is supplied
- * by the caller (which file this line came from), not derived from the
- * line's own ss_type field (a finer-grained distinction, e.g. adjective
- * vs adjective-satellite, not needed here). Only hypernym ('@') and
- * hyponym ('~') pointers are kept -- other relations (antonym, meronym,
- * holonym, etc.) are outside this module's scope per the spec. Returns
- * NULL on a malformed line or allocation failure. */
+/* Parse one data.<pos> line (pos from caller, not ss_type). Keeps @/~ pointers only.
+ * NULL on malformed line or alloc failure. */
 WordNetSynset *wordnet_parse_data_line(const char *line, WordNetPOS pos);
 
-/* Frees a synset's words array, hypernym/hyponym offset arrays, and the
- * struct itself. Safe to call with synset == NULL. */
+/* Free words, offset arrays, and struct. Safe with synset == NULL. */
 void wordnet_synset_free(WordNetSynset *synset);
 
-/* Every synset from one data.<pos> file, sorted by offset for O(log n)
- * lookup via wordnet_synset_index_find(). Intermediate structure used
- * only while resolving hypernym/hyponym pointers to actual words at load
- * time -- not what callers query at runtime (see wordnet_table_load /
- * wordnet_lookup, still to come). */
+/* One data.<pos> file's synsets, sorted by offset. Load-time intermediate; not queried at runtime. */
 typedef struct {
     WordNetSynset **synsets;
     size_t count;
 } WordNetSynsetIndex;
 
-/* Reads and parses every synset in `path` (a data.<pos> file), sorted by
- * offset. Skips the file's leading copyright-comment lines (they start
- * with a space; real data lines never do) and blank lines. Treats any
- * unparseable data line as a hard failure rather than skipping it --
- * this is trusted, official WordNet data, so a parse failure here means
- * a real bug, not malformed input worth silently tolerating. Returns
- * NULL on a file read failure, a parse failure, or allocation failure. */
+/* Load every synset in path, sorted by offset. Skips comments/blanks; any bad line fails hard.
+ * NULL on file/parse/alloc failure. */
 WordNetSynsetIndex *wordnet_load_data_file(const char *path, WordNetPOS pos);
 
-/* Frees every synset in the index, the synsets array, and the struct
- * itself. Safe to call with index == NULL. */
+/* Free every synset, the array, and the struct. Safe with index == NULL. */
 void wordnet_synset_index_free(WordNetSynsetIndex *index);
 
-/* Binary-searches `index` for the synset at `offset`. Returns NULL if no
- * synset in this index has that offset. */
+/* Binary-search index for the synset at offset. NULL if absent. */
 const WordNetSynset *wordnet_synset_index_find(const WordNetSynsetIndex *index, long offset);
 
-/* One word's entry from an index.<pos> file: the word itself (always
- * lowercase, multi-word lemmas use underscores, e.g. "united_states"),
- * plus the byte offset of every synset it belongs to -- one per distinct
- * sense/meaning. Still just offsets here, not resolved to actual
- * synonym/hypernym/hyponym word lists; that happens once both this and
- * the matching WordNetSynsetIndex are loaded. */
+/* One index.<pos> entry: lowercase lemma + its synsets' offsets (one per sense; unresolved here). */
 typedef struct {
     char *lemma;
     long *synset_offsets;
     size_t synset_count;
 } WordNetIndexEntry;
 
-/* Parses one line of an index.<pos> file. Every field in this file is
- * decimal (unlike data.<pos>, which mixes in a couple of hexadecimal
- * fields) -- see wordnet_parse_data_line's comment for why that
- * distinction matters. Returns NULL on a malformed line or allocation
- * failure. */
+/* Parse one index.<pos> line (all fields decimal). NULL on malformed line or alloc failure. */
 WordNetIndexEntry *wordnet_parse_index_line(const char *line);
 
-/* Frees an entry's lemma string, its synset_offsets array, and the
- * struct itself. Safe to call with entry == NULL. */
+/* Free lemma, offsets, and struct. Safe with entry == NULL. */
 void wordnet_index_entry_free(WordNetIndexEntry *entry);
 
-/* Every word from one index.<pos> file, sorted alphabetically by lemma
- * for O(log n) lookup via wordnet_word_index_find(). Same role as
- * WordNetSynsetIndex, just keyed by word instead of by offset. */
+/* One index.<pos> file's entries, sorted by lemma. Load-time intermediate, like WordNetSynsetIndex. */
 typedef struct {
     WordNetIndexEntry **entries;
     size_t count;
 } WordNetWordIndex;
 
-/* Reads and parses every entry in `path` (an index.<pos> file), sorted
- * by lemma. Same header/blank-line-skipping and hard-fail-on-malformed-
- * line behavior as wordnet_load_data_file, for the same reasons. Returns
- * NULL on a file read failure, a parse failure, or allocation failure. */
+/* Load every entry in path, sorted by lemma. Same skip/fail-hard rules. NULL on failure. */
 WordNetWordIndex *wordnet_load_index_file(const char *path);
 
-/* Frees every entry in the index, the entries array, and the struct
- * itself. Safe to call with index == NULL. */
+/* Free every entry, the array, and the struct. Safe with index == NULL. */
 void wordnet_word_index_free(WordNetWordIndex *index);
 
-/* Binary-searches `index` for `lemma`. Returns NULL if the word isn't
- * present in this index. */
+/* Binary-search index for lemma. NULL if absent. */
 const WordNetIndexEntry *wordnet_word_index_find(const WordNetWordIndex *index, const char *lemma);
 
-/* One word's fully-resolved lookup result: every synonym, hypernym, and
- * hyponym across ALL of the word's senses, merged together and
- * deduplicated -- not grouped per sense. Sense disambiguation (deciding
- * which of a word's meanings actually applies to a given query) is a
- * downstream concern that needs query context this module doesn't have
- * (spec 5.2.3's small-model disambiguation step); this hands back raw
- * candidate data, not a ranked or sense-separated result. `next` is an
- * internal hash-bucket chaining pointer -- callers should ignore it. */
+/* One word's resolved result: synonyms/hypernyms/hyponyms merged across all senses, deduped.
+ * next is an internal bucket pointer; callers ignore it. */
 typedef struct WordNetLookupResult {
     char *word;
     TokenList *synonyms;
@@ -144,35 +89,22 @@ typedef struct WordNetLookupResult {
     struct WordNetLookupResult *next;
 } WordNetLookupResult;
 
-/* The final, query-facing hash table -- what wordnet_table_load() builds
- * (still to come) and wordnet_lookup() queries. A simple chained-bucket
- * hash table keyed by word. */
+/* Query-facing hash table: chained buckets keyed by word. */
 typedef struct {
     WordNetLookupResult **buckets;
     size_t bucket_count;
 } WordNetTable;
 
-/* Allocates an empty table with a fixed bucket count sized for the whole
- * of WordNet (~150K words across all parts of speech). Returns NULL on
- * allocation failure. */
+/* Empty table, bucket count sized for all of WordNet (~150K words). NULL on alloc failure. */
 WordNetTable *wordnet_table_create(void);
 
-/* Frees every entry in every bucket (including each entry's synonym/
- * hypernym/hyponym lists), the bucket array, and the table itself. Safe
- * to call with table == NULL. */
+/* Free every entry, the bucket array, and the table. Safe with table == NULL. */
 void wordnet_table_free(WordNetTable *table);
 
-/* Looks up `word` in the table. Returns NULL if the word was never seen
- * while loading (i.e. it's not in WordNet at all). */
+/* Look up word. NULL if not in WordNet. */
 const WordNetLookupResult *wordnet_lookup(const WordNetTable *table, const char *word);
 
-/* Loads all four parts of speech from `wordnet_dir` (expects
- * index.<pos>/data.<pos> pairs directly inside it, e.g. data/wordnet/)
- * and resolves every word into one final table -- this is the actual
- * "preprocess WordNet into a hash table at startup" the spec describes.
- * The per-POS index/synset scaffolding used along the way is discarded
- * once each part of speech's words are resolved; only the final table
- * survives. Returns NULL on any file load or allocation failure. */
+/* Load all four POS pairs from wordnet_dir into one resolved table. NULL on file/alloc failure. */
 WordNetTable *wordnet_table_load(const char *wordnet_dir);
 
 #endif /* LEXIS_WORDNET_H */

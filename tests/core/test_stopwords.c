@@ -1,8 +1,4 @@
-/*
- * Tests for src/core/stopwords.c — StopwordSet lifecycle and lookup.
- * Standalone executable; exit code reflects pass/fail. Run from the repo
- * root so the relative path to data/stopwords/english.txt resolves.
- */
+/* Tests for stopwords.c. Run from repo root for data/stopwords/english.txt. */
 
 #include "stopwords.h"
 #include "test_utils.h"
@@ -25,16 +21,13 @@ static void test_contains_known_stopwords(void) {
     StopwordSet *set = stopword_set_load(STOPWORD_FILE);
     TEST_ASSERT(set != NULL, "expected stopword_set_load to succeed");
 
-    /* Spans the sorted range: first entry, last entry, and a couple from
-     * the middle — exercises bsearch() across the whole array, not just
-     * whatever happens to land near the midpoint. */
+    /* Span the sorted range to exercise bsearch across the array. */
     TEST_ASSERT(stopword_set_contains(set, "a"), "expected 'a' to be a stopword");
     TEST_ASSERT(stopword_set_contains(set, "you've"), "expected \"you've\" to be a stopword");
     TEST_ASSERT(stopword_set_contains(set, "the"), "expected 'the' to be a stopword");
     TEST_ASSERT(stopword_set_contains(set, "is"), "expected 'is' to be a stopword");
 
-    /* Contraction-split fragments (see LIMITATIONS.md) that tokenizer.c
-     * actually produces from input like "don't". */
+    /* Contraction fragments tokenizer.c produces (see dev/LIMITATIONS.md). */
     TEST_ASSERT(stopword_set_contains(set, "t"), "expected 't' to be a stopword");
     TEST_ASSERT(stopword_set_contains(set, "don"), "expected 'don' to be a stopword");
 

@@ -1,19 +1,5 @@
-// Runs the PostgreSQL server that ships inside the app bundle as a
-// child process: initdb on first run, start on launch, stop when the
-// app quits. Bundle mode only -- the dev build keeps using the native
-// Homebrew instance via `make pg-start` and never constructs one of
-// these.
-//
-// Security model (dev/PACKAGE.md): no TCP at all (listen_addresses =
-// ''), a unix socket in a 0700 directory under Application Support,
-// and peer auth -- the OS user is the credential, so no database
-// password exists anywhere on the machine.
-//
-// Lifecycle: ensureStarted() is synchronous and runs before the QML
-// engine loads (initdb takes ~1-2s once, pg_ctl start ~1s). The
-// destructor stops the server -- construct this BEFORE the QML engine
-// in main() so C++ destruction order closes the app's database
-// connections first, then shuts the server down.
+// Bundled Postgres child process: initdb on first run, start on launch, stop on quit.
+// Bundle mode only; construct before the QML engine so connections close first.
 
 #ifndef LEXIS_APP_POSTGRESMANAGER_H
 #define LEXIS_APP_POSTGRESMANAGER_H
@@ -28,10 +14,7 @@ public:
     // binDir: the bundled pgsql/bin (initdb, pg_ctl, createdb, ...).
     void configure(const QString &binDir, const QString &dataDir, const QString &socketDir);
 
-    // initdb if the data directory is empty, force socket-only
-    // configuration, start the server (a leftover from a crashed
-    // previous run counts as started), and create the `lexis` database
-    // if missing. Returns false with *error set on the first failure.
+    // Initdb/start/create-lexis-db as needed; a leftover server counts as started.
     bool ensureStarted(QString *error);
 
     void stop();

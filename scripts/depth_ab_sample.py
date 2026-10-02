@@ -1,45 +1,17 @@
 #!/usr/bin/env python3
-"""Pick a stratified question sample for the 5-vs-12 A/B, using Phase 0's ranks.
-
-Running all 913 questions through two generation configs costs about five
-hours. Almost all of that would be wasted: Phase 0 found a correct passage at
-rank 1 for 82% of questions, and where gold sits at rank 1 both configs contain
-it, so both will tend to answer the same way.
-
-The questions that actually discriminate are stratified by where gold ranks:
-
-  1-3    both configs contain gold -> isolates whether the 7 extra distractors
-         in the 12-passage config hurt
-  4-5    both contain gold, gold near the 5-passage boundary
-  6-12   ONLY the 12-passage config contains gold -> measures what the recall
-         drop from 97.0% to 93.5% actually costs in answers
-  13+/none  neither contains gold; excluded, since neither config can answer
-         and including them would only add noise to both arms equally
-
-Sampling is deterministic (every Nth within a stratum, no RNG) so the run can
-be repeated or extended without reshuffling what was already measured.
-"""
+"""Stratified 5-vs-12 A/B sample by Phase 0 gold rank; deterministic (every Nth, no RNG).
+Strata 1-3/4-5/6-12 discriminate the arms; 13+/none excluded (neither can answer)."""
 
 import collections
 import json
 import os
 import sys
 
-SHINGLE = 8
-# Stratum -> how many questions to take. The 6-12 band is small and is the
-# whole point of the experiment, so it is sampled hardest.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from eval_common import shingles
+
+# Stratum -> quota. The 6-12 band is the point of the experiment, sampled hardest.
 QUOTAS = {"1-3": 25, "4-5": 10, "6-12": 25}
-
-
-def normalize(text):
-    return " ".join(text.lower().split())
-
-
-def shingles(text):
-    words = normalize(text).split()
-    if len(words) < SHINGLE:
-        return {" ".join(words)} if words else set()
-    return {" ".join(words[i : i + SHINGLE]) for i in range(len(words) - SHINGLE + 1)}
 
 
 def stratum_of(rank):

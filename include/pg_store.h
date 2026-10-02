@@ -1,24 +1,4 @@
-/*
- * Index and passage persistence via libpq/PostgreSQL -- the
- * experiment/postgres-migration branch's replacement for sqlite_store.c
- * (see LIMITATIONS.md and that module's own history for why: SQLite
- * allows exactly one writer per connection, which caps concurrent
- * ingestion throughput at roughly 1.3x regardless of thread count,
- * measured on the experiment/sharded-ingestion branch. Postgres allows
- * genuinely concurrent writer connections instead).
- *
- * Same schema shape as the SQLite version (passages/terms/postings), with
- * two real differences: ids are `int64_t`, not a SQLite-specific typedef,
- * and there's no equivalent of sqlite3_last_insert_rowid() -- every insert
- * here uses `RETURNING id` instead. Also: pg_store_get_or_create_term()
- * closes the SELECT-then-INSERT race the SQLite version had to leave
- * undocumented as a known gap (see LIMITATIONS.md) via
- * `INSERT ... ON CONFLICT (term) DO NOTHING` plus a re-SELECT to fetch the
- * id either way -- deliberately not `DO UPDATE ... RETURNING id` (which
- * would avoid the extra round trip), since DO UPDATE takes a row lock even
- * for a no-op self-assignment, and that caused real Postgres deadlocks
- * under genuine concurrent writers (see pg_store_get_or_create_term()'s
- * own doc comment below, and SPEED.md, for the full story). */
+/* Index and passage persistence via libpq/PostgreSQL (passages/terms/postings, int64_t ids). */
 
 #ifndef LEXIS_PG_STORE_H
 #define LEXIS_PG_STORE_H
@@ -31,376 +11,169 @@ typedef struct {
     PGconn *conn;
 } PgStore;
 
-/* Opens a connection using `conninfo` (a libpq connection string, e.g.
- * "host=127.0.0.1 port=5433 dbname=lexis user=lexis password=...") and
- * ensures the passages/terms/postings tables exist. Returns NULL on
- * connection failure or if schema creation fails. */
+/* Open via conninfo; ensure passages/terms/postings exist. NULL on connection/schema failure. */
 PgStore *pg_store_open(const char *conninfo);
 
-/* -- Multi-corpus support (groups) -- see APP_SPEC.md's "Core concept:
- * groups = one Postgres schema each" for the full design. Each corpus
- * ("group" in the app UI) is its own Postgres schema, holding its own
- * passages/terms/postings tables, isolated from every other corpus so
- * the whole bulk-ingest machinery above stays safely reusable per group.
- * The public.corpora table (created by pg_store_ensure_corpora_registry())
- * is the one exception -- it lives permanently in the default `public`
- * schema and tracks which corpora exist. -- */
+/* -- Multi-corpus support: each corpus is its own schema; public.corpora tracks them. -- */
 
-/* Creates public.corpora if it doesn't already exist. Idempotent (IF NOT
- * EXISTS). Returns 0 on success, -1 on failure. Called automatically by
- * pg_store_create_corpus(); exposed separately for callers (e.g. a future
- * "list corpora") that only need to read the registry. */
+/* Create public.corpora if missing. Idempotent. 0 on success, -1 on failure. */
 int pg_store_ensure_corpora_registry(PgStore *store);
 
-/* Creates a new corpus: a registry row in public.corpora plus a fresh
- * Postgres schema (an opaque, server-generated name -- "corpus_<id>",
- * never built from `display_name`, see APP_SPEC.md) holding its own
- * passages/terms/postings tables, identical in shape to the ones
- * pg_store_open() creates in `public`. Runs as one transaction, so a
- * failure partway through (e.g. schema creation fails after the registry
- * row is inserted) never leaves an orphaned registry entry pointing at a
- * schema that doesn't exist.
- *
- * On success, returns the new corpus's id (> 0) and sets *schema_name_out
- * to a newly malloc()'d string (caller must free()) holding its schema
- * name -- needed by a future "open/use this corpus" call to set
- * `search_path`. Returns -1 on failure (display_name NULL/empty,
- * schema_name_out NULL, or any database error), *schema_name_out left
- * untouched. */
+/* Create a corpus: registry row + fresh schema, one transaction. New id (> 0) and malloc'd
+ * schema_name_out (caller frees); -1 on failure, schema_name_out untouched. */
 int64_t pg_store_create_corpus(PgStore *store, const char *display_name, char **schema_name_out);
 
-/* Scopes every subsequent query on `store`'s connection to `corpus_id`'s
- * schema by setting `search_path` (looked up from public.corpora, so the
- * caller only ever deals in ids/display names, never the opaque schema
- * name itself). This is what makes every existing, unqualified query in
- * this module and bm25.c/bulk_ingest.c actually operate on one chosen
- * group -- none of them need to change to become corpus-aware.
- *
- * Stays in effect for this connection until the next pg_store_use_corpus()
- * call or pg_store_close(); there is no "switch back to no corpus"
- * beyond selecting a different corpus_id. Returns 0 on success, -1 if
- * corpus_id doesn't exist in the registry or the SET fails. */
+/* Scope this connection to corpus_id's schema (persists until next use_corpus/close).
+ * 0 on success, -1 if corpus_id missing or SET fails. */
 int pg_store_use_corpus(PgStore *store, int64_t corpus_id);
 
-/* Lower-level primitive pg_store_use_corpus() is built on: sets
- * search_path directly from a schema_name, with no registry lookup.
- * Needed by callers that must target a schema with no corpus_id of its
- * own -- e.g. rebuild-on-append's temporary "corpus_<id>_rebuild" schema
- * while it's being built, before it's swapped in (see
- * pg_store_swap_corpus_schema()). schema_name must be a trusted,
- * server-generated identifier, never built from user input -- same
- * constraint as pg_store_create_corpus()'s DDL. Returns 0 on success, -1
- * on failure. */
+/* Set search_path from schema_name directly (no registry lookup). schema_name must be a trusted id.
+ * 0 on success, -1 on failure. */
 int pg_store_use_schema(PgStore *store, const char *schema_name);
 
-/* One corpus as read back from the registry -- display_name is an owned
- * copy, freed via pg_store_corpora_free(). schema_name is deliberately
- * not exposed here; callers only ever need id (to pass to
- * pg_store_use_corpus()/pg_store_delete_corpus()) and display_name (to
- * show the user). */
+/* One corpus: id + owned display_name (freed via pg_store_corpora_free()). */
 typedef struct {
     int64_t id;
     char *display_name;
 } PgStoreCorpus;
 
-/* Lists every registered corpus, oldest first (ORDER BY id). Creates the
- * registry first if it doesn't exist yet (see
- * pg_store_ensure_corpora_registry()), so this returns an empty array,
- * not an error, on a database where no corpus has ever been created.
- * Sets *count_out to the number of corpora found. Returns a newly
- * allocated array the caller must free via pg_store_corpora_free(), or
- * NULL (with *count_out unset) on a database or allocation error. */
+/* List every corpus, oldest first (empty array if none). Caller frees via corpora_free.
+ * NULL (count_out unset) on DB/alloc error. */
 PgStoreCorpus *pg_store_list_corpora(PgStore *store, size_t *count_out);
 
-/* Frees an array returned by pg_store_list_corpora(), including each
- * entry's owned display_name. Safe to call with corpora == NULL. */
+/* Free a list_corpora array incl. display_names. Safe with corpora == NULL. */
 void pg_store_corpora_free(PgStoreCorpus *corpora, size_t count);
 
-/* Permanently deletes a corpus: drops its schema (DROP SCHEMA ... CASCADE
- * -- removes passages/terms/postings and every row in them, atomically
- * and near-instantly, see APP_SPEC.md on why this beats a row-by-row
- * DELETE) and removes its row from public.corpora, as one transaction.
- * Does not check whether `corpus_id` is the connection's currently
- * active corpus (via pg_store_use_corpus()) -- deleting the active
- * corpus leaves search_path pointing at a schema that no longer exists;
- * the caller is responsible for not doing that, or for calling
- * pg_store_use_corpus() again with a different corpus afterward before
- * issuing any further passages/terms/postings query. Returns 0 on
- * success, -1 if corpus_id doesn't exist or any step fails (in which
- * case nothing is deleted -- the whole operation rolls back). */
+/* Delete a corpus: drop schema CASCADE + remove registry row, one transaction (rolls back on failure).
+ * Caller must not leave the connection scoped to the deleted corpus. 0 ok, -1 on failure. */
 int pg_store_delete_corpus(PgStore *store, int64_t corpus_id);
 
-/* -- Chat history -- each group ("corpus") can have multiple chat
- * sessions. Both chat_sessions and chat_messages live permanently in the
- * public schema, next to public.corpora, NOT inside a corpus's own
- * per-corpus schema -- rebuild-on-append (see pg_store_swap_corpus_schema()
- * below) drops and replaces a corpus's own schema on every document
- * added to it, which would silently destroy chat history if it were
- * stored alongside documents/passages/terms/postings. -- */
+/* -- Chat history: chat_sessions/chat_messages live in public, never in a corpus schema. -- */
 
-/* One chat session as read back from the registry -- title and
- * created_at are owned copies, both freed via pg_store_chat_sessions_free().
- * created_at is the raw TIMESTAMPTZ text as Postgres renders it
- * (ISO 8601, e.g. "2026-08-06 14:32:07.123456+00") -- parsing into a
- * real timestamp type is the caller's job (LexisEngine parses it via
- * Qt::ISODate). */
+/* One chat session: id + owned title/created_at (raw TIMESTAMPTZ text; caller parses). */
 typedef struct {
     int64_t id;
     char *title;
     char *created_at;
 } PgStoreChatSession;
 
-/* Creates public.chat_sessions/public.chat_messages if they don't already
- * exist. Idempotent (IF NOT EXISTS). Returns 0 on success, -1 on failure.
- * Called automatically by every other chat function below; exposed
- * separately like pg_store_ensure_corpora_registry() for any caller that
- * only needs to read. */
+/* Create chat tables if missing. Idempotent. 0 on success, -1 on failure. */
 int pg_store_ensure_chat_tables(PgStore *store);
 
-/* Creates a new chat session under corpus_id, titled `title` (the
- * caller's job to derive -- e.g. the first ~60 chars of the first
- * question; this function just stores whatever string it's given).
- * Returns the new session's id (> 0) on success, -1 on failure
- * (corpus_id doesn't exist, title NULL/empty, or any database error). */
+/* Create a chat session under corpus_id with title. New id (> 0), or -1 on failure. */
 int64_t pg_store_create_chat_session(PgStore *store, int64_t corpus_id, const char *title);
 
-/* Lists every chat session under corpus_id, newest first (ORDER BY id
- * DESC) -- matches how a chat sidebar wants to show sessions. Sets
- * *count_out to the number found (0 if the corpus has none yet, not an
- * error). Returns a newly allocated array the caller must free via
- * pg_store_chat_sessions_free(), or NULL (with *count_out unset) on a
- * database or allocation error. */
+/* List corpus_id's sessions, newest first (0 = none, not an error). Caller frees via sessions_free.
+ * NULL (count_out unset) on DB/alloc error. */
 PgStoreChatSession *pg_store_list_chat_sessions(PgStore *store, int64_t corpus_id, size_t *count_out);
 
-/* Frees an array returned by pg_store_list_chat_sessions(), including
- * each entry's owned title. Safe to call with sessions == NULL. */
+/* Free a list_chat_sessions array incl. titles. Safe with sessions == NULL. */
 void pg_store_chat_sessions_free(PgStoreChatSession *sessions, size_t count);
 
-/* -- Group summaries -- one cached, model-generated overview of what a
- * group contains, built lazily on the first broad question about it (see
- * corpus_summary.h) and reused afterward. Backs the SUMMARY tool, whose
- * whole purpose is that answering "what is this collection about" must
- * not re-read the entire corpus every time.
- *
- * Lives in the public schema alongside public.corpora, NOT in the
- * corpus's own per-corpus schema, for the same reason chat history does:
- * rebuild-on-append (pg_store_swap_corpus_schema()) drops and replaces a
- * corpus's schema whenever a document is added to it. Storing the cache
- * there would make invalidation an accident of that rebuild rather than
- * a rule anyone can read -- and would break the moment rebuild-on-append
- * became incremental.
- *
- * document_count is the staleness key: a cached summary describes the
- * group as it was at that document count, so a mismatch against the
- * group's current count means the cache must be rebuilt. Coarse on
- * purpose -- it cannot detect a document being replaced by another one --
- * see LIMITATIONS.md. */
+/* -- Group summaries: cached overview per corpus in public; document_count is the staleness key. -- */
 
-/* Creates public.corpus_summaries if it doesn't exist. Idempotent; safe
- * to call before every read/write, same convention as
- * pg_store_ensure_chat_tables(). Returns 0 on success, -1 on failure. */
+/* Create public.corpus_summaries if missing. Idempotent. 0 on success, -1 on failure. */
 int pg_store_ensure_summary_table(PgStore *store);
 
-/* Reads corpus_id's cached summary. Returns a newly malloc()'d string the
- * caller must free(), or NULL if this corpus has no cached summary yet or
- * on a database/allocation error -- "absent" and "failed" are
- * deliberately the same return here, because both mean the same thing to
- * the only caller: build it. Sets *document_count_out to the document
- * count the cached summary was generated at, untouched when NULL is
- * returned. */
+/* Read corpus_id's cached summary. Caller frees; NULL = absent or failed (both mean: build it).
+ * document_count_out = count it was generated at, untouched on NULL. */
 char *pg_store_get_corpus_summary(PgStore *store, int64_t corpus_id, int *document_count_out);
 
 /* Inserts or replaces corpus_id's cached summary (one row per corpus).
  * Returns 0 on success, -1 on failure. */
 int pg_store_set_corpus_summary(PgStore *store, int64_t corpus_id, const char *text, int document_count);
 
-/* Permanently deletes a chat session and every message in it (ON DELETE
- * CASCADE from chat_messages.session_id). Returns 0 on success, -1 if
- * session_id doesn't exist or the delete fails. */
+/* Delete a chat session and its messages (CASCADE). 0 on success, -1 if missing/failed. */
 int pg_store_delete_chat_session(PgStore *store, int64_t session_id);
 
-/* One chat message as read back from a session -- text and sources_json
- * are owned copies, freed via pg_store_chat_messages_free().
- * sources_json is NULL for a user message (only assistant messages ever
- * carry source citations), or whatever JSON string was passed to
- * pg_store_append_chat_message() otherwise -- this module never parses
- * it, just stores and returns it verbatim. */
+/* One chat message: owned text + sources_json (NULL for user msgs; stored/returned verbatim). */
 typedef struct {
     int is_user;
     char *text;
     char *sources_json;
 } PgStoreChatMessage;
 
-/* Records one message in session_id -- is_user distinguishes the
- * question from the answer, sources_json is NULL for a user message or a
- * caller-supplied JSON string (typically a serialized array of source
- * citations) for an assistant message. Returns 0 on success, -1 on
- * failure (including session_id not existing). */
+/* Append one message to session_id. sources_json NULL for user msgs. 0 ok, -1 on failure. */
 int pg_store_append_chat_message(PgStore *store, int64_t session_id, int is_user, const char *text,
                                   const char *sources_json);
 
-/* Reads back every message in session_id, oldest first (ORDER BY id) --
- * the full conversation history a caller windows down to whatever fits
- * the model's context budget. Sets *count_out to the number of messages
- * found (0 for a session with none yet, not an error). Returns a newly
- * allocated array the caller must free via pg_store_chat_messages_free(),
- * or NULL (with *count_out unset) on a database or allocation error. */
+/* Read session_id's messages, oldest first (0 = none, not an error). Caller frees via messages_free.
+ * NULL (count_out unset) on DB/alloc error. */
 PgStoreChatMessage *pg_store_get_chat_messages(PgStore *store, int64_t session_id, size_t *count_out);
 
-/* Frees an array returned by pg_store_get_chat_messages(), including each
- * entry's owned text/sources_json. Safe to call with messages == NULL. */
+/* Free a get_chat_messages array incl. text/sources_json. Safe with messages == NULL. */
 void pg_store_chat_messages_free(PgStoreChatMessage *messages, size_t count);
 
-/* Replaces the text and sources of session_id's most recent assistant
- * message -- what a user-invoked "try harder" retry writes, so the
- * deeper answer replaces (rather than stacks on) the one it improves,
- * matching what the live UI shows. Updates only if that message exists
- * and is genuinely an assistant row (is_user = false); returns -1 on
- * failure or if the session's newest message is not an assistant row
- * (nothing modified). */
+/* Replace session_id's newest message if it is an assistant row ("try harder" retry). -1 otherwise. */
 int pg_store_update_last_assistant_message(PgStore *store, int64_t session_id, const char *text,
                                             const char *sources_json);
 
-/* -- Per-document reads and deletion --
- *
- * The documents table holds one row per source document (full extracted
- * text); passages holds its chunks. These support the app's document
- * viewer (open a document's indexed text, list its chunks, jump to a
- * cited one) and per-document removal from a group. All operate on the
- * currently-selected schema (see pg_store_use_corpus()). */
+/* -- Per-document reads and deletion (operate on the currently-selected schema). -- */
 
-/* One document's per-chunk stats as read back from passages -- owned
- * document_name, freed via pg_store_document_stats_free(). */
+/* One document's chunk stats; owned document_name (freed via document_stats_free). */
 typedef struct {
     char *document_name;
     long passage_count;
     long total_tokens;
 } PgStoreDocumentStats;
 
-/* Lists every document in the currently-selected schema with its
- * passage count and total token count, from one GROUP BY over passages
- * (documents with zero passages -- none in a consistent corpus, but
- * nothing forbids the shape -- simply don't appear). Ordered by
- * document_name. Sets *count_out to the number found. Returns a newly
- * allocated array the caller must free via
- * pg_store_document_stats_free(), or NULL (with *count_out unset) on a
- * database or allocation error. */
+/* List every document with passage/token counts, ordered by name. Caller frees via stats_free.
+ * NULL (count_out unset) on DB/alloc error. */
 PgStoreDocumentStats *pg_store_list_document_stats(PgStore *store, size_t *count_out);
 
-/* Frees an array returned by pg_store_list_document_stats(), including
- * each entry's owned document_name. Safe to call with stats == NULL. */
+/* Free a list_document_stats array incl. names. Safe with stats == NULL. */
 void pg_store_document_stats_free(PgStoreDocumentStats *stats, size_t count);
 
-/* Reads back one document's full stored text (the extraction as it was
- * indexed, not a re-read of any original file -- the file may no longer
- * exist; the database is the source of truth). Returns a newly
- * malloc()'d string the caller must free(), or NULL if no document
- * with that name exists or on a database/allocation error. */
+/* Read one document's stored text (as indexed; the DB is the source of truth). Caller frees.
+ * NULL if missing or on DB/alloc error. */
 char *pg_store_get_document_text(PgStore *store, const char *document_name);
 
-/* One chunk of a document, ordered by chunk_id -- same shape
- * PgStorePassage uses, minus the document name (constant across the
- * array). Owned text, freed via pg_store_document_passages_free(). */
+/* One document chunk in chunk order; owned text (freed via document_passages_free). */
 typedef struct {
     int chunk_id;
     char *text;
     int token_count;
 } PgStoreDocumentPassage;
 
-/* Reads back every chunk of `document_name` in chunk order -- what the
- * document viewer lists as "here is everything search can find in this
- * document". Sets *count_out to the number of chunks (0 if the document
- * has none or doesn't exist -- not an error). Returns a newly allocated
- * array the caller must free via pg_store_document_passages_free(), or
- * NULL (with *count_out unset) on a database or allocation error. */
+/* Read document_name's chunks in order (0 = none/missing, not an error). Caller frees via passages_free.
+ * NULL (count_out unset) on DB/alloc error. */
 PgStoreDocumentPassage *pg_store_get_document_passages(PgStore *store, const char *document_name,
                                                        size_t *count_out);
 
-/* Frees an array returned by pg_store_get_document_passages(), including
- * each entry's owned text. Safe to call with passages == NULL. */
+/* Free a get_document_passages array incl. text. Safe with passages == NULL. */
 void pg_store_document_passages_free(PgStoreDocumentPassage *passages, size_t count);
 
-/* Removes one document and every trace of it from the currently-selected
- * corpus, as one transaction: its postings, its passages, its documents
- * row, and any terms left with no postings anywhere (terms are only
- * reachable through postings, so an orphaned row can never contribute to
- * a search -- but sweeping them keeps the terms table honest for anyone
- * reading it directly).
- *
- * Consistent with rebuild-on-append rather than fighting it: the
- * documents table is what the next rebuild re-reads, so a removed
- * document cannot be resurrected by the next document drop. BM25's
- * document frequencies derive from live postings rows, so the index
- * stays correct with no rebuild.
- *
- * Returns 0 on success, -1 if `document_name` doesn't exist, a delete
- * fails, or the orphan-term sweep fails (the whole operation rolls
- * back -- never a half-deleted corpus). */
+/* Remove one document: postings, passages, documents row, orphaned terms. One transaction (rolls back).
+ * 0 on success, -1 if missing or any step fails. */
 int pg_store_remove_document(PgStore *store, const char *document_name);
 
-/* -- Rebuild-on-append primitives -- see APP_SPEC.md's "Adding documents
- * to an existing group" for the full design: a group is rebuilt (not
- * incrementally appended to) by combining its existing documents with
- * new ones and re-running the fast bulk pipeline into a fresh schema,
- * which is then swapped in for the corpus's real one. These are the
- * pieces that make the swap possible; the orchestration itself
- * (reading existing documents, writing a combined CSV, calling
- * bulk_ingest_tsv(), then swapping) lives in bulk_ingest.c. -- */
+/* -- Rebuild-on-append primitives: ingest into a scratch schema, then swap it in. -- */
 
-/* Creates a schema plus its documents/passages/terms/postings tables
- * under an explicit `schema_name`, with NO public.corpora registry row --
- * unlike pg_store_create_corpus(), this schema isn't a corpus of its own,
- * it's a scratch space a rebuild ingests into before being swapped in for
- * an existing corpus (see pg_store_swap_corpus_schema()). schema_name
- * must be a trusted, server-generated identifier -- same constraint as
- * pg_store_use_schema(). Returns 0 on success, -1 on failure (including
- * if schema_name already exists). */
+/* Create a bare schema + tables (no registry row): scratch space for a rebuild. Trusted id only.
+ * 0 on success, -1 on failure (incl. already exists). */
 int pg_store_create_bare_schema(PgStore *store, const char *schema_name);
 
-/* Drops schema_name (IF EXISTS -- not an error if it isn't there) and
- * everything in it. Companion to pg_store_create_bare_schema(): cleans
- * up a rebuild's scratch schema on failure, and defensively clears a
- * leftover from a rebuild that crashed on a *previous* attempt before
- * creating a fresh one under the same name. schema_name must be a
- * trusted, server-generated identifier -- same constraint as
- * pg_store_use_schema(). Returns 0 on success, -1 on failure. */
+/* Drop a bare schema IF EXISTS (missing is fine). Trusted id only. 0 on success, -1 on failure. */
 int pg_store_drop_bare_schema(PgStore *store, const char *schema_name);
 
-/* Atomically replaces corpus_id's underlying schema with
- * new_schema_name's: drops the corpus's current schema (and everything
- * in it) and renames new_schema_name to take its place, as one
- * transaction -- either both happen (clean swap, corpus_id's
- * schema_name in the registry never changes, only what's physically
- * behind it) or neither does, so a failure here never leaves the
- * corpus's existing data lost or partially replaced. Does not create or
- * clean up new_schema_name itself -- the caller builds it first (see
- * pg_store_create_bare_schema()) and is responsible for dropping it if
- * this fails or is never called. Returns 0 on success, -1 if corpus_id
- * doesn't exist or either DDL statement fails. */
+/* Atomically swap corpus_id's schema for new_schema_name (one transaction; registry id unchanged).
+ * Caller builds/drops new_schema_name. 0 on success, -1 on failure. */
 int pg_store_swap_corpus_schema(PgStore *store, int64_t corpus_id, const char *new_schema_name);
 
-/* One document as read back from the documents table -- both fields are
- * owned copies, freed via pg_store_documents_free(). */
+/* One document: owned name + text (freed via pg_store_documents_free). */
 typedef struct {
     char *document_name;
     char *text;
 } PgStoreDocument;
 
-/* Reads back every row in the currently-selected schema's documents
- * table (see pg_store_use_corpus()/pg_store_use_schema()) -- "pull a
- * group's existing documents back out" for a rebuild, ordered by
- * document_name. Sets *count_out to the number of documents found.
- * Returns a newly allocated array the caller must free via
- * pg_store_documents_free(), or NULL (with *count_out unset) on a
- * database or allocation error. */
+/* Read the selected schema's documents, ordered by name. Caller frees via documents_free.
+ * NULL (count_out unset) on DB/alloc error. */
 PgStoreDocument *pg_store_get_all_documents(PgStore *store, size_t *count_out);
 
-/* Frees an array returned by pg_store_get_all_documents(), including each
- * entry's owned document_name/text. Safe to call with docs == NULL. */
+/* Free a get_all_documents array incl. name/text. Safe with docs == NULL. */
 void pg_store_documents_free(PgStoreDocument *docs, size_t count);
 
-/* Closes the connection and frees the PgStore. Safe to call with
- * store == NULL. */
+/* Close the connection and free the store. Safe with store == NULL. */
 void pg_store_close(PgStore *store);
 
 /* Inserts a passage (a chunk of a source document) and returns its new
@@ -408,66 +181,28 @@ void pg_store_close(PgStore *store);
 int64_t pg_store_insert_passage(PgStore *store, const char *document_name, int chunk_id,
                                  const char *text, int token_count);
 
-/* Records `document_name`'s original, un-chunked `text` in the documents
- * table -- see pg_store.c's LEXIS_SCHEMA_SQL comment for why this exists
- * separately from passages (which only ever holds post-chunking
- * fragments) and documents_raw (which is transient, dropped at the end
- * of every bulk_ingest_tsv() run). ON CONFLICT (document_name) DO
- * NOTHING, not an error -- a Phase 2 batch retry re-processing the same
- * document is expected, not a bug (see bulk_ingest.c). Returns 0 on
- * success, -1 on failure. */
+/* Record document_name's original un-chunked text. ON CONFLICT DO NOTHING. 0 ok, -1 on failure. */
 int pg_store_insert_document(PgStore *store, const char *document_name, const char *text);
 
-/* Returns the id of `term` in the terms table, inserting it first if this
- * is the first time it's been seen (INSERT ... ON CONFLICT DO NOTHING,
- * plus a re-SELECT to fetch the id either way it landed -- see pg_store.c
- * for why not a single RETURNING call), safe under concurrent writers.
- * Returns -1 on failure. One round trip in the common (already-seen term)
- * case, up to three otherwise -- pg_store_get_or_create_terms() below is
- * the batch version, worth using instead when indexing more than one term
- * at a time (see LIMITATIONS.md on why per-term round trips dominated
- * ingestion latency here in a way they never did with SQLite). */
+/* Test helper, no production caller: term's id, inserting first if new. -1 on failure. */
 int64_t pg_store_get_or_create_term(PgStore *store, const char *term);
 
-/* Batch version of pg_store_get_or_create_term(): resolves every term in
- * `terms[0..count)` (which may contain duplicates) to its id, returning a
- * newly allocated array of `count` ids in the caller-must-free()'d same
- * order as `terms` (result[i] corresponds to terms[i]). At most 3 round
- * trips total *regardless of count* -- one bulk SELECT for terms that
- * already exist, one bulk INSERT ... ON CONFLICT DO NOTHING for genuinely
- * new ones, one bulk re-SELECT for any a concurrent writer won the race
- * on -- versus 1-3 round trips *per term* calling
- * pg_store_get_or_create_term() in a loop would cost. Requires count >= 1.
- * Returns NULL on failure. */
+/* Test helper, no production caller: batch ids for terms[0..count) in order (caller frees).
+ * count >= 1 required. NULL on failure. */
 int64_t *pg_store_get_or_create_terms(PgStore *store, const char *const *terms, size_t count);
 
-/* Read-only counterpart to pg_store_get_or_create_term(): looks up `term`
- * without ever inserting it. Returns its id if seen before, or -1 if
- * never indexed (or on a real database error -- either way, the caller's
- * correct response is the same: this term contributes nothing). */
+/* term's id without inserting. -1 if never indexed or on DB error (both = contributes nothing). */
 int64_t pg_store_lookup_term(PgStore *store, const char *term);
 
-/* Records that `term_id` occurs `term_frequency` times in `passage_id`,
- * which is itself `token_count` tokens long. `token_count` is a
- * deliberate denormalization of passages.token_count -- see pg_store.c's
- * schema comment for why (BM25's length-normalization term needs each
- * matching passage's own length, and fetching it via a JOIN against
- * passages meant one random-access lookup per matching posting row --
- * measured directly at real MS MARCO scale, see LIMITATIONS.md). Returns
- * 0 on success, -1 on failure. */
+/* Record term_id x term_frequency in passage_id (token_count denormalized). 0 ok, -1 on failure. */
 int pg_store_insert_posting(PgStore *store, int64_t term_id, int64_t passage_id, int term_frequency,
                              int token_count);
 
-/* Batch version of pg_store_insert_posting(): records `count` postings in
- * one round trip, all against the same `passage_id` (and therefore the
- * same `token_count`) -- term_ids[i] occurs term_frequencies[i] times
- * (parallel arrays, length `count`). Requires count >= 1. Returns 0 on
- * success, -1 on failure. */
+/* Batch insert: count postings for one passage_id in one round trip. count >= 1. 0 ok, -1 on failure. */
 int pg_store_insert_postings(PgStore *store, const int64_t *term_ids, int64_t passage_id,
                               const int *term_frequencies, int token_count, size_t count);
 
-/* One passage's stored data, read back from the database. `document_name`
- * and `text` are owned copies -- free via pg_store_passage_free(). */
+/* One passage's stored data; owned document_name/text (free via pg_store_passage_free). */
 typedef struct {
     char *document_name;
     int chunk_id;
@@ -479,191 +214,68 @@ typedef struct {
  * passage exists or on a database/allocation error. */
 PgStorePassage *pg_store_get_passage(PgStore *store, int64_t passage_id);
 
-/* Frees a passage's owned strings and the struct itself. Safe to call
- * with passage == NULL. */
+/* Free a passage's strings and struct. Safe with passage == NULL. */
 void pg_store_passage_free(PgStorePassage *passage);
 
-/* Batch counterpart to pg_store_get_passage() that returns only each
- * passage's document_name (not chunk_id/text/token_count) -- for callers
- * like the eval harness that need to map many result passage_ids back to
- * their source document_name (e.g. an MS MARCO pid) without paying for
- * the full passage payload over the wire, and without one round trip per
- * id. Returns a newly allocated array of `count` strings in the same
- * order as `passage_ids` (result[i] corresponds to passage_ids[i]);
- * caller must free() each non-NULL entry and then the array itself. NULL
- * at index i means passage_ids[i] doesn't exist. One round trip
- * regardless of count. Requires count >= 1. Returns NULL (the whole
- * array, nothing to free) on a database or allocation failure. */
+/* Batch document_names for passage_ids in order (one round trip); NULL entry = missing. Free each + array.
+ * count >= 1. NULL (nothing to free) on DB/alloc failure. */
 char **pg_store_get_document_names(PgStore *store, const int64_t *passage_ids, size_t count);
 
-/* Explicit transaction control -- see sqlite_store.h's original rationale
- * (batching a whole document's writes into one commit); the mechanism is
- * different here (Postgres MVCC vs SQLite's rollback journal) but the
- * calling convention is identical. Each returns 0 on success, -1 on
- * failure. */
+/* Explicit transaction control (batch a document's writes into one commit). 0 ok, -1 on failure. */
 int pg_store_begin_transaction(PgStore *store);
 int pg_store_commit_transaction(PgStore *store);
 int pg_store_rollback_transaction(PgStore *store);
 
-/* Disables synchronous commit on this connection (`SET synchronous_commit
- * = off`) -- every COMMIT from here on returns as soon as its WAL record
- * is written to the OS, without waiting for a physical disk fsync.
- * Trades a small, bounded durability window (the last few not-yet-
- * flushed commits could be lost on a hard crash/power loss, though the
- * database itself never corrupts) for real throughput -- appropriate for
- * a rebuildable index build (if ingestion crashes, the fix is re-running
- * it, not recovering unflushed commits), not for connections serving
- * live, irreplaceable writes. Measured directly: ~16% higher ingestion
- * throughput with this enabled (see SPEED.md). Returns 0 on success, -1
- * on failure. */
+/* SET synchronous_commit = off: throughput over durability. For rebuildable index builds only.
+ * 0 on success, -1 on failure. */
 int pg_store_disable_synchronous_commit(PgStore *store);
 
-/* -- Bulk staging tables (deferred-term-resolution ingestion, spec section
- * 8's three-phase redesign -- see bulk_ingest.c) --
- *
- * documents_raw holds Phase 1's raw (pid, text) rows, loaded via a single
- * COPY rather than one INSERT per row. postings_staged holds Phase 2's
- * per-passage term postings keyed by the term's own text, not its
- * terms.id -- Phase 2's whole point is that worker threads never touch
- * the terms table (the sole source of every deadlock measured in this
- * project's concurrent ingestion, see SPEED.md), so there is no term_id
- * to write yet. Both are UNLOGGED (no WAL, no crash durability) and
- * carry no constraints beyond documents_raw's ordering key -- this data
- * is fully rebuildable from tsv_path by re-running the load, exactly
- * like the rest of this ingestion pipeline, so paying for durability or
- * constraint checking here buys nothing. Phase 3 (see
- * pg_store_finalize_terms_and_postings()) is what actually populates the
- * real terms/postings tables, and is also what makes duplicate/invalid
- * staged rows harmless -- ON CONFLICT DO NOTHING on terms, and a plain
- * JOIN on postings, both no-op on garbage rather than erroring. */
+/* -- Bulk staging tables: UNLOGGED, rebuildable; Phase 3 folds them into terms/postings. -- */
 
 /* Creates documents_raw/postings_staged if they don't already exist.
  * Idempotent (IF NOT EXISTS). Returns 0 on success, -1 on failure. */
 int pg_store_create_staging_tables(PgStore *store);
 
-/* Empties both staging tables (TRUNCATE, not DELETE -- instant regardless
- * of prior row count, and resets documents_raw's row_num identity
- * sequence back to 1 so a fresh run's row ranges start clean). Call once
- * before Phase 1 so a prior run's leftover rows can't mix into this
- * one. Returns 0 on success, -1 on failure. */
+/* TRUNCATE both staging tables (resets row_num to 1). Call once before Phase 1. 0 ok, -1 on failure. */
 int pg_store_truncate_staging_tables(PgStore *store);
 
-/* Drops both staging tables entirely, reclaiming their disk space --
- * call once Phase 3 has finished and their data has been folded into the
- * real terms/postings tables, since nothing after that point needs them.
- * Returns 0 on success, -1 on failure. */
+/* Drop both staging tables; call once Phase 3 has folded their data in. 0 ok, -1 on failure. */
 int pg_store_drop_staging_tables(PgStore *store);
 
-/* Phase 1: loads every row of the CSV file at `tsv_path` (columns:
- * pid, text -- RFC4180 CSV, tab-delimited, no header; see SPEED.md for
- * why plain TSV without CSV-style quoting isn't safe here -- real
- * MS MARCO passages contain literal, unescaped backslash and
- * double-quote characters) into documents_raw via a single COPY, using
- * libpq's COPY protocol (PQputCopyData) rather than any per-row INSERT.
- * `tsv_path` is read client-side in fixed-size chunks and streamed to
- * the server, so this works the same whether the file is local to the
- * machine running lexis or not (unlike server-side `COPY FROM
- * '<path>'`, which requires the file to be readable by the Postgres
- * server process itself). Returns the number of rows loaded (>= 0) on
- * success, or -1 if the file can't be opened or the COPY fails. */
+/* Phase 1: COPY every (pid, text) row of tsv_path into documents_raw (client-side streamed).
+ * Rows loaded (>= 0), or -1 if the file can't open or COPY fails. */
 int64_t pg_store_copy_documents_raw(PgStore *store, const char *tsv_path);
 
-/* One row read back from documents_raw -- `pid`/`text` are owned copies,
- * see pg_store_raw_documents_free(). */
+/* One documents_raw row; owned pid/text (see pg_store_raw_documents_free). */
 typedef struct {
     int64_t row_num;
     char *pid;
     char *text;
 } PgStoreRawDocument;
 
-/* Phase 2: fetches every documents_raw row with row_num in
- * [start_row, end_row) (start inclusive, end exclusive), ordered by
- * row_num, as a single round trip -- the batch a Phase 2 worker claims
- * and processes independently of every other worker (see bulk_ingest.c;
- * plain SELECTs against a range never lock anything, unlike the
- * ON CONFLICT-driven terms-table contention that motivated this whole
- * redesign, see SPEED.md). Sets *count_out to the number of rows
- * actually returned (may be less than end_row - start_row at the tail
- * end of the table). Returns a newly allocated array the caller must
- * free via pg_store_raw_documents_free(), or NULL (with *count_out
- * unset) on a database or allocation error. */
+/* Phase 2: fetch documents_raw rows in [start_row, end_row) ordered by row_num, one round trip.
+ * Caller frees via raw_documents_free; NULL (count_out unset) on DB/alloc error. */
 PgStoreRawDocument *pg_store_get_raw_documents_range(PgStore *store, int64_t start_row, int64_t end_row,
                                                       size_t *count_out);
 
-/* Frees an array returned by pg_store_get_raw_documents_range(), including
- * each row's owned pid/text. Safe to call with docs == NULL. */
+/* Free a get_raw_documents_range array incl. pid/text. Safe with docs == NULL. */
 void pg_store_raw_documents_free(PgStoreRawDocument *docs, size_t count);
 
-/* Phase 2: records that `passage_id` (already inserted into the real
- * passages table) contains each of terms[0..count) `term_frequencies[i]`
- * times, out of `token_count` total tokens -- staged by the term's own
- * text, not a resolved terms.id, since Phase 2 never touches the terms
- * table at all (see pg_store.h's staging-tables comment for why). One
- * round trip regardless of count, same unnest()-zip technique as
- * pg_store_insert_postings(). Requires count >= 1. Returns 0 on success,
- * -1 on failure. */
+/* Phase 2: stage passage_id's postings keyed by term text (one round trip). count >= 1.
+ * 0 on success, -1 on failure. */
 int pg_store_insert_staged_postings(PgStore *store, int64_t passage_id, const char *const *terms,
                                      const int *term_frequencies, int token_count, size_t count);
 
-/* Phase 3: the single-threaded, set-based finalize step -- resolves every
- * distinct term in postings_staged to a real terms.id (inserting new
- * ones, `ON CONFLICT (term) DO NOTHING` for ones another run already
- * created), then writes the real postings rows by joining postings_staged
- * against terms on term text. Exactly one writer, so unlike Phase 2's
- * worker pool this has zero contention risk by construction -- this is
- * also where a large work_mem genuinely pays off (a hash join/distinct
- * over hundreds of millions of staged rows), which this raises for the
- * duration of the call. Meant to run once, after every Phase 2 worker
- * has finished writing to postings_staged. Returns the number of postings
- * rows written (>= 0) on success, or -1 on failure. */
+/* Phase 3: resolve staged terms to ids, write real postings via join. Run once, after Phase 2.
+ * Postings rows written (>= 0), or -1 on failure. */
 long pg_store_finalize_terms_and_postings(PgStore *store);
 
-/* Bracket Phase 3 with this (prepare, called first) and
- * pg_store_finish_bulk_load() (restore, called last) to defer postings'
- * PRIMARY KEY and both FOREIGN KEY constraints, and terms/postings'
- * durability, to one bulk pass at the very end instead of paying for
- * them per-row during the load. Measured directly (see SPEED.md): the
- * two foreign keys turned out to be the single largest lever found so
- * far in this whole pipeline -- bigger than the primary key itself, and
- * far bigger than parallelizing the join (which barely mattered).
- *
- * Drops (with IF EXISTS, so a prior crashed run's already-weakened state
- * doesn't wedge this one -- matches this pipeline's existing
- * "rebuildable, not crash-safe mid-run" philosophy, see
- * pg_store_disable_synchronous_commit()) postings_pkey,
- * postings_term_id_fkey, and postings_passage_id_fkey, then sets
- * `postings` and `terms` UNLOGGED. Constraints are dropped before the
- * UNLOGGED conversion specifically because Postgres refuses to weaken a
- * table's persistence while a still-LOGGED table holds a foreign key
- * referencing it -- dropping postings' FK to terms first removes that
- * dependency.
- *
- * `passages` is deliberately left untouched -- query_log.c's
- * search_results table (LOGGED, only populated in testing mode) holds a
- * foreign key referencing it, which the same rule above would block, and
- * passages isn't written by Phase 3 (the actual target) anyway.
- *
- * A run that fails after calling this and before calling
- * pg_store_finish_bulk_load() leaves the schema in this weakened state
- * until the next successful bulk-ingest run restores it -- an accepted
- * trade-off given the "just re-run it" philosophy already in place, not
- * a gap. Returns 0 on success, -1 on failure. */
+/* Prepare bulk load: drop postings PK/FKs (IF EXISTS), set terms/postings UNLOGGED. passages untouched.
+ * A failed run leaves this weakened state until the next run restores it. 0 ok, -1 on failure. */
 int pg_store_prepare_bulk_load(PgStore *store);
 
-/* Reverses pg_store_prepare_bulk_load(): re-adds postings' PRIMARY KEY
- * and both FOREIGN KEY constraints -- built/validated once in a single
- * bulk pass against whatever's actually in the table, far cheaper than
- * maintaining them incrementally during the load (see SPEED.md) -- then
- * sets `postings` and `terms` back to LOGGED. The constraints are
- * rebuilt before restoring LOGGED status, not after: an index or
- * constraint built on a still-UNLOGGED table is itself unlogged, so
- * building them first avoids paying WAL for that build entirely: SET
- * LOGGED then generates WAL once, in bulk, for the fully-built table
- * instead. Must be called after every successful
- * pg_store_prepare_bulk_load() -- unlike the throwaway staging tables,
- * `passages`/`terms`/`postings` are the real index, and a run that never
- * restores this leaves it durably weakened. Returns 0 on success, -1 on
- * failure. */
+/* Reverse prepare: rebuild postings PK/FKs in one bulk pass, set terms/postings back to LOGGED.
+ * Must follow every successful prepare. 0 on success, -1 on failure. */
 int pg_store_finish_bulk_load(PgStore *store);
 
 #endif /* LEXIS_PG_STORE_H */

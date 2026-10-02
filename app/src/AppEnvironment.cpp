@@ -10,9 +10,7 @@
 #include <unistd.h>
 
 namespace {
-// The OS user name, from the password database rather than $USER --
-// peer auth compares against the real uid, and an inherited/stale USER
-// variable would silently mismatch it.
+// From the password database, not $USER: peer auth compares against the real uid.
 QString osUserName() {
     const struct passwd *pw = getpwuid(getuid());
     return pw != nullptr ? QString::fromUtf8(pw->pw_name) : QString();
@@ -22,16 +20,14 @@ QString osUserName() {
 AppEnvironment AppEnvironment::detect() {
     AppEnvironment env;
 
-    // Bundle marker: the wordnet data shipped into Contents/Resources.
-    // Checking for actual payload (not just the directory) means a dev
-    // binary that happens to live in a folder named MacOS can't
-    // misdetect.
+    // Bundle marker: the shipped wordnet payload (checking data, not just a directory
+    // name, so a dev binary in a folder named MacOS can't misdetect).
     const QString resources =
         QDir::cleanPath(QCoreApplication::applicationDirPath() + "/../Resources");
     env.bundleMode = QFileInfo::exists(resources + "/data/wordnet/index.noun");
 
     if (!env.bundleMode) {
-        // Dev tree: keep every historical relative path untouched.
+        // Dev tree: historical relative paths, untouched.
         env.configFile = QStringLiteral("config/lexis.conf");
         return env;
     }
@@ -47,11 +43,8 @@ AppEnvironment AppEnvironment::detect() {
 }
 
 QString AppEnvironment::socketConninfo() const {
-    // host=<absolute dir> makes libpq use the unix socket in that
-    // directory; peer auth means the OS user is the credential and no
-    // password field exists at all. The path is quoted because it
-    // contains a space ("Application Support") and libpq's conninfo
-    // parser splits on unquoted whitespace.
+    // Unix socket + peer auth (the OS user is the credential; no password). Quoted
+    // because the path contains a space and libpq splits on unquoted whitespace.
     return QStringLiteral("host='%1' dbname=lexis user=%2").arg(pgSocketDir, osUserName());
 }
 
@@ -68,7 +61,7 @@ bool AppEnvironment::ensureSupportLayout(QString *error) const {
             return false;
         }
     }
-    // Only this macOS user may even see the socket directory.
+    // Socket directory visible to this user only.
     QFile::setPermissions(pgSocketDir, QFileDevice::ReadOwner | QFileDevice::WriteOwner |
                                             QFileDevice::ExeOwner);
 
@@ -76,9 +69,8 @@ bool AppEnvironment::ensureSupportLayout(QString *error) const {
         return true;
     }
 
-    // First run: the shipped defaults, with absolute paths into
-    // Application Support. thinking=off and the reranker on match the
-    // measured-best configuration (913-question run v2).
+    // First run: shipped defaults with absolute Application Support paths
+    // (thinking=off, reranker on: the measured-best configuration).
     QFile conf(configFile);
     if (!conf.open(QIODevice::WriteOnly | QIODevice::Text)) {
         if (error != nullptr) {

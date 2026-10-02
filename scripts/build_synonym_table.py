@@ -1,24 +1,6 @@
 #!/usr/bin/env python3
-"""Builds data/synonyms/learned_neighbors.tsv -- the learned synonym table.
-
-The idea: WordNet knows curated dictionary relations; word embeddings know
-DISTRIBUTIONAL relations -- words used in the same contexts ("functions" ~
-"controls", "fresh" ~ "clean") that no dictionary links. Precomputing each
-word's nearest neighbors ONCE, globally, gives a data file that ships like
-WordNet does: query-time cost is a table lookup, ingest cost is zero. The
-neighbors feed query expansion as candidates and pass through the same LLM
-sense filter and 0.4 BM25 weight as WordNet candidates.
-
-Source: fastText wiki-news-300d-1M (public, pretrained on Wikipedia+news).
-The .vec file is frequency-sorted; the top VOCAB words cover everyday and
-technical vocabulary. Filters keep the table useful post-lemmatization:
-alphabetic words only, no near-duplicates (prefix test catches inflections
-and spelling variants the lemmatizer already handles).
-
-Usage: .venv/bin/python scripts/build_synonym_table.py [vec_path]
-Downloads the vectors (~680MB zip) into the scratch dir if not given.
-Output: data/synonyms/learned_neighbors.tsv ("word<TAB>n1 n2 ...").
-"""
+"""Builds data/synonyms/learned_neighbors.tsv from fastText nearest neighbors.
+Usage: build_synonym_table.py [vec_path] (downloads ~680MB vectors if omitted)."""
 
 import os
 import sys

@@ -20,8 +20,7 @@ IngestWorker::IngestWorker(QString conninfo, qint64 corpusId, QStringList filePa
 
 void IngestWorker::requestCancel() {
     m_cancelRequested.storeRelease(1);
-    // Reaches into whichever bulk_ingest phase is running right now;
-    // harmless if the run is still in extraction.
+    // Reaches the running bulk_ingest phase; harmless while still extracting.
     bulk_ingest_request_cancel();
 }
 
@@ -31,8 +30,7 @@ void IngestWorker::run() {
     QStringList malformed;
     QStringList noTextFound;
 
-    // A stale flag from a previously-cancelled run must not abort this
-    // one -- see bulk_ingest.h.
+    // A stale flag from a previously-cancelled run must not abort this one.
     bulk_ingest_clear_cancel();
 
     int filesDone = 0;
@@ -54,11 +52,8 @@ void IngestWorker::run() {
             QTextStream stream(&file);
             newDocuments.append(qMakePair(info.fileName(), stream.readAll()));
         } else if (suffix == QStringLiteral("csv")) {
-            // One CSV file can produce many documents -- one per data
-            // row (see APP_SPEC.md's "CSV" section: v1's default
-            // document mapping is one row = one document, every column
-            // concatenated). csv_parse_file() fails the WHOLE file on
-            // any malformed row rather than a partial parse.
+            // One CSV row = one document (see dev/APP_SPEC.md's "CSV" section).
+            // csv_parse_file() fails the WHOLE file on any malformed row.
             TokenList *rows = csv_parse_file(path.toUtf8().constData());
             if (rows == nullptr) {
                 malformed.append(info.fileName());
@@ -85,11 +80,8 @@ void IngestWorker::run() {
                 continue;
             }
             if (text.isEmpty()) {
-                // No text layer at all -- almost certainly a scanned
-                // PDF. Rendering pages and OCRing them isn't
-                // implemented yet (see APP_SPEC.md's "Images and
-                // scanned PDFs" section) -- reported distinctly so it
-                // isn't confused with a genuine parse failure.
+                // No text layer: almost certainly scanned. Reported distinctly from a
+                // genuine parse failure (render-and-OCR isn't implemented yet).
                 noTextFound.append(info.fileName());
                 continue;
             }
@@ -122,17 +114,12 @@ void IngestWorker::run() {
         return;
     }
 
-    // Mirrors main.c's LEXIS_CHUNK_SIZE/LEXIS_CHUNK_OVERLAP/
-    // LEXIS_INGEST_THREADS exactly -- no config UI for these yet, and
-    // matching the CLI's own ingest behavior matters more right now
-    // than tuning them differently here.
+    // Mirrors the CLI's chunk size/overlap/thread count exactly (no config UI yet).
     constexpr size_t kChunkSize = 200;
     constexpr size_t kChunkOverlap = 40;
     constexpr int kThreadCount = 6;
 
-    // bulk_ingest_rebuild_corpus() wants const char*const* arrays --
-    // the QByteArray vectors own the UTF-8 bytes those pointers point
-    // into for the duration of this call.
+    // The QByteArray vectors own the UTF-8 bytes the const char* arrays point into.
     QVector<QByteArray> nameBytes;
     QVector<QByteArray> textBytes;
     nameBytes.reserve(newDocuments.size());
@@ -153,10 +140,8 @@ void IngestWorker::run() {
         totalTextBytes += textBytes[i].size();
     }
 
-    // Rebuild-duration estimate for the progress display: ~6 bytes per
-    // English word, a 160-word stride per passage (chunk 200, overlap
-    // 40), and the measured ~3500 passages/sec ingest rate on this
-    // machine class. Order-of-magnitude honest, not precise.
+    // Rebuild-duration estimate: ~6 bytes/word, 160-word stride, ~3500 passages/sec.
+    // Order-of-magnitude honest, not precise.
     const qint64 estimatedPassages = totalTextBytes / (6 * 160);
     const qint64 indexEtaMs = qMax<qint64>(1000, estimatedPassages * 1000 / 3500);
     emit ingestProgress(m_filePaths.size(), m_filePaths.size(), indexEtaMs);

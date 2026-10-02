@@ -1,0 +1,55 @@
+# CI: C core + full test suite on a temp Postgres, Qt app build, lint.
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install postgresql@18 llama.cpp ggml cmake pkgconf \
+            qtbase qtdeclarative poppler pugixml tesseract leptonica libzip
+
+      - name: Build CLI
+        run: make lexis
+
+      - name: Build test binaries
+        run: |
+          for t in tests/core/test_*.c; do
+            make "build/$(basename "$t" .c)"
+          done
+
+      # Full `make check`: needs Postgres, but no model download -- the only
+      # model-loading test (test_stream_identity) is already excluded from it.
+      # Temp cluster on 5434 with the role+db tests/core/test_utils.h expects.
+      - name: Run test suite on temp Postgres
+        run: |
+          PGBIN=/opt/homebrew/opt/postgresql@18/bin
+          "$PGBIN/initdb" -D "$RUNNER_TEMP/pgdata" -E UTF8
+          "$PGBIN/pg_ctl" -D "$RUNNER_TEMP/pgdata" -l "$RUNNER_TEMP/pgdata/server.log" \
+            -o "-p 5434" start
+          "$PGBIN/psql" -h 127.0.0.1 -p 5434 -d postgres \
+            -c "CREATE ROLE lexis LOGIN PASSWORD 'lexis_dev_only';"
+          "$PGBIN/createdb" -h 127.0.0.1 -p 5434 -O lexis lexis_test
+          export LEXIS_TEST_CONNINFO="host=127.0.0.1 port=5434 dbname=lexis_test user=lexis password=lexis_dev_only"
+          make check
+
+      - name: Configure and build Qt app
+        run: |
+          cmake -S app -B app/build
+          cmake --build app/build -j8
+
+      # The build's own qmllint target (bare qmllint can't resolve `import Lexis`).
+      - name: Lint QML
+        run: cmake --build app/build --target all_qmllint
+
+      - name: Check scripts
+        run: |
+          python3 -m py_compile scripts/*.py
+          for s in scripts/*.sh; do bash -n "$s"; done

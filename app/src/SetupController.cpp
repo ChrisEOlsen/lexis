@@ -16,9 +16,7 @@ extern "C" {
 namespace {
 bool g_bundleMode = false;
 
-// Same repo-derivation rule as scripts/download_model.sh: strip the
-// quantization suffix to recover the model name unsloth's "-GGUF"
-// repos are named after. Empty result = underivable filename.
+// Same unsloth-repo rule as scripts/download_model.sh; empty = underivable filename.
 QString unslothUrlFor(const QString &modelFileName) {
     static const QRegularExpression quantSuffix(
         QStringLiteral("-(UD-)?(I?Q[0-9][A-Za-z0-9_]*)\\.gguf$"));
@@ -44,8 +42,7 @@ SetupController::SetupController(QObject *parent) : QObject(parent) {
         return; // dev build: overlay never shows
     }
 
-    // The files the config actually points at -- absolute paths in a
-    // bundle (AppEnvironment generated the config before QML loaded).
+    // The files the config points at (absolute paths in a bundle).
     const char *configPath = lexis_paths_config_file();
     char *modelPath = config_load_model_path(configPath);
     char *rerankerPath = config_load_reranker_model_path(configPath);
@@ -120,9 +117,7 @@ void SetupController::startNext() {
     m_reply = m_network.get(request);
 
     connect(m_reply, &QNetworkReply::readyRead, this, [this]() {
-        // A server that ignored our Range request restarts the file
-        // from byte zero -- drop what we had so the file can't end up
-        // doubled.
+        // Server ignored Range: drop what we had so the file can't end up doubled.
         if (m_resumeOffset > 0 &&
             m_reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 200) {
             m_partFile.resize(0);

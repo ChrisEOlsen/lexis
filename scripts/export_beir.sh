@@ -1,24 +1,6 @@
 #!/usr/bin/env bash
-# Exports any BeIR/* dataset into the exact formats `lexis bulk-ingest`
-# and `lexis eval` consume, so LEXIS results line up against the BEIR
-# benchmark's published BM25/dense-retriever nDCG@10 tables without
-# running any baseline locally. Generalizes scripts/export_msmarco.sh's
-# duckdb approach (BeIR repos share one layout: corpus/ + queries/
-# parquet, and a BeIR/<name>-qrels sibling repo of TSVs).
-#
-# Usage: scripts/export_beir.sh <dataset> [qrels_split]
-#   e.g.  scripts/export_beir.sh scifact test
-#         scripts/export_beir.sh nfcorpus test
-#
-# Outputs under data/eval/beir/<dataset>/:
-#   corpus_csv.tsv   <doc_id><TAB><title + text>, RFC4180 CSV-quoted, no
-#                    header -- bulk-ingest input. Title is prepended:
-#                    published BM25 baselines index title+text, and BEIR
-#                    titles carry real signal (papers' titles especially).
-#   qrels_<split>.tsv  the split verbatim (query-id/corpus-id/score,
-#                    header) -- `lexis eval`'s second argument.
-#   queries_<split>.tsv  <query_id><TAB><query_text>, no header, no
-#                    quoting, restricted to queries in the split's qrels.
+# Exports any BeIR dataset into `lexis bulk-ingest`/`lexis eval` formats.
+# Usage: export_beir.sh <dataset> [qrels_split]; outputs under data/eval/beir/<dataset>/.
 set -euo pipefail
 
 DATASET="${1:?usage: scripts/export_beir.sh <dataset> [qrels_split]}"
